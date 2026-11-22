@@ -239,11 +239,14 @@ static ACTIONS: [(AtomicU32, AtomicUsize); NR_ACTIONS] = [const { (AtomicU32::ne
 /// 置くほうだけ (同時に modprobe されても同じところに置かないように)。割り込みのほうはロックなしで読む
 static REQUEST: crate::spinlock::SpinLock<()> = crate::spinlock::SpinLock::new(());
 
-/// 割り込み id が来たら handler(id) を呼ぶようにして、割り込みを有効にする (同じ番号なら置きかえる)
+/// 割り込み id が来たら handler(id) を呼ぶようにして、割り込みを有効にする。同じ番号と同じ handler はいちどだけ、
+/// 同じ番号でちがう handler は並べて置く (Linux の IRQF_SHARED: PCI の INTx の線は装置どうしで分けあう。
+/// どれも自分の装置の理由を読んで、自分のでなければ何もしない)
 pub fn request(id: u32, handler: fn(u32)) {
     assert!(id != 0, "irq: request of 0");
     let g = REQUEST.lock();
-    let slot = ACTIONS.iter().find(|a| a.0.load(Ordering::Relaxed) == id).or_else(|| ACTIONS.iter().find(|a| a.0.load(Ordering::Relaxed) == 0));
+    let same = |a: &&(AtomicU32, AtomicUsize)| a.0.load(Ordering::Relaxed) == id && a.1.load(Ordering::Relaxed) == handler as usize;
+    let slot = ACTIONS.iter().find(same).or_else(|| ACTIONS.iter().find(|a| a.0.load(Ordering::Relaxed) == 0));
     let Some((n, h)) = slot else { panic!("irq: more than {} handlers", NR_ACTIONS) };
     h.store(handler as usize, Ordering::Relaxed);
     n.store(id, Ordering::Release);
@@ -251,17 +254,18 @@ pub fn request(id: u32, handler: fn(u32)) {
     enable(id);
 }
 
-/// 割り込み id に置いたものを呼ぶ (なければ false: trap.rs が知らない割り込みとして出す)
+/// 割り込み id に置いたものをみな呼ぶ (なければ false: trap.rs が知らない割り込みとして出す)
 pub fn handle(id: u32) -> bool {
+    let mut any = false;
     for (n, h) in &ACTIONS {
         if n.load(Ordering::Acquire) == id {
             // SAFETY: request が fn(u32) だけを置く
             let f: fn(u32) = unsafe { core::mem::transmute::<usize, fn(u32)>(h.load(Ordering::Relaxed)) };
             f(id);
-            return true;
+            any = true;
         }
     }
-    false
+    any
 }
 
 pub fn enable(id: u32) {

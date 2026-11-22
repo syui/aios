@@ -5,7 +5,7 @@
 #   (EDK2) で起こす。ファームウェアは ACPI の表をわたし、DTB はわたさない (ほんものの UEFI の機械と同じ)。ディスクは
 #   -snapshot。シリアルは build/acpi-boot.log に、終わりを出す (AIOS_ACPI_TAIL 行。GIC の版は AIOS_GIC)
 #   AIOS_ACPI_CMD があれば、プロンプトが出たらそれを打つ (そのあと 5 秒待つ)。AIOS_QEMU_ARGS は QEMU にそのまま足す
-#   (PCI の装置: test/pci.c)
+#   (PCI の装置: test/pci.c)。AIOS_VIRTIO=pci なら virtio の装置を PCIe に (bin/run.sh と同じ)
 set -e
 top=$(cd "$(dirname "$0")/.." && pwd)
 cd "$top"
@@ -30,10 +30,12 @@ tmpl=$(echo "$code" | sed 's/CODE\(\.[a-z-]*\)\{0,1\}\.fd$/VARS.fd/; s/-code\.fd
 if [ -f "$tmpl" ] && [ "$tmpl" != "$code" ]; then cp "$tmpl" "$vars"; else dd if=/dev/zero of="$vars" bs=1 count=0 seek="$(wc -c < "$code" | tr -d ' ')" 2>/dev/null; fi
 log=build/acpi-boot.log
 rm -f "$log"
+vt=device
+[ "${AIOS_VIRTIO:-}" = pci ] && vt=pci
 set -- -machine "virt,acpi=on${AIOS_GIC:+,gic-version=$AIOS_GIC}" -cpu "${AIOS_CPU:-cortex-a72}" -smp "${AIOS_SMP:-2}" -m "${AIOS_MEM:-2G}" \
   -nographic -no-reboot -drive if=pflash,format=raw,readonly=on,file="$code" -drive if=pflash,format=raw,file="$vars" \
-  -drive file="$disk",if=none,format=raw,id=root,snapshot=on -device virtio-blk-device,drive=root \
-  -global virtio-mmio.force-legacy=false -netdev user,id=n0 -device virtio-net-device,netdev=n0 -device virtio-rng-device \
+  -drive file="$disk",if=none,format=raw,id=root,snapshot=on -device virtio-blk-$vt,drive=root \
+  -global virtio-mmio.force-legacy=false -netdev user,id=n0 -device virtio-net-$vt,netdev=n0 -device virtio-rng-$vt \
   ${AIOS_QEMU_ARGS:-}
 if [ -n "$AIOS_ACPI_CMD" ]; then
   python3 - "$secs" "$log" "$AIOS_ACPI_CMD" qemu-system-aarch64 "$@" <<'EOF'

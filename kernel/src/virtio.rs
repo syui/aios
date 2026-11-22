@@ -1,4 +1,6 @@
-// virtio-mmio (version 2) の共通部分: デバイス探し、初期化、virtqueue
+// virtio の共通部分: デバイス探し、初期化、virtqueue。つなぎかたは virtio-mmio (version 2) と virtio-pci (modern:
+// PCI の vendor の capability が指す BAR の中の共通の設定、知らせ、ISR、装置の設定。Linux の virtio_pci_modern.c)。
+// 探すのは virtio-mmio の口が先、そのあと PCI (pci.rs が見つけて BAR を割り当てたもの)
 use crate::kalloc;
 use crate::memlayout::{p2v, v2p, PGSIZE};
 use core::ptr::{read_volatile, write_volatile};
@@ -43,9 +45,38 @@ pub const DESC_NEXT: u16 = 1;
 pub const DESC_WRITE: u16 = 2;
 
 pub struct Mmio {
+    /// virtio-mmio の口の番地 (virtio-pci なら共通の設定の番地)
     pub base: usize,
+    /// 割り込み (GIC の INTID。virtio-pci は INTx の線: 分けあうことがある)
     pub irq: u32,
+    /// virtio-pci なら、その capability の場所
+    pci: Option<Pci>,
 }
+
+/// virtio-pci の capability が指すところ (写した仮想番地)
+#[derive(Clone, Copy)]
+struct Pci {
+    common: usize,
+    notify: usize,
+    mul: u32,
+    isr: usize,
+    device: usize,
+}
+
+/// virtio-pci の共通の設定 (struct virtio_pci_common_cfg)
+const PCI_DFSELECT: usize = 0x00;
+const PCI_DF: usize = 0x04;
+const PCI_GFSELECT: usize = 0x08;
+const PCI_GF: usize = 0x0c;
+const PCI_STATUS: usize = 0x14;
+const PCI_Q_SELECT: usize = 0x16;
+const PCI_Q_SIZE: usize = 0x18;
+const PCI_Q_MSIX: usize = 0x1a;
+const PCI_Q_ENABLE: usize = 0x1c;
+const PCI_Q_NOFF: usize = 0x1e;
+const PCI_Q_DESC: usize = 0x20;
+const PCI_Q_AVAIL: usize = 0x28;
+const PCI_Q_USED: usize = 0x30;
 
 impl Mmio {
     pub fn rd(&self, off: usize) -> u32 {
@@ -56,31 +87,89 @@ impl Mmio {
         crate::mmio::w32(self.base + off, v)
     }
 
+    /// 装置の設定の領域のはじめ
+    fn config(&self) -> usize {
+        self.pci.map_or(self.base + CONFIG, |p| p.device)
+    }
+
     /// 設定の領域の 1 バイト
     pub fn config_w8(&self, off: usize, v: u8) {
-        crate::mmio::w8(self.base + CONFIG + off, v)
+        crate::mmio::w8(self.config() + off, v)
     }
 
     pub fn config8(&self, off: usize) -> u8 {
-        crate::mmio::r8(self.base + CONFIG + off)
+        crate::mmio::r8(self.config() + off)
     }
 
     /// 設定の領域の 32 ビット
     pub fn config32(&self, off: usize) -> u32 {
-        crate::mmio::r32(self.base + CONFIG + off)
+        crate::mmio::r32(self.config() + off)
     }
 
     /// 設定の領域の 64 ビット (32 ビットずつ、下から)
     pub fn config64(&self, off: usize) -> u64 {
-        let a = self.base + CONFIG + off;
+        let a = self.config() + off;
         crate::mmio::r32(a) as u64 | (crate::mmio::r32(a + 4) as u64) << 32
     }
 
-    /// 割り込みの理由を読んで下げる
+    /// 割り込みの理由を読んで下げる (virtio-pci は ISR を読むと下がる)
     pub fn ack(&self) -> u32 {
+        if let Some(p) = self.pci {
+            return crate::mmio::r8(p.isr) as u32;
+        }
         let isr = self.rd(INTERRUPT_STATUS);
         self.wr(INTERRUPT_ACK, isr);
         isr
+    }
+
+    fn set_status(&self, v: u32) {
+        match self.pci {
+            Some(p) => crate::mmio::w8(p.common + PCI_STATUS, v as u8),
+            None => self.wr(STATUS, v),
+        }
+    }
+
+    fn status(&self) -> u32 {
+        match self.pci {
+            Some(p) => crate::mmio::r8(p.common + PCI_STATUS) as u32,
+            None => self.rd(STATUS),
+        }
+    }
+
+    fn device_features(&self) -> u64 {
+        let (sel, val) = match self.pci {
+            Some(p) => (p.common + PCI_DFSELECT, p.common + PCI_DF),
+            None => (self.base + DEVICE_FEATURES_SEL, self.base + DEVICE_FEATURES),
+        };
+        crate::mmio::w32(sel, 0);
+        let lo = crate::mmio::r32(val) as u64;
+        crate::mmio::w32(sel, 1);
+        lo | (crate::mmio::r32(val) as u64) << 32
+    }
+
+    fn set_driver_features(&self, f: u64) {
+        let (sel, val) = match self.pci {
+            Some(p) => (p.common + PCI_GFSELECT, p.common + PCI_GF),
+            None => (self.base + DRIVER_FEATURES_SEL, self.base + DRIVER_FEATURES),
+        };
+        crate::mmio::w32(sel, 0);
+        crate::mmio::w32(val, f as u32);
+        crate::mmio::w32(sel, 1);
+        crate::mmio::w32(val, (f >> 32) as u32);
+    }
+
+    fn select_queue(&self, idx: u32) {
+        match self.pci {
+            Some(p) => crate::mmio::w16(p.common + PCI_Q_SELECT, idx as u16),
+            None => self.wr(QUEUE_SEL, idx),
+        }
+    }
+
+    fn queue_max(&self) -> u32 {
+        match self.pci {
+            Some(p) => crate::mmio::r16(p.common + PCI_Q_SIZE) as u32,
+            None => self.rd(QUEUE_NUM_MAX),
+        }
     }
 }
 
@@ -109,7 +198,7 @@ pub fn linux_index(base: usize) -> usize {
         .into_iter()
         .filter(|&(pa, _)| p2v(pa) < base)
         .filter(|&(pa, _)| {
-            let m = Mmio { base: p2v(pa), irq: 0 };
+            let m = Mmio { base: p2v(pa), irq: 0, pci: None };
             m.rd(MAGIC) == 0x7472_6976 && m.rd(DEVICE_ID) != 0
         })
         .count()
@@ -118,8 +207,9 @@ pub fn linux_index(base: usize) -> usize {
 /// device_id の装置の nth 番目 (0 から)。キーボードとタブレットのように、同じ種類がいくつもあるとき
 pub fn probe_nth(device_id: u32, wanted: u64, nth: usize) -> Option<(Mmio, u64)> {
     let mut seen = 0;
+    let mut found = None;
     for (pa, irq) in slots() {
-        let m = Mmio { base: p2v(pa), irq };
+        let m = Mmio { base: p2v(pa), irq, pci: None };
         if m.rd(MAGIC) != 0x7472_6976 || m.rd(DEVICE_ID) != device_id {
             continue;
         }
@@ -131,29 +221,68 @@ pub fn probe_nth(device_id: u32, wanted: u64, nth: usize) -> Option<(Mmio, u64)>
             println!("virtio: legacy device (use -global virtio-mmio.force-legacy=false)");
             return None;
         }
-        m.wr(STATUS, 0);
-        m.wr(STATUS, STATUS_ACK | STATUS_DRIVER);
-        m.wr(DEVICE_FEATURES_SEL, 0);
-        let lo = m.rd(DEVICE_FEATURES) as u64;
-        m.wr(DEVICE_FEATURES_SEL, 1);
-        let dev = lo | (m.rd(DEVICE_FEATURES) as u64) << 32;
-        if dev & F_VERSION_1 == 0 {
-            println!("virtio: device {} at {:#x} has no VERSION_1", device_id, pa);
-            return None;
-        }
-        let feats = dev & (wanted | F_VERSION_1);
-        m.wr(DRIVER_FEATURES_SEL, 0);
-        m.wr(DRIVER_FEATURES, feats as u32);
-        m.wr(DRIVER_FEATURES_SEL, 1);
-        m.wr(DRIVER_FEATURES, (feats >> 32) as u32);
-        m.wr(STATUS, STATUS_ACK | STATUS_DRIVER | STATUS_FEATURES_OK);
-        if m.rd(STATUS) & STATUS_FEATURES_OK == 0 {
-            println!("virtio: device {} at {:#x} refused features {:#x}", device_id, pa, feats);
-            return None;
-        }
-        return Some((m, feats));
+        found = Some((m, alloc::format!("{:#x}", pa)));
+        break;
     }
-    None
+    if found.is_none() {
+        // virtio-pci (pci.rs が見つけたもの。PCI の順)
+        for (i, id) in crate::pci::virtio_devices() {
+            if id != device_id {
+                continue;
+            }
+            seen += 1;
+            if seen <= nth {
+                continue;
+            }
+            found = Some((pci_transport(i)?, crate::pci::devs()[i].name()));
+            break;
+        }
+    }
+    let (m, at) = found?;
+    m.set_status(0);
+    m.set_status(STATUS_ACK | STATUS_DRIVER);
+    let dev = m.device_features();
+    if dev & F_VERSION_1 == 0 {
+        println!("virtio: device {} at {} has no VERSION_1", device_id, at);
+        return None;
+    }
+    let feats = dev & (wanted | F_VERSION_1);
+    m.set_driver_features(feats);
+    m.set_status(STATUS_ACK | STATUS_DRIVER | STATUS_FEATURES_OK);
+    if m.status() & STATUS_FEATURES_OK == 0 {
+        println!("virtio: device {} at {} refused features {:#x}", device_id, at, feats);
+        return None;
+    }
+    Some((m, feats))
+}
+
+/// virtio-pci の装置 i をつなぐ: vendor の capability (common 1、notify 2、ISR 3、device 4) の BAR の中を写し、
+/// MEM の読み書きと bus master を入れ、INTx の線を引く (Linux の virtio_pci_modern_probe と vp_find_vqs_intx)
+fn pci_transport(i: usize) -> Option<Mmio> {
+    let (mut common, mut notify, mut mul, mut isr, mut device) = (0, 0, 0, 0, 0);
+    for c in crate::pci::vendor_caps(i) {
+        let Some(va) = crate::pci::bar_va(i, c.bar as usize, c.offset as u64, c.length as usize) else { continue };
+        match c.kind {
+            1 if common == 0 => common = va,
+            2 if notify == 0 => {
+                notify = va;
+                mul = c.extra;
+            }
+            3 if isr == 0 => isr = va,
+            4 if device == 0 => device = va,
+            _ => {}
+        }
+    }
+    if common == 0 || notify == 0 || isr == 0 {
+        println!("virtio: {}: no modern virtio-pci capabilities", crate::pci::devs()[i].name());
+        return None;
+    }
+    let Some(irq) = crate::pci::intx(i) else {
+        println!("virtio: {}: no INTx route", crate::pci::devs()[i].name());
+        return None;
+    };
+    crate::pci::enable(i);
+    Some(Mmio { base: common, irq, pci: Some(Pci { common, notify, mul, isr, device }) })
 }
 
 /// 見えている virtio の装置 (「ID@番地」の並び。モジュールが装置を見つけられないときに出す)
@@ -167,10 +296,13 @@ pub fn list() -> alloc::string::String {
     }
     let mut s = alloc::string::String::new();
     for pa in slots {
-        let m = Mmio { base: p2v(pa), irq: 0 };
+        let m = Mmio { base: p2v(pa), irq: 0, pci: None };
         if m.rd(MAGIC) == 0x7472_6976 && m.rd(DEVICE_ID) != 0 {
             s.push_str(&alloc::format!(" {}@{:#x}", m.rd(DEVICE_ID), pa));
         }
+    }
+    for (i, id) in crate::pci::virtio_devices() {
+        s.push_str(&alloc::format!(" {}@{}", id, crate::pci::devs()[i].name()));
     }
     if s.is_empty() {
         s.push_str(" none");
@@ -179,7 +311,7 @@ pub fn list() -> alloc::string::String {
 }
 
 pub fn ready(m: &Mmio) {
-    m.wr(STATUS, STATUS_ACK | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
+    m.set_status(STATUS_ACK | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
 }
 
 #[repr(C)]
@@ -193,6 +325,8 @@ pub struct Desc {
 /// 1 本の virtqueue。desc/avail/used はそれぞれ 1 ページ
 pub struct Queue {
     idx: u32,
+    /// virtio-pci の知らせる番地 (notify の BAR + queue_notify_off * 倍数。virtio-mmio は 0)
+    notify_at: usize,
     pub size: usize,
     desc: *mut Desc,
     avail: *mut u16,
@@ -203,25 +337,42 @@ pub struct Queue {
 impl Queue {
     /// キュー idx の入れ物の数の上限 (デバイスの言うもの)
     pub fn max(m: &Mmio, idx: u32) -> usize {
-        m.wr(QUEUE_SEL, idx);
-        m.rd(QUEUE_NUM_MAX) as usize
+        m.select_queue(idx);
+        m.queue_max() as usize
     }
 
     pub fn new(m: &Mmio, idx: u32, size: usize) -> Option<Queue> {
-        m.wr(QUEUE_SEL, idx);
-        if (m.rd(QUEUE_NUM_MAX) as usize) < size || size * 16 > PGSIZE {
-            println!("virtio: queue {} has {} entries, {} wanted", idx, m.rd(QUEUE_NUM_MAX), size);
+        m.select_queue(idx);
+        if (m.queue_max() as usize) < size || size * 16 > PGSIZE {
+            println!("virtio: queue {} has {} entries, {} wanted", idx, m.queue_max(), size);
             return None;
         }
-        m.wr(QUEUE_NUM, size as u32);
         let (d, a, u) = (kalloc::alloc()?, kalloc::alloc()?, kalloc::alloc()?);
-        for (lo, p) in [(QUEUE_DESC_LOW, d), (QUEUE_DRIVER_LOW, a), (QUEUE_DEVICE_LOW, u)] {
-            let pa = v2p(p as usize) as u64;
-            m.wr(lo, pa as u32);
-            m.wr(lo + 4, (pa >> 32) as u32);
+        let mut notify_at = 0;
+        match m.pci {
+            Some(p) => {
+                crate::mmio::w16(p.common + PCI_Q_SIZE, size as u16);
+                for (o, q) in [(PCI_Q_DESC, d), (PCI_Q_AVAIL, a), (PCI_Q_USED, u)] {
+                    let pa = v2p(q as usize) as u64;
+                    crate::mmio::w32(p.common + o, pa as u32);
+                    crate::mmio::w32(p.common + o + 4, (pa >> 32) as u32);
+                }
+                // MSI-X は使わない (INTx)
+                crate::mmio::w16(p.common + PCI_Q_MSIX, 0xffff);
+                notify_at = p.notify + crate::mmio::r16(p.common + PCI_Q_NOFF) as usize * p.mul as usize;
+                crate::mmio::w16(p.common + PCI_Q_ENABLE, 1);
+            }
+            None => {
+                m.wr(QUEUE_NUM, size as u32);
+                for (lo, q) in [(QUEUE_DESC_LOW, d), (QUEUE_DRIVER_LOW, a), (QUEUE_DEVICE_LOW, u)] {
+                    let pa = v2p(q as usize) as u64;
+                    m.wr(lo, pa as u32);
+                    m.wr(lo + 4, (pa >> 32) as u32);
+                }
+                m.wr(QUEUE_READY, 1);
+            }
         }
-        m.wr(QUEUE_READY, 1);
-        Some(Queue { idx, size, desc: d as *mut Desc, avail: a as *mut u16, used: u as *mut u16, last_used: 0 })
+        Some(Queue { idx, notify_at, size, desc: d as *mut Desc, avail: a as *mut u16, used: u as *mut u16, last_used: 0 })
     }
 
     pub fn desc(&mut self, i: usize) -> &mut Desc {
@@ -241,7 +392,11 @@ impl Queue {
     }
 
     pub fn notify(&self, m: &Mmio) {
-        m.wr(QUEUE_NOTIFY, self.idx);
+        if self.notify_at != 0 {
+            crate::mmio::w16(self.notify_at, self.idx as u16);
+        } else {
+            m.wr(QUEUE_NOTIFY, self.idx);
+        }
     }
 
     /// デバイスが使い終わったものを 1 つ: (head, 書かれた長さ)

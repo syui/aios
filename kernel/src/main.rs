@@ -240,6 +240,11 @@ pub extern "C" fn kmain() -> ! {
         }
     }
     uart::init();
+    // PCI のバスをたどって BAR を割り当てる (Linux の pci_host_probe と MCFG: /sys/bus/pci に)。virtio-pci の装置を
+    // 使うもの (乱数、ディスク、ネット) より前に
+    if !parts::off(parts::Part::Pci) {
+        pci::init();
+    }
     // 乱数: 起動のときのもと (UEFI がくれたもの、DTB の rng-seed、CPU の RNDR) と、乱数の装置 (virtio-rng かラズパイのもの)。
     // 使う人 (ネット、exec) より前に
     efi::take_seed(|b| rand::seed("efi-rng", b));
@@ -251,10 +256,6 @@ pub extern "C" fn kmain() -> ! {
     }
     rand::summary();
     audit::init();
-    // PCI のバスをたどる (Linux の pci_host_probe と MCFG: 見つけたものを /sys/bus/pci に。ドライバはまだない)
-    if !parts::off(parts::Part::Pci) {
-        pci::init();
-    }
     // 装置のないファイルシステム (Linux の register_filesystem: mount(2) と、起動のときの /proc や /sys が引く)
     vfs::register_filesystem("proc", || Ok(procfs::new_root()));
     vfs::register_filesystem("sysfs", || Ok(sysfs::new_root()));

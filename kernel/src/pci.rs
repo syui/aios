@@ -74,12 +74,18 @@ pub struct Host {
     pub compat: Vec<String>,
     /// ranges の窓 (バスの番地。CPU とちがう MEM の窓があれば空: 割り当てない)
     wins: Vec<Res>,
+    /// interrupt-map-mask (子の番地の上のセル、ピン)
+    imask: (u32, u32),
 }
 
 /// PCI の IO の口 0 の CPU の番地 (resourceN で IO の BAR を読み書きする。DTB の ranges か、QEMU の ACPI の表)
 static IO_CPU: crate::cell::Once<u64> = crate::cell::Once::new();
 
 static HOST: crate::cell::Once<Host> = crate::cell::Once::new();
+/// DTB の interrupt-map のそのままのバイト (GIC のセルの数は phandle の先を見てから読む)
+static RAW_IMAP: crate::cell::Once<Vec<u8>> = crate::cell::Once::new();
+/// INTx のつなぎ先: DTB の interrupt-map を読んだもの (子の番地の上のセル、ピン、INTID) か ACPI の _PRT
+static IMAP: crate::cell::Once<Vec<(u32, u32, u32)>> = crate::cell::Once::new();
 
 /// DTB で見つけたホストブリッジ (ACPI なら None: pci0000:00 は /sys/devices のすぐ下)
 pub fn host() -> Option<&'static Host> {
@@ -307,7 +313,20 @@ fn find_ecam() -> Option<(u64, u64, u8, u8, &'static str)> {
             if let Some(io) = io_cpu {
                 IO_CPU.set(io);
             }
-            HOST.set(Host { dir: format!("{:x}.{}", pa, name), of_name: name, of_full: n.full_name(), of_type: n.str("device_type").unwrap_or("<NULL>").into(), compat, wins });
+            let cell = |b: &[u8], o: usize| b.get(o..o + 4).map_or(0, |c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]));
+            let m = n.prop("interrupt-map-mask").unwrap_or(&[]);
+            let imask = (cell(m, 0), cell(m, 12));
+            let imap = n.prop("interrupt-map").map(|b| b.to_vec()).unwrap_or_default();
+            HOST.set(Host {
+                dir: format!("{:x}.{}", pa, name),
+                of_name: name,
+                of_full: n.full_name(),
+                of_type: n.str("device_type").unwrap_or("<NULL>").into(),
+                compat,
+                wins,
+                imask,
+            });
+            RAW_IMAP.set(imap);
             Some((pa, size, s.min(0xff) as u8, e.min(0xff) as u8, "pci-host-generic"))
         });
     }
@@ -373,9 +392,119 @@ pub fn init() {
         }
     }
     aspm_init(&out, host().is_some());
+    IMAP.set(if host().is_some() { dt_imap() } else { crate::acpi::pci_prt().into_iter().map(|(slot, pin, gsi)| (slot << 11, pin as u32 + 1, gsi)).collect() });
     ROOT.set(start);
     DEVS.set(out);
 }
+
+/// DTB の interrupt-map を読む: 1 つは子の番地 (3)、ピン (1)、親の phandle (1)、親の番地 (親の #address-cells)、
+/// 親の割り込み (親の #interrupt-cells。GIC は種類 (0 SPI、1 PPI)、番号、印)
+fn dt_imap() -> Vec<(u32, u32, u32)> {
+    let raw = RAW_IMAP.get().map(|v| v.as_slice()).unwrap_or(&[]);
+    let cell = |o: usize| raw.get(o * 4..o * 4 + 4).map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]));
+    let mut v = Vec::new();
+    let mut o = 0;
+    while let (Some(hi), Some(pin), Some(ph)) = (cell(o), cell(o + 3), cell(o + 4)) {
+        let (ac, ic) = crate::dtb::scan(|n| {
+            let c = |p: &str| n.prop(p).and_then(|b| b.get(..4)).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize);
+            (c("phandle") == Some(ph as usize)).then(|| (c("#address-cells").unwrap_or(0), c("#interrupt-cells").unwrap_or(3)))
+        })
+        .unwrap_or((0, 3));
+        let p = o + 5 + ac;
+        if ic >= 2
+            && let (Some(kind), Some(num)) = (cell(p), cell(p + 1))
+        {
+            v.push((hi, pin, num + if kind == 1 { 16 } else { 32 }));
+        }
+        o = p + ic;
+    }
+    v
+}
+
+/// i の装置の INTx の GIC の INTID (Linux の pci_assign_irq: ブリッジをこえるたびにピンをまわし (pci_swizzle_interrupt_pin)、
+/// ルートのバスの装置の番地で interrupt-map か _PRT を引く)。ピンがなければ None
+pub fn intx(i: usize) -> Option<u32> {
+    let out = devs();
+    let mut pin = rd8(out[i].cfg, 0x3d) as u32;
+    if pin == 0 || pin > 4 {
+        return None;
+    }
+    let mut d = i;
+    while let Some(u) = out[d].up {
+        pin = (pin - 1 + out[d].slot as u32) % 4 + 1;
+        d = u;
+    }
+    let hi = (out[d].bus as u32) << 16 | (out[d].slot as u32) << 11 | (out[d].func as u32) << 8;
+    let (mhi, mpin) = match host() {
+        Some(h) => h.imask,
+        // _PRT は装置の番号とピンだけを見る
+        None => (0x1f << 11, 7),
+    };
+    IMAP.get()?.iter().find(|&&(chi, cpin, _)| chi & mhi == hi & mhi && cpin & mpin == pin & mpin).map(|e| e.2)
+}
+
+/// virtio の装置 (Linux の virtio_pci の id の表: 1af4:1000..107f。modern は 0x1040 + 種類、transitional は
+/// subsystem の装置の番号が種類): (devs の番号, virtio の種類)
+pub fn virtio_devices() -> Vec<(usize, u32)> {
+    devs()
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.vendor == 0x1af4 && (0x1000..=0x107f).contains(&d.device))
+        .map(|(i, d)| (i, if d.device >= 0x1040 { (d.device - 0x1040) as u32 } else { d.subdevice as u32 }))
+        .collect()
+}
+
+/// vendor の capability (id 9) のうち virtio のもの (struct virtio_pci_cap): 種類、BAR、BAR の中の場所、長さ、
+/// 知らせるものなら notify_off_multiplier
+pub struct VendorCap {
+    pub kind: u8,
+    pub bar: u8,
+    pub offset: u32,
+    pub length: u32,
+    pub extra: u32,
+}
+
+pub fn vendor_caps(i: usize) -> Vec<VendorCap> {
+    let d = &devs()[i];
+    let mut v = Vec::new();
+    if rd16(d.cfg, 0x06) & (1 << 4) == 0 {
+        return v;
+    }
+    let mut pos = rd8(d.cfg, 0x34) as usize;
+    for _ in 0..48 {
+        if pos < 0x40 {
+            break;
+        }
+        pos &= !3;
+        let h = rd16(d.cfg, pos);
+        if h as u8 == 0x09 {
+            v.push(VendorCap { kind: rd8(d.cfg, pos + 3), bar: rd8(d.cfg, pos + 4), offset: rd32(d.cfg, pos + 8), length: rd32(d.cfg, pos + 12), extra: rd32(d.cfg, pos + 16) });
+        }
+        pos = (h >> 8) as usize;
+    }
+    v
+}
+
+/// BAR bar の中の [off, off + len) の仮想番地 (MEM で、割り当てたものだけ。Linux の pci_iomap_range)
+pub fn bar_va(i: usize, bar: usize, off: u64, len: usize) -> Option<usize> {
+    let r = devs()[i].res.get(bar)?;
+    if r.flags & IORESOURCE_MEM == 0 || r.size() == 0 || off + len as u64 > r.size() {
+        return None;
+    }
+    crate::memlayout::map_device((r.start + off) as usize, len.max(1))
+}
+
+/// 装置を使えるようにする: MEM の読み書きと bus master を入れ、INTx を止めない (Linux の pci_enable_device と
+/// pci_set_master、pci_intx)
+pub fn enable(i: usize) {
+    let d = &devs()[i];
+    let cmd = rd16(d.cfg, 4);
+    wr16(d.cfg, 4, (cmd | 0x6) & !(1 << 10));
+    ENABLED[i.min(ENABLED.len() - 1)].store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// 使えるようにした装置 (/sys の enable: Linux の enable_cnt)
+static ENABLED: [core::sync::atomic::AtomicBool; 255] = [const { core::sync::atomic::AtomicBool::new(false) }; 255];
 
 impl Dev {
     /// 0000:BB:DD.F
@@ -531,6 +660,10 @@ impl Dev {
             "msi_bus" => "1\n".into(),
             "power_state" => "D0\n".into(),
             "devspec" => String::new(),
+            "enable" => {
+                let i = devs().iter().position(|o| core::ptr::eq(o, self)).unwrap_or(0);
+                format!("{}\n", ENABLED[i.min(ENABLED.len() - 1)].load(core::sync::atomic::Ordering::Relaxed) as u8)
+            }
             // LNKCAP2 の速さの並びがあればその上 (Linux の pcie_get_speed_cap)、なければ LNKCAP
             "max_link_speed" => {
                 let cap2 = lnk(0x2c) >> 1 & 0x7f;

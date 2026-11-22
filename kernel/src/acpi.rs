@@ -22,9 +22,11 @@ pub struct Dev {
     pub base: u64,
     pub size: u64,
     pub gsiv: u32,
+    /// Device の名前 (NameString の終わりの NameSeg: PCI の _PRT の割り込みのつなぎ先 GSI0 など)
+    pub name: [u8; 4],
 }
 
-const NO_DEV: Dev = Dev { hid: [0; 8], uid: 0, base: 0, size: 0, gsiv: 0 };
+const NO_DEV: Dev = Dev { hid: [0; 8], uid: 0, base: 0, size: 0, gsiv: 0, name: [0; 4] };
 
 pub struct Info {
     pub rsdp: u64,
@@ -326,9 +328,12 @@ fn aml(i: &mut Info, b: &[u8]) {
             continue;
         }
         let body = &b[p + 2 + n + nl..end];
-        if let Some(d) = device(body)
+        if let Some(mut d) = device(body)
             && i.ndevs < MAX_DEVS
         {
+            if nl >= 4 {
+                d.name.copy_from_slice(&b[p + 2 + n + nl - 4..p + 2 + n + nl]);
+            }
             i.devs[i.ndevs] = d;
             i.ndevs += 1;
         }
@@ -388,6 +393,63 @@ fn each_device(b: &[u8], mut f: impl FnMut(&[u8])) {
         }
         p += 2;
     }
+}
+
+/// PCI のホストブリッジ (PNP0A08 か PNP0A03) の _PRT (Linux の acpi_pci_irq_lookup): (装置の番号, ピン 0..3 (INTA..D),
+/// GSI)。つなぎ先が名前なら、その Device (PNP0C0F など) の _CRS の割り込み、0 なら Source Index がそのまま GSI
+pub fn pci_prt() -> alloc::vec::Vec<(u32, u8, u32)> {
+    let i = INFO.get();
+    let mut v = alloc::vec::Vec::new();
+    for &(sig, pa, len) in &i.tables[..i.ntables] {
+        if &sig != b"DSDT" && &sig != b"SSDT" {
+            continue;
+        }
+        let Some(t) = phys(pa, len as usize).and_then(|t| t.get(36..)) else { continue };
+        each_device(t, |body| {
+            if !v.is_empty() || !device(body).is_some_and(|d| hid_is(&d, "PNP0A08") || hid_is(&d, "PNP0A03")) {
+                return;
+            }
+            // Package (NumElements は 1 バイト) か VarPackage (NumElements は数: QEMU はこちら)
+            let Some(c) = name_skipping(body, b"_PRT") else { return };
+            let var = match body.get(c) {
+                Some(0x12) => false,
+                Some(0x13) => true,
+                _ => return,
+            };
+            let Some((len, n)) = pkglen(body, c + 1) else { return };
+            let end = (c + 1 + len).min(body.len());
+            let count = if var { integer(body, c + 1 + n).map_or(1, |x| x.1) } else { 1 };
+            let mut e = c + 1 + n + count;
+            while e < end && body[e] == 0x12 {
+                let Some((l2, n2)) = pkglen(body, e + 1) else { break };
+                let next = e + 1 + l2;
+                let mut j = e + 1 + n2 + 1;
+                let mut one = || -> Option<(u32, u8, u32)> {
+                    let (addr, k) = integer(body, j)?;
+                    j += k;
+                    let (pin, k) = integer(body, j)?;
+                    j += k;
+                    let gsi = match integer(body, j) {
+                        Some((_, k)) => {
+                            j += k;
+                            integer(body, j)?.0 as u32
+                        }
+                        None => {
+                            let nl = name_len(body, j)?;
+                            let seg = body.get(j + nl - 4..j + nl)?;
+                            i.devs[..i.ndevs].iter().find(|d| d.name == seg && d.gsiv != 0)?.gsiv
+                        }
+                    };
+                    Some(((addr >> 16) as u32, pin as u8, gsi))
+                };
+                if let Some(r) = one() {
+                    v.push(r);
+                }
+                e = next;
+            }
+        });
+    }
+    v
 }
 
 /// PCI のホストブリッジ (PNP0A08 か PNP0A03) の _CRS の窓 (Linux の acpi_pci_root_create が読むもの): Word、DWord、

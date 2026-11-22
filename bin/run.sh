@@ -98,13 +98,16 @@ fi
 if [ -n "${AIOS_FWD:-}" ]; then
   fwd="$fwd,hostfwd=tcp:127.0.0.1:${AIOS_FWD%%,*}-:7001,hostfwd=udp:127.0.0.1:${AIOS_FWD#*,}-:7002"
 fi
-set -- -netdev "user,id=n0$fwd" -device virtio-net-device,netdev=n0 -global virtio-mmio.force-legacy=false
+# AIOS_VIRTIO=pci: virtio の装置を virtio-mmio ではなく PCIe につなぐ (UTM などの UEFI の仮想機械と同じ。kernel/src/virtio.rs)
+vt=device
+[ "${AIOS_VIRTIO:-}" = pci ] && vt=pci
+set -- -netdev "user,id=n0$fwd" -device virtio-net-$vt,netdev=n0 -global virtio-mmio.force-legacy=false
 if [ -f "$disk" ]; then
   set -- "$@" \
     -drive file="$disk",if=none,format=raw,id=hd0${AIOS_DISK_OPTS:+,$AIOS_DISK_OPTS} \
-    -device virtio-blk-device,drive=hd0
+    -device virtio-blk-$vt,drive=hd0
 fi
-set -- "$@" -device virtio-rng-device
+set -- "$@" -device virtio-rng-$vt
 out=-nographic
 if [ -n "$AIOS_DISPLAY" ]; then
   disp=$AIOS_DISPLAY
@@ -112,9 +115,9 @@ if [ -n "$AIOS_DISPLAY" ]; then
     if [ "$(uname -s)" = Darwin ]; then disp=cocoa; else disp=gtk; fi
   fi
   # 画面に GL があれば (-display sdl,gl=on など) 3D のある virtio-gpu (virgl: ホストの GPU で描く。/dev/dri ができる)
-  gpu=virtio-gpu-device
-  case $disp in *gl=on* | *gl=es* | *gl=core*) gpu=virtio-gpu-gl-device ;; esac
-  set -- "$@" -device $gpu -device virtio-keyboard-device -device virtio-tablet-device
+  gpu=virtio-gpu-$vt
+  case $disp in *gl=on* | *gl=es* | *gl=core*) gpu=virtio-gpu-gl-$vt ;; esac
+  set -- "$@" -device $gpu -device virtio-keyboard-$vt -device virtio-tablet-$vt
   out="-display $disp -serial mon:stdio"
   echo "display: $disp ($gpu, keyboard, tablet)" >&2
   snd=${AIOS_SOUND:-}
@@ -127,7 +130,7 @@ if [ -n "$AIOS_DISPLAY" ]; then
     fi
   fi
   if [ "$snd" != 0 ] && qemu-system-aarch64 -device help 2>/dev/null | grep -q '"virtio-sound-device"'; then
-    set -- "$@" -audiodev "$snd,id=snd0" -device virtio-sound-device,audiodev=snd0
+    set -- "$@" -audiodev "$snd,id=snd0" -device virtio-sound-$vt,audiodev=snd0
     echo "sound: $snd (virtio-sound)" >&2
   fi
 fi

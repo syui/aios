@@ -42,6 +42,11 @@ pub fn w8(a: usize, v: u8) {
 }
 
 #[inline(always)]
+pub fn w16(a: usize, v: u16) {
+    unsafe { asm!("strh {v:w}, [{a}]", a = in(reg) a, v = in(reg) v as u32, options(nostack, preserves_flags)) };
+}
+
+#[inline(always)]
 // [lockless]
 pub fn w32(a: usize, v: u32) {
     unsafe { asm!("str {v:w}, [{a}]", a = in(reg) a, v = in(reg) v, options(nostack, preserves_flags)) };

@@ -2473,6 +2473,18 @@ DTB がなくても ACPI の表で起きる (Linux の drivers/acpi/tables.c と
 - /sys の装置に resource (BAR、ROM、ブリッジの窓)、resourceN と resourceN_wc (0600。IO の BAR は 1、2、4 バイトずつ
   口を読み書き、MEM は EIO)、rom (EINVAL)、reset と reset_method (flr、af_flr、pm、bus)、link/l0s_aspm と l1_aspm
   (0 と 1 を書ける)
+- virtio-pci (2026-11-22、kernel/src/virtio.rs): virtio の装置を PCIe でつなぐ (UTM などの UEFI の仮想機械はこの形)。
+  modern のつなぎかた (Linux の virtio_pci_modern.c): vendor の capability (id 9) が指す BAR の中の共通の設定、知らせ
+  (queue_notify_off × notify_off_multiplier)、ISR (読むと割り込みが下がる)、装置の設定を写す。1af4:1040+種類 (modern)
+  と 1af4:1000..103f (transitional: subsystem の装置の番号が種類) のどちらも。MEM の読み書きと bus master を入れ
+  (pci_enable_device と pci_set_master)、割り込みは INTx (MSI-X は 0xffff で使わない)。INTx の線はブリッジをこえる
+  たびにピンをまわし (pci_swizzle_interrupt_pin)、ルートのバスの装置の番地で DTB の interrupt-map (interrupt-map-mask
+  と、親の GIC の #address-cells と #interrupt-cells を phandle から) か、ACPI の _PRT (VarPackage も。つなぎ先が
+  名前なら、その Device (QEMU は GSI0..3、PNP0C0F) の _CRS の割り込み) を引く。INTx の線は装置どうしで分けあうので、
+  irq.rs の request は同じ番号にちがう handler を並べて置ける (Linux の IRQF_SHARED)。探すのは virtio-mmio の口が先、
+  そのあと PCI。PCI の初期化は乱数より前 (virtio-rng-pci も)。`AIOS_VIRTIO=pci bin/run.sh` (test/vm.py も、
+  test/acpi-boot.sh も) で、ディスク、ネット、乱数、画面、キーボード、タブレット、音を virtio-*-pci に。DTB と ACPI の
+  両方で、ext4 のルートと DHCP、virtio-rng、CI と同じ C のテスト (ctests) まで
 - /sys/bus/pci (devices/NAME のリンク、drivers/ と slots/ (空)、drivers_autoprobe など) と装置のディレクトリは Linux
   7.4 と同じ形: ACPI は /sys/devices/pci0000:00、DTB はホストブリッジの platform の装置の下
   (/sys/devices/platform/4010000000.pcie/pci0000:00。その uevent と modalias は DTB のノードから)。装置ごとに vendor、
@@ -2484,7 +2496,8 @@ DTB がなくても ACPI の表で起きる (Linux の drivers/acpi/tables.c と
   ACPI のブリッジのコマンドの bus master は、ファームウェアの起こしかた (aiboot か -kernel か) でちがう。2026-11-22)。
   手本の Linux に CONFIG_PCI_HOST_GENERIC を足し、-netdev がないときに QEMU が足す virtio-net-pci を `-nic none` で
   消した (aios の VM にはない)。QEMU に装置を足すのは AIOS_QEMU_ARGS と LINUX_QEMU_ARGS (ldiff の答えの鍵にも入る)
-- まだ: ほんものの UEFI の機械、PCI のドライバ (MSI / INTx の割り込み、virtio-pci と virtio でない機器)、
+- まだ: ほんものの UEFI の機械、MSI と MSI-X (GICv2m と ITS)、virtio でない PCI の機器 (NVMe、xHCI)、virtio-pci の
+  装置の /sys (Linux の .../0000:00:02.0/virtio1/...: いまは画面の DRM の親の名前が virtio-mmio の形のまま)、
   Method の _CRS と _DSM、/sys/firmware/devicetree。virtio-blk は 1 台だけ見る (はじめのもの)
 
 ### CPU のぜい弱性 (/sys/devices/system/cpu/vulnerabilities、SSBS)
