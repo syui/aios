@@ -2423,17 +2423,32 @@ pub fn fast_pwrite(me: &proc::Proc, fd: u64, va: usize, len: usize, off: i64) ->
     if !ino.page_cacheable() {
         return None;
     }
-    crate::vm::write_fast(me.pt(), ino.id(), off as usize, va, len).map(|n| n as i64)
+    if let Some(n) = crate::vm::write_fast(me.pt(), ino.id(), off as usize, va, len) {
+        return Some(n as i64);
+    }
+    // ちょうど終わりからの pwrite (ファイルを伸ばす) は、write の書きたしと同じ道で (Inode::fast_append: いまの終わりで
+    // なければ何もせずにふつうの道へ)。O_APPEND で開いたものも off に (aios がえらんだちがい pwrite-append: pwrite_flags
+    // と同じ)。位置は変えない
+    if of.label.is_some() || MODIFY_WATCHED.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+        return None;
+    }
+    let mut data = crate::heap::try_vec(len, false).ok()?;
+    if !me.pt().copy_in_nofault(va, &mut data) {
+        return None;
+    }
+    let (n, _) = ino.fast_append(Some(off as usize), &data)?;
+    FAST_WRITE[0].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    Some(n as i64)
 }
 
 /// 大きなロックなしの write (syscall::fast): ふつうのファイルの終わりへの書きたし (Inode::fast_append: ext4 の、最後の
 /// extent がそのまま伸びるもの)。fd の表が自分だけで、開いたファイルを持っているのが自分だけ (dup も fork もしていない:
-/// 位置を変えるので)、1 バイトから FAST_WRITE_MAX まで。中身はロックを取る前にカーネルの入れ物に写す (ページが写って
+/// 位置を変えるので)、1 バイトから FAST_WRITE_MAX (ext4 の FAST_APPEND_MAX と同じ 1 MiB) まで。中身はロックを取る前にカーネルの入れ物に写す (ページが写って
 /// いなければふつうの道へ)。O_DSYNC / O_SYNC / O_DIRECT、開いたときの LSM のラベルのあるもの (file_permission)、IN_MODIFY
 /// の見張りがあるとき (ふつうの道ができごとを出す)、わざとしくじらせる決まりのあるとき (fail.rs) は、ふつうの道へ
 // [lockless]
 pub fn fast_write_file(me: &proc::Proc, fd: u64, va: usize, len: usize) -> Option<i64> {
-    const FAST_WRITE_MAX: usize = 64 * 1024;
+    const FAST_WRITE_MAX: usize = 1024 * 1024;
     const O_DSYNC: u32 = 0o10000;
     const O_DIRECT: u32 = 0o200000;
     if len == 0 || len > FAST_WRITE_MAX || crate::debug::FAIL_ON.load(core::sync::atomic::Ordering::Relaxed) || MODIFY_WATCHED.load(core::sync::atomic::Ordering::Relaxed) != 0 {

@@ -3,7 +3,8 @@
 // 大きさのちがう記録 (1 回の write) を秒数だけ書きたす。そのあいだ、読む子 (read と、MAP_SHARED の mmap) が途中を読んで、
 // 読めたところに記録でないもの (0 や、ほかの記録のかけら) がないかを見る (終わりの記録は書きかけでもよい: その頭だけ見る)。
 // 終わったら全部を読んで、どの子の記録も 0 から順に欠けずにあるか、大きさが合うかを見る。おしまいに IN_MODIFY の見張りを
-// 足してから書きたすと、できごとが来ること (見張りがあると、ロックなしの道を通らない)。
+// 足してから書きたすと、できごとが来ること (見張りがあると、ロックなしの道を通らない)。記録はときどき 64 KiB より大きく
+// (1 MiB まではロックなしの道)、自分のファイルにはときどき終わりからの pwrite で (これもロックなしの道) 書く。
 // 出すだけのテスト: ./appendrace [秒] DIR...
 //   aarch64-linux-gnu-gcc -O2 -static -o appendrace test/appendrace.c
 #define _GNU_SOURCE
@@ -21,7 +22,8 @@
 
 #define P 4
 #define MAGIC 0x43455241u // "AREC"
-#define MAXREC (24 * 1024)
+#define MAXREC (640 * 1024)
+#define SMALLREC (24 * 1024)
 #define BUDGET (4 << 20) // 1 人が同じファイルに書く大きさ (読む子が毎回全部を読むので。そのあとは自分のファイルだけ)
 
 struct hdr {
@@ -45,11 +47,12 @@ static unsigned char pat(unsigned id, unsigned seq, unsigned i) { return (id * 1
 
 static size_t make(char *buf, unsigned id, unsigned seq, unsigned *rnd) {
   unsigned r = rand_r(rnd), len;
-  switch (r % 8) {
+  switch (r % 16) {
   case 0: len = 4096 - sizeof(struct hdr); break;   // ちょうど 1 ページ
-  case 1: len = 1 + r / 8 % (MAXREC - sizeof(struct hdr)); break;
-  case 2: len = 4000 + r / 8 % 300; break;           // ページの境をまたぐ
-  default: len = r / 8 % 300; break;               // 小さいもの (ブロックの中に何回も)
+  case 1: len = 1 + r / 16 % (SMALLREC - sizeof(struct hdr)); break;
+  case 2: len = 4000 + r / 16 % 300; break;          // ページの境をまたぐ
+  case 3: len = 64 * 1024 + r / 16 % (MAXREC - 64 * 1024 - sizeof(struct hdr)); break; // 64 KiB より大きい write
+  default: len = r / 16 % 300; break;              // 小さいもの (ブロックの中に何回も)
   }
   struct hdr h = {MAGIC, id, 0, seq, len};
   memcpy(buf, &h, sizeof h);
@@ -132,7 +135,13 @@ static void writer(int id, double end, int out) {
       obase = oseq;
     }
     n = make(buf, id, oseq, &rnd);
-    if (write(b, buf, n) != (ssize_t)n) {
+    // ときどき終わりからの pwrite で (位置は動かないので、あとで合わせる)
+    if (rand_r(&rnd) % 4 == 0) {
+      if (pwrite(b, buf, n, off) != (ssize_t)n || lseek(b, off + n, SEEK_SET) != off + (long)n) {
+        perror("pwrite own");
+        _exit(1);
+      }
+    } else if (write(b, buf, n) != (ssize_t)n) {
       perror("write own");
       _exit(1);
     }

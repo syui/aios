@@ -416,8 +416,10 @@ const BG_BLOCK_UNINIT: u16 = 0x2;
 
 const EXT_MAGIC: u16 = 0xf30a;
 const EXT_INIT_MAX_LEN: u32 = 32768;
-/// 大きなロックなしの書きたし (ExtFs::fast_append) の 1 回の長さの上限 (ふつうの道が 1 度に写す CHUNK と同じ)
-const FAST_APPEND_MAX: usize = 64 * 1024;
+/// 大きなロックなしの書きたし (ExtFs::fast_append) の 1 回の長さの上限。Linux と同じく 1 回の write は inode を 1 つずつ
+/// 持って (dir_lock) まとめて書く (前は 64 KiB で、それより大きい write (dd bs=1M など) は大きなロックの道: 4 つのプロセス
+/// で Linux の 4〜5 倍おそかった)
+pub const FAST_APPEND_MAX: usize = 1024 * 1024;
 
 /// ファイルの先取り (Linux の mballoc の inode の preallocation): 大きなロックなしの書きたし (fast_append) が ALLOC を取って
 /// ブロックをとるとき、書く分のすぐあとにつづく空きも RESV_BLOCKS までビットマップでとっておき (グループとスーパーブロック
@@ -436,6 +438,8 @@ struct Resv {
 
 const RESV_SLOTS: usize = 64;
 const RESV_BLOCKS: u32 = 64;
+/// 先取りのいちばん大きいもの (8 MiB: 1 MiB の write の 8 回分)
+const RESV_MAX: u32 = 2048;
 /// ディレクトリブロックの末尾にある、チェックサム用の偽のエントリ
 const DIR_TAIL: usize = 12;
 const DIR_TAIL_FT: u8 = 0xde;
@@ -2347,14 +2351,15 @@ impl ExtFs {
     // [lockless]
     fn adopt_fresh(&self, b: u64, pages: &[*mut u8]) {
         let mut c = self.cache.borrow_mut();
-        let old: [Option<*mut u8>; FAST_APPEND_MAX / PGSIZE + 1] = map_edit(|| {
-            let mut old = [None; FAST_APPEND_MAX / PGSIZE + 1];
+        // 前の中身 (表の外で片づける)。ページの数は FAST_APPEND_MAX まで (表はヒープに: カーネルのスタックは 16 KiB)
+        let mut old: Vec<Option<*mut u8>> = Vec::new();
+        old.resize(pages.len(), None);
+        map_edit(|| {
             for (i, &p) in pages.iter().enumerate() {
                 old[i] = c.map.insert(b + i as u64, p);
             }
-            old
         });
-        for (i, o) in old.iter().take(pages.len()).enumerate() {
+        for (i, o) in old.iter().enumerate() {
             let x = b + i as u64;
             match *o {
                 Some(o) => c.release_page(x, o),
@@ -4596,17 +4601,20 @@ impl ExtFs {
         // とるブロックの 0 のページを先に (ロックの外で。とれなければ何も変えずにふつうの道へ)
         let nb = (off as u64).div_ceil(self.bsize as u64);
         let want = (((off + buf.len() - 1) / self.bsize) as u64 + 1).saturating_sub(nb) as usize;
-        let mut pages = [core::ptr::null_mut::<u8>(); FAST_APPEND_MAX / PGSIZE + 1];
-        for i in 0..want {
+        let mut pages: Vec<*mut u8> = Vec::new();
+        if pages.try_reserve(want).is_err() {
+            return refuse(4);
+        }
+        for _ in 0..want {
             match kalloc::alloc() {
-                Some(p) => pages[i] = p,
+                Some(p) => pages.push(p),
                 None => {
-                    pages[..i].iter().for_each(|&p| kalloc::free(p));
+                    pages.iter().for_each(|&p| kalloc::free(p));
                     return refuse(4);
                 }
             }
         }
-        let pages = &pages[..want];
+        let pages = &pages[..];
         let done = crate::proc::noio(|| {
             // extent の木をたどるのは inode だけのもの (ALLOC の外で)。ブロックが空いているかとビットマップは ALLOC の中で
             // (書きたしが終わりのブロックの中だけなら ALLOC はいらない)
@@ -4649,7 +4657,11 @@ impl ExtFs {
                     // 書く分のあとにつづく空きも先取りして (グループの空きの数の中で)、前の先取り (この箱のもの) は返す。
                     // 空のファイルへのはじめての書きこみはしない (ふつうの道と同じ: 1 度しか書かないファイル (cp や tar の
                     // 小さなもの) の先取りは、消しても次の書き出しまで返らない。2 回目の書きたしから)
-                    let extra = if first { 0 } else { self.free_after(g, gbit + k, RESV_BLOCKS.min(self.gd_cnt(g, 0xc, 0x2c).saturating_sub(k))) };
+                    // 先取りは書く大きさの 8 回分 (RESV_BLOCKS から RESV_MAX まで: Linux の mballoc がファイルの大きさで
+                    // 先取りを大きくするのと同じ。決まった大きさだと、それより大きい write は先取りが goal をふさいで
+                    // ふつうの道に落ちた)
+                    let want_extra = (k * 8).clamp(RESV_BLOCKS, RESV_MAX);
+                    let extra = if first { 0 } else { self.free_after(g, gbit + k, want_extra.min(self.gd_cnt(g, 0xc, 0x2c).saturating_sub(k))) };
                     let b = self.take_bits(g, gbit, k + extra);
                     if let Ok(b) = b {
                         let old = slot.get();

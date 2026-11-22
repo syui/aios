@@ -633,18 +633,28 @@ fn write_flags(fd: u64, buf: usize, len: usize, flags: u32, append: Option<bool>
         vfs::drop_privs(&i)?;
     }
     // 分けずに 1 回で受けとるもの (AppArmor の .load。Inode::whole_write) は、16 MiB まで長さぶんをみな
-    let chunk = match &f.borrow().kind {
+    let (mut chunk, shrink) = match &f.borrow().kind {
         Kind::Inode(i, _) if i.whole_write() => {
             if len > WHOLE_MAX {
                 return Err(-ENOMEM);
             }
-            len.max(1)
+            (len.max(1), false)
         }
-        _ => CHUNK,
+        // ふつうのファイルも 16 MiB までは 1 回で (Linux の i_rwsem のように、1 回の write がまとまって書かれる:
+        // 分けると、O_APPEND の大きな write のあいだに、ほかの (大きなロックなしの) 書きたしが入って記録がまざった)
+        Kind::Inode(..) => (len.clamp(1, WHOLE_MAX), true),
+        _ => (CHUNK, false),
     };
     let mut done = 0;
     loop {
-        let mut tmp = uninit((len - done).min(chunk))?;
+        let mut tmp = match uninit((len - done).min(chunk)) {
+            // 入れ物がとれなければ、いままでどおり 64 KiB ずつ
+            Err(_) if shrink && chunk > CHUNK => {
+                chunk = CHUNK;
+                continue;
+            }
+            r => r?,
+        };
         proc::current().pt().copy_in(&mut tmp, buf + done).ok_or(-EFAULT)?;
         let r = file::write_opt2(&f, &tmp, flags & RWF_NOWAIT != 0, append);
         // AF_UNIX のソケットは unix.rs で (SOCK_STREAM だけ: Linux の unix_stream_sendmsg)
@@ -782,9 +792,17 @@ fn pwrite_flags(fd: u64, buf: usize, len: usize, off: i64, flags: u32) -> R {
     {
         vfs::drop_privs(i)?;
     }
+    // ふつうのファイルは 16 MiB までは 1 回で (write_flags と同じ: 1 回の pwrite がまとまって書かれる)
+    let mut chunk = if ino.is_some() { len.clamp(1, WHOLE_MAX) } else { CHUNK };
     let mut done = 0;
     while done < len {
-        let mut tmp = uninit((len - done).min(CHUNK))?;
+        let mut tmp = match uninit((len - done).min(chunk)) {
+            Err(_) if chunk > CHUNK => {
+                chunk = CHUNK;
+                continue;
+            }
+            r => r?,
+        };
         proc::current().pt().copy_in(&mut tmp, buf + done).ok_or(-EFAULT)?;
         let r = match &ino {
             Some(i) => {
