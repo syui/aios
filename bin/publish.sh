@@ -79,9 +79,16 @@ if [ -n "$run" ]; then
   prev=$(curl -fsS "$api/actions/workflows/unix.yml/runs?branch=main&status=success&per_page=1" 2>/dev/null | json 'd["workflow_runs"][0]["id"] if d["workflow_runs"] else ""' 2>/dev/null) || prev=
   usual=
   [ -z "$prev" ] || usual=$(curl -fsS "$api/actions/runs/$prev/jobs?per_page=50" 2>/dev/null | step_times 2>/dev/null) || usual=
-  n=0 last=
+  n=0 last= miss=0
   while :; do
-    st=$(curl -fsS "$api/actions/runs/$run" | json 'd["status"] + " " + str(d["conclusion"])')
+    # 読めないとき (つなぎの口が一時切れるなど) は、続けて 20 回 (5 分) までは次の回にもう一度
+    if ! st=$(curl -fsS "$api/actions/runs/$run" 2>/dev/null | json 'd["status"] + " " + str(d["conclusion"])' 2>/dev/null); then
+      miss=$((miss + 1))
+      [ "$miss" -lt 20 ] || { echo "publish: cannot read CI run $run" >&2; exit 1; }
+      sleep 15
+      continue
+    fi
+    miss=0
     case "$st" in completed*) break ;; esac
     [ -n "$dry" ] && break
     if [ $((n % 4)) = 0 ]; then
