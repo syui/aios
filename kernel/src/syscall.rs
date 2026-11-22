@@ -1995,6 +1995,7 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
     }
     // ファイルを写すなら、その inode (と、/proc/PID/maps に出すパス)
     let mut path: Option<alloc::string::String> = None;
+    let mut accessed: Option<(crate::vfs::InodeRef, u32)> = None;
     // 写しかたの型 (Linux の MAP_TYPE: 1 MAP_SHARED、2 MAP_PRIVATE、3 MAP_SHARED_VALIDATE (ファイルだけ)、8 MAP_DROPPABLE
     // (無名だけ: fork した子では 0、Linux はメモリが足りなければ捨てる。aios は捨てない))。ほかは EINVAL
     let kind = flags & 0xf;
@@ -2030,8 +2031,9 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
                     return Err(-EPERM);
                 }
                 path = Some(p.clone());
-                // 写したファイルの atime (Linux の generic_file_mmap と shmem_mmap の file_accessed)
-                crate::vfs::file_accessed(ino, p, f.flags);
+                // 写したファイルの atime (Linux の generic_file_mmap と shmem_mmap の file_accessed)。開いたファイルを
+                // 借りたまま書かない (ext4 は書き出しで眠ることがある) ので、あとで
+                accessed = Some((ino.clone(), f.flags));
                 Backing::File { ino: ino.clone(), off, fend: usize::MAX, ver: crate::vm::file_ver(ino) }
             }
             // 装置やソケット (画面、音の再生の口、TCP のソケット: file.rs の mmap_dev。Linux の f_op->mmap)。ほかは ENODEV
@@ -2046,6 +2048,9 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
         }
         Backing::Anon
     };
+    if let (Some((ino, fl)), Some(pp)) = (&accessed, &path) {
+        crate::vfs::file_accessed(ino, pp, *fl);
+    }
     let p = proc::current();
     let m = p.mm();
     let len = pg_up(len);

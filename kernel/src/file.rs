@@ -1302,7 +1302,9 @@ impl OpenFile {
                 if n > 0 {
                     crate::vfs::notify::file_event(path, ino, crate::vfs::notify::IN_ACCESS);
                 }
-                if !dst.is_empty() {
+                // atime (ext4 はふつう read_inode_file で。ここは開いたファイルを借りたままなので、書くと眠るかもしれない
+                // ext4 は見ない: module.rs の finit_module)
+                if !dst.is_empty() && !ino.page_cacheable() {
                     vfs::file_accessed(ino, path, self.flags);
                 }
                 Ok(n)

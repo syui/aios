@@ -6397,6 +6397,8 @@ impl Inode for ExtInode {
     /// Linux の ext4_fileattr_get: 見える印 (ふつうのファイルは PROJINHERIT を落とす)。ふつうのファイルとディレクトリだけ
     /// (リンクと装置は ENOTTY: Linux の ext4 もその inode_operations に fileattr がない)
     fn fs_flags(&self) -> Result<u32, i64> {
+        // ext4 のロックの中で (ロックなしの作る・消す (fastdir) が、いっしょに持ってブロックのキャッシュを使っている)
+        let _e = fs_lock();
         let r = self.raw()?;
         match r.mode() & S_IFMT {
             S_IFREG => Ok(r.flags() & FL_USER_VISIBLE & !PROJINHERIT_FL),

@@ -1700,11 +1700,12 @@ pub fn getdents64(fd: u64, buf: usize, len: usize) -> R {
     let r = f.borrow_mut().getdents(&mut v, len);
     // 読んだディレクトリの atime (Linux の iterate_dir: 消されたもの (ENOENT) とディレクトリでないもののほか、
     // 入れ物が小さい (EINVAL) ときも)
-    if !matches!(r, Err(e) if e == -ENOTDIR || e == -vfs::ENOENT) {
-        let b = f.borrow();
-        if let Kind::Inode(i, path) = &b.kind {
-            vfs::file_accessed(i, path, b.flags);
-        }
+    // (開いたファイルを借りたまま書かない: ext4 は書き出しで眠ることがある)
+    if !matches!(r, Err(e) if e == -ENOTDIR || e == -vfs::ENOENT)
+        && let Some((i, path)) = inode_path(&f)
+    {
+        let flags = f.borrow().flags;
+        vfs::file_accessed(&i, &path, flags);
     }
     r?;
     out(buf, &v)?;
