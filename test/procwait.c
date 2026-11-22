@@ -296,7 +296,9 @@ static pid_t old_parent;
 static int report_fd;
 static void *report_ppid(void *a) {
     (void)a;
-    for (int i = 0; i < 400 && getppid() == old_parent; i++)
+    // 親 (まん中) が終わるまで: z がゾンビになるのを待ってから終わるので、重い VM では 2 秒をこえることがある
+    // (ctests をみな続けて動かすと、ときどき前の親のまま答えた)。10 秒まで
+    for (int i = 0; i < 2000 && getppid() == old_parent; i++)
         msleep(5);
     int v = getppid();
     if (write(report_fd, &v, sizeof v) != sizeof v)
@@ -304,11 +306,11 @@ static void *report_ppid(void *a) {
     return NULL;
 }
 
-// 3 秒まで待って int を 1 つ読む (来なければ -1)
+// 12 秒まで待って int を 1 つ読む (来なければ -1)
 static int read_int(int fd) {
     struct pollfd pfd = {fd, POLLIN, 0};
     int v = -1;
-    if (poll(&pfd, 1, 3000) == 1 && read(fd, &v, sizeof v) == sizeof v)
+    if (poll(&pfd, 1, 12000) == 1 && read(fd, &v, sizeof v) == sizeof v)
         return v;
     return -1;
 }
@@ -366,6 +368,8 @@ static void kids(void) {
     pid_t z = read_int(fds[0]), g = read_int(fds[0]);
     check("middle parent exits", w4(m, 0, &st), m);
     int p1 = read_int(fds[0]), p2 = read_int(fds[0]);
+    if (p1 != 1 || p2 != 1)
+        printf("orphan: getppid %d %d (middle parent %d)\n", p1, p2, (int)m);
     check("orphan: getppid of the main thread and a thread is 1", p1 == 1 && p2 == 1, 1);
     check("orphan: /proc/PID/status PPid 1", ppid_of(g), 1);
     check("orphan: not my kid any more", w4(g, WNOHANG, &st), -ECHILD);
