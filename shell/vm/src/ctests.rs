@@ -9,7 +9,7 @@ use crate::sandbox::build_ctests;
 use crate::vmop::panic_note;
 use aish_plugin::{Value, json, s};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 動かすテストの名前 (tests か name。なければ空: vm-ctests.sh の TESTS みな)
 fn names(a: &Value) -> Vec<String> {
@@ -65,6 +65,69 @@ fn serving(root: &Path) -> bool {
     aish_plugin::parse(out.trim()).is_some_and(|v| v["ready"] == true && v["www"].as_str().is_some_and(|w| Path::new(w) == test || w.ends_with("/test")))
 }
 
+/// vm-ctests.sh の TESTS の数 (みな動かすときの進みぐあいの分母)
+fn all_tests(root: &Path) -> usize {
+    let t = std::fs::read_to_string(root.join("test/vm-ctests.sh")).unwrap_or_default();
+    t.lines().find_map(|l| l.strip_prefix("TESTS=\"")).map_or(0, |l| l.trim_end_matches('"').split_whitespace().count())
+}
+
+/// 中のうしろで (vm.py bg) cmd を動かし、20 秒ごとに新しい出力を見て、テストが 1 つ終わるたびに進みぐあいを書く
+/// (aish-vm の job が「40 of 150 (1 failed)」を見せる。前は終わるまで何も見えなかった)。終わったら全部の出力を読む。
+/// (終わりの番号、出力、ms、時間切れか VM が答えない)
+fn run_bg(root: &Path, cmd: &str, limit: Duration, count: usize) -> Result<(i64, String, u64, bool), String> {
+    let t0 = Instant::now();
+    let (_, out, err, _, _) = vmpy(root, &["bg", cmd], &[], Duration::from_secs(60));
+    let id = aish_plugin::parse(out.trim()).and_then(|v| v["job"].as_u64()).ok_or_else(|| format!("cannot start it in the VM: {}{}", out.trim(), err.trim()))?;
+    let id = id.to_string();
+    note(json!({ "step": "run", "done": 0, "total": count, "failed": 0 }));
+    let (mut seen, mut quiet) = (String::new(), Instant::now());
+    let (mut status, mut stuck) = (None, false);
+    let mut shown = (0, 0);
+    loop {
+        let (st, out, _, _, _) = vmpy(root, &["job", &id, "-w", "20"], &[], Duration::from_secs(45));
+        match aish_plugin::parse(out.trim()) {
+            Some(r) if st == 0 && r.get("error").is_none() && r["busy"] != true => {
+                quiet = Instant::now();
+                if let Some(o) = r["out"].as_str().filter(|o| !o.is_empty()) {
+                    seen.push_str(o);
+                    seen.push('\n');
+                }
+                let (ok, fails, _) = parse(&seen);
+                if (ok.len(), fails.len()) != shown {
+                    shown = (ok.len(), fails.len());
+                    // いちばん新しく終わったもの (ok か FAIL の行の終わり)
+                    let last = seen.lines().rev().find_map(|l| l.strip_prefix("ok ").or_else(|| l.strip_prefix("FAIL "))).map(|l| l.split([' ', ':']).next().unwrap_or(l).to_string());
+                    note(json!({ "step": "run", "done": ok.len() + fails.len(), "total": count, "failed": fails.len(), "last": last }));
+                }
+                if r["done"] == true {
+                    status = Some(r["status"].as_i64().unwrap_or(-1));
+                    break;
+                }
+            }
+            // VM が答えない (いそがしいか、止まった): 2 分つづけば止まったとみる
+            _ if quiet.elapsed() > Duration::from_secs(120) => {
+                stuck = true;
+                break;
+            }
+            _ => {}
+        }
+        if t0.elapsed() > limit {
+            vmpy(root, &["job", &id, "--kill"], &[], Duration::from_secs(40));
+            stuck = true;
+            break;
+        }
+    }
+    // 全部の出力 (途中の読みは行のとちゅうで切れることがある)。VM が答えなければ、読めた分
+    let mut all = seen;
+    if !stuck {
+        let (st, out, _, _, _) = vmpy(root, &["run", &format!("cat /tmp/.vmjob/{}.log", id), "-t", "30"], &[], Duration::from_secs(40));
+        if st == 0 {
+            all = out;
+        }
+    }
+    Ok((status.unwrap_or(124), all, t0.elapsed().as_millis() as u64, stuck))
+}
+
 pub fn job(root: &Path, a: &Value) -> Result<Value, String> {
     let list = names(a);
     if let Some(n) = list.iter().find(|n| !root.join("test").join(format!("{}.c", n)).is_file()) {
@@ -81,10 +144,10 @@ pub fn job(root: &Path, a: &Value) -> Result<Value, String> {
         note(json!({ "step": "boot" }));
         boot(root, Some(&k), true, "test", &[])?;
     }
-    let t = secs(a, "timeout", 1200.0, 3600.0);
+    let t = Duration::from_secs_f64(secs(a, "timeout", 1200.0, 3600.0));
     let cmd = format!("fetch http://10.0.2.2:8000/vm-ctests.sh > /tmp/vm-ctests.sh && sh /tmp/vm-ctests.sh run {}", list.join(" "));
-    note(json!({ "step": "run" }));
-    let (st, out, _, ms, to) = vmpy(root, &["run", &cmd, "-t", &format!("{}", t)], &[], Duration::from_secs_f64(t + 15.0));
+    let count = if list.is_empty() { all_tests(root) } else { list.len() };
+    let (st, out, ms, to) = run_bg(root, &cmd, t, count)?;
     let (ok, fails, total) = parse(&out);
     let failed: Vec<Value> = fails.iter().map(|f| json!({ "name": f.name, "status": f.status, "tail": f.tail })).collect();
     let mut r = json!({ "ok": ok.len(), "failed": failed, "ms": ms });

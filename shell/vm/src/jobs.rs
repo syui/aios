@@ -123,11 +123,15 @@ pub(crate) fn job(jobs: &mut HashMap<String, Job>, root: &Path, key: &str, a: &V
     };
     let text = std::fs::read_to_string(&j.log).unwrap_or_default();
     let lines: Vec<&str> = text.lines().collect();
-    let tail = lines[lines.len().saturating_sub(12)..].join("\n");
     let ms = j.t0.elapsed().as_millis() as u64;
     let adopted = j.child.is_none();
     let Some(st) = status else {
-        let mut r = json!({ "running": true, "ms": ms, "log": tail, "hint": "call again to wait more" });
+        // 途中の様子は短い行で (note の JSON をそのまま見せていた)、終わりの 8 行と、わかれば進みぐあい (k of N)
+        let tail: Vec<String> = lines[lines.len().saturating_sub(8)..].iter().map(|l| brief_line(l)).collect();
+        let mut r = json!({ "running": true, "ms": ms, "log": tail.join("\n"), "hint": "call again to wait more" });
+        if let Some(p) = progress(&lines) {
+            r["progress"] = json!(p);
+        }
         if adopted {
             r["adopted"] = json!(format!("started before aish-vm was restarted (pid {}); its arguments may differ from this call", j.pid));
         }
@@ -148,9 +152,63 @@ pub(crate) fn job(jobs: &mut HashMap<String, Job>, root: &Path, key: &str, a: &V
     r
 }
 
+/// 途中の様子の 1 行 (note の JSON) を短く: {"test", "result", "ms"} は「test: result (12.3s)」、{"step", ...} は
+/// 「step k=v ... (2.0s)」。JSON でなければそのまま
+fn brief_line(l: &str) -> String {
+    let Some(v) = aish_plugin::parse(l).filter(Value::is_object) else { return l.to_string() };
+    let val = |x: &Value| x.as_str().map(String::from).unwrap_or_else(|| x.to_string());
+    let secs = v["ms"].as_f64().map(|m| format!(" ({:.1}s)", m / 1000.0)).unwrap_or_default();
+    if let (Some(t), Some(r)) = (v.get("test"), v.get("result")) {
+        return format!("{}: {}{}", val(t), val(r), secs);
+    }
+    let rest: Vec<String> = v
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(k, x)| !matches!(k.as_str(), "step" | "ms") && !x.is_null() && x.as_array().is_none_or(|a| !a.is_empty()))
+        .map(|(k, x)| format!("{}={}", k, val(x)))
+        .collect();
+    let head = v.get("step").map(val).unwrap_or_default();
+    format!("{}{}{}{}", head, if head.is_empty() || rest.is_empty() { "" } else { " " }, rest.join(" "), secs).trim().to_string()
+}
+
+/// 進みぐあい: いちばん新しい {"done", "total"} (ctests) か、{"total"} と {"result"} の数 (ldiff: 「2 of 5 (1 same,
+/// 1 differ)」)。わからなければ None
+fn progress(lines: &[&str]) -> Option<String> {
+    let notes: Vec<Value> = lines.iter().filter_map(|l| aish_plugin::parse(l)).filter(Value::is_object).collect();
+    if let Some(v) = notes.iter().rev().find(|v| v["done"].is_u64() && v["total"].is_u64()) {
+        let failed = v["failed"].as_u64().unwrap_or(0);
+        return Some(format!("{} of {}{}", v["done"], v["total"], if failed > 0 { format!(" ({} failed)", failed) } else { String::new() }));
+    }
+    let total = notes.iter().find_map(|v| v["total"].as_u64())?;
+    let results: Vec<&str> = notes.iter().filter_map(|v| v["result"].as_str()).collect();
+    let mut kinds: Vec<(&str, usize)> = Vec::new();
+    for r in &results {
+        match kinds.iter_mut().find(|(k, _)| k == r) {
+            Some(e) => e.1 += 1,
+            None => kinds.push((r, 1)),
+        }
+    }
+    let each: Vec<String> = kinds.iter().map(|(k, n)| format!("{} {}", n, k)).collect();
+    Some(format!("{} of {}{}", results.len(), total, if each.is_empty() { String::new() } else { format!(" ({})", each.join(", ")) }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn running_lines() {
+        assert_eq!(brief_line(r#"{"ms":15349,"result":"differ","test":"statc @home /tmp"}"#), "statc @home /tmp: differ (15.3s)");
+        assert_eq!(brief_line(r#"{"step":"run","spec":"HEAD","i":2,"ms":2103}"#), "run i=2 spec=HEAD (2.1s)");
+        assert_eq!(brief_line(r#"{"step":"boot","off":[]}"#), "boot");
+        assert_eq!(brief_line("ldiff: building test/bin/x"), "ldiff: building test/bin/x");
+        let ldiff = [r#"{"step":"tests","total":3}"#, r#"{"ms":1,"result":"same","test":"a"}"#, r#"{"ms":1,"result":"differ","test":"b"}"#];
+        assert_eq!(progress(&ldiff).as_deref(), Some("2 of 3 (1 same, 1 differ)"));
+        let ct = [r#"{"step":"run","done":3,"total":150,"failed":0,"last":"atime"}"#, r#"{"step":"run","done":40,"total":150,"failed":1,"last":"futex"}"#];
+        assert_eq!(progress(&ct).as_deref(), Some("40 of 150 (1 failed)"));
+        assert!(progress(&[r#"{"step":"boot"}"#]).is_none());
+    }
 
     #[test]
     fn adopt_jobs() {

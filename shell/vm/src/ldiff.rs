@@ -70,6 +70,7 @@ pub fn job(root: &Path, a: &Value) -> Result<Value, String> {
     if !s(a, "linux").is_empty() {
         flags.extend(["--linux".to_string(), s(a, "linux").to_string()]);
     }
+    note(json!({ "step": "tests", "total": list.len() }));
     let mut kernel = s(a, "kernel").to_string();
     let (mut same, mut differ, mut errors, mut aios, mut text) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), String::new());
     let mut seen: Vec<String> = Vec::new();
