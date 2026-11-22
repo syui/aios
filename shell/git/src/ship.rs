@@ -161,7 +161,8 @@ pub fn ship(v: &Value) -> Value {
                     let mut text = format!("{}: publishing ({}s, {})\n{}", short, st["started"].as_u64().map_or(0, |t0| now().saturating_sub(t0)), log, tail(&log, 2));
                     // CI を待っているあいだは、publish.sh がいまの step と前に通った run のその長さを 1 分に 1 度書く。
                     // いつもよりずっと長ければ、止まっているかもしれない (VM test の中でカーネルが panic など)
-                    if let Some(l) = txt.lines().rev().find(|l| l.starts_with("ci: step ")) {
+                    // CI が終わったあと (ci: completed ...) の古い step は見せない
+                    if let Some(l) = txt.lines().rev().find(|l| l.starts_with("ci: ")).filter(|l| l.starts_with("ci: step ")) {
                         if !tail(&log, 2).contains(l) {
                             text.push_str(&format!("  {}\n", l));
                         }
@@ -234,6 +235,18 @@ pub fn ship(v: &Value) -> Value {
         return r;
     }
 
+    // もう送ってある (origin のブランチも push の refspec の先も HEAD で、publish するものもない): 送りなおして
+    // CI を待ちはじめない。CI の様子を 1 度だけ見せて終わる (終わったあとにもう一度 ship を呼んで、image の CI を
+    // 待ちはじめていた。2026-11-22)
+    if !want && a["publish"].as_bool() != Some(true) && shipped(&top, &branch, &c.push, &head) {
+        text.push_str("already shipped: origin has HEAD and there is nothing to publish (ci waits for the runs)\n");
+        if repo.is_some() {
+            let r = ci(&json!({ "args": { "dir": top, "sha": head, "wait_ms": 0 }, "pwd": top }));
+            text.push_str(s(&r, "text"));
+        }
+        return json!({ "text": text, "done": true, "ok": true });
+    }
+
     // 送る
     let mut steps = String::new();
     let (ok, out) = push(&top, &["-u", "origin", &format!("HEAD:{}", branch)]);
@@ -289,6 +302,20 @@ pub fn ship(v: &Value) -> Value {
         return json!({ "text": text, "done": true, "ok": r["ok"] == true });
     }
     json!({ "text": text, "done": false, "running": true })
+}
+
+/// origin の branch と、push の refspec の先 (HEAD:main なら main) が、みな head か (ls-remote なので fetch しない)
+fn shipped(top: &str, branch: &str, push: &[String], head: &str) -> bool {
+    let mut refs = vec![format!("refs/heads/{}", branch)];
+    for spec in push {
+        let dst = spec.rsplit(':').next().unwrap_or(spec).trim_start_matches('+');
+        refs.push(if dst.starts_with("refs/") { dst.to_string() } else { format!("refs/heads/{}", dst) });
+    }
+    let mut args = vec!["ls-remote", "origin"];
+    args.extend(refs.iter().map(String::as_str));
+    let Some(out) = git(top, &args) else { return false };
+    let got: Vec<(&str, &str)> = out.lines().filter_map(|l| l.split_once('\t')).collect();
+    refs.iter().all(|r| got.iter().any(|(sha, name)| name == r && *sha == head))
 }
 
 fn now() -> u64 {

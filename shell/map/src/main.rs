@@ -9,7 +9,7 @@ use aish_plugin::{Spec, Tool, Value, error, json, pick_live, s};
 use std::path::{Path, PathBuf};
 
 const WHERE: &str = r#"{"type":"object","properties":{"name":{"type":"string","description":"探す名前 (大文字小文字は区別しない。ぴったり、前が同じ、含む、の順)"},"kind":{"type":"string","description":"fn struct enum trait type mod const static macro impl define class def ... のどれかだけ"},"path":{"type":"string","description":"探すところ (既定: いまのディレクトリの git のいちばん上、なければいまのディレクトリ)"},"limit":{"type":"integer","description":"いくつまで (既定 30)"},"body":{"type":"boolean","description":"いちばん上のものに、定義の中身 (body: 行の番号つき、200 行まで) もつける。read しなくてよい"}},"required":["name"]}"#;
-const OUTLINE: &str = r#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}"#;
+const OUTLINE: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"定義を見るファイル"}},"required":["path"]}"#;
 
 /// 言語: ファイルの名前 (拡張子か、名前そのもの) と、定義の形 (種類, 正規表現)。
 /// 正規表現の NAME が名前 (where では問い、outline では何でも)、(?P<kind>...) があればそれが種類

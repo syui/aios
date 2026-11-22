@@ -153,6 +153,44 @@ check('reload keeps dir and rc', t.startswith('/tmp\nx\n'), t)
 
 p.stdin.close()
 p.wait(timeout=10)
+
+# ツールのスキーマ: PLUGINS のプラグインをみな読み、どのツールも説明があり、スキーマは object で (SDK が JSON に
+# できなかったものは invalid がつく)、required は properties にあり、どの引数にも型 (array なら items) と説明が
+# ある (dir はのぞく。AI は説明を読んで引数を決めるので)
+names = sorted(n for n in os.listdir(plugins) if n.startswith('aish-') and '.' not in n and os.access(os.path.join(plugins, n), os.X_OK))
+open(work + '/all.rc', 'w').write(''.join('plugin %s\n' % n for n in names))
+q = subprocess.Popen([aish, '--mcp', work + '/all.rc'], cwd=work, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=dict(env, AISH_PLUGIN_PATH=plugins))
+
+
+def ask(i, method, params):
+    q.stdin.write(json.dumps({'jsonrpc': '2.0', 'id': i, 'method': method, 'params': params}) + '\n')
+    q.stdin.flush()
+    while True:
+        m = json.loads(q.stdout.readline())
+        if m.get('id') == i:
+            return m
+
+
+ask(1, 'initialize', {'protocolVersion': '2025-06-18', 'capabilities': {}, 'clientInfo': {'name': 't', 'version': '0'}})
+every = ask(2, 'tools/list', {})['result']['tools']
+TYPES = {'string', 'integer', 'number', 'boolean', 'array', 'object'}
+bad = []
+for t in every:
+    sc, n = t.get('inputSchema', {}), t['name']
+    if not t.get('description'):
+        bad.append(n + ': no description')
+    if sc.get('type') != 'object' or 'invalid' in sc:
+        bad.append(n + ': schema ' + json.dumps(sc)[:100])
+    props = sc.get('properties', {})
+    bad += ['%s: required %s is not a property' % (n, r) for r in sc.get('required', []) if r not in props]
+    for k, v in props.items():
+        if v.get('type') not in TYPES or (v.get('type') == 'array' and 'items' not in v):
+            bad.append('%s.%s: type %s' % (n, k, v.get('type')))
+        if not v.get('description') and k != 'dir':
+            bad.append('%s.%s: no description' % (n, k))
+check('tool schemas (%d tools from %d plugins)' % (len(every), len(names)), len(every) > 40 and not bad, '; '.join(bad))
+q.stdin.close()
+q.wait(timeout=10)
 shutil.rmtree(work, ignore_errors=True)
 print('mcp: %d failed%s' % (len(fails), (' (' + ', '.join(fails) + ')') if fails else ''))
 sys.exit(1 if fails else 0)
