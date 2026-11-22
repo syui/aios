@@ -3628,6 +3628,11 @@ git status は 0.27 → 0.18 秒、2 度目からは 0.072 → 0.040 秒、du �
 1.28 → 1.06 秒、rg -j1 は 2.25 → 2.09 秒。rg -j4 でのこる大きなロックは close (2 万回、12 µs: スレッドで表を分けていると
 棚にしまえない) と、はじめて開いて読むもの (ディスクを読む)。
 
+2026-11-22 は cp -r を同じ日に同じ VM でくらべなおした (bkl-file (5) のあと。tar -x した zig の木を 3 回。Linux は
+test/linux-vm.sh exec に LINUX_WORK_DIR (道具と tarball を /work に) と LINUX_WORK_SIZE=3G、LINUX_SMP=4、
+LINUX_CPU=cortex-a72): Linux 7.4-rc3 は 20.2 / 21.1 / 18.8 秒、aios は 19.8 / 16.8 / 20.1 秒。ふだんのしごとで Linux より
+遅いものはなくなった。
+
 ファイルを写したところのページフォルト (Firefox の起動で 6 万回、大きなロックを持つ時間の 2.5 秒) をしらべると、大きなロック
 なしの道 (fast_fault) のほうが、ロックの道より遅かった (MAP_PRIVATE で 1 ページ 40 µs)。PTE を書くたびに、すべての CPU の
 TLB を消していた (tlbi …is) が、QEMU の TCG ではこれが全部の CPU を止めて合わせるので重い。arm64 では、無効な PTE と

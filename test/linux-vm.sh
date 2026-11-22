@@ -23,6 +23,8 @@
 # 127.0.0.1:P1 を中の TCP 7001 へ、P2 を UDP 7002 へ (aios の bin/run.sh の AIOS_FWD と同じ。test/nfteval.c)
 # QEMU の CPU は LINUX_CPU (既定 max)、数は LINUX_SMP (既定 1)。速さをくらべるとき (aish の bench) は aios の VM と同じ
 # cortex-a72 にする
+# LINUX_WORK_SIZE は /work の ext4 の大きさ (既定 1G)、LINUX_WORK_DIR はその中身にするディレクトリ (mkfs.ext4 -d。
+# ふだんのしごとの test/workload.sh の道具と zig の tarball など)
 # LINUX_QEMU_ARGS は QEMU にそのまま足す (aios の bin/run.sh の AIOS_QEMU_ARGS と同じ。PCI の装置: test/pci.c)
 # 置き場は build/linux/ (VERSION/Image と、作るときのソースと tarball。作ったらソースは消す)。
 # 作るのに要るもの: aarch64-linux-gnu-gcc、make、flex、bison、bc、curl、xz。動かすのに qemu-system-aarch64、mkfs.ext4、debugfs
@@ -171,8 +173,8 @@ boot() {
   fi
   initramfs "$tmp/initrd" init="$init" "$@"
   # ext4 は aios のディスクと同じく 4 KiB のブロックで (小さなものの既定は 1 KiB)
-  truncate -s 1G "$tmp/work.img"
-  mkfs.ext4 -q -F -b 4096 -E root_owner=0:0 "$tmp/work.img"
+  truncate -s "${LINUX_WORK_SIZE:-1G}" "$tmp/work.img"
+  mkfs.ext4 -q -F -b 4096 -E root_owner=0:0 ${LINUX_WORK_DIR:+-d "$LINUX_WORK_DIR"} "$tmp/work.img"
   machine=virt
   set --
   if [ -n "${LINUX_EFI:-}" ]; then

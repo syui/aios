@@ -2,8 +2,8 @@
 #   zsh test/workload.sh BASE
 # BASE には、静的な道具の bin/ (bsdtar、coreutils (uutils。cp、du、rm、ls など)、find (uutils findutils)、rg、git、
 # make (GNU)、zsh)、zig 0.17 の tarball (zig.tar.gz)、C のファイル src/*.c (test/*.c をいくつか) を置く。aios では
-# test/vm.py の VM のホーム、Linux では test/linux-vm.sh と同じ init で ext4 の /work (init は /now で時計を合わせる:
-# 時計が 1970 年だと、zig cc がキャッシュを信じない)。1 行に 1 つ: 名前 秒 status user sys idle (/proc/stat の tick)
+# test/vm.py の VM のホーム、Linux では test/linux-vm.sh と同じ init で ext4 の /work (LINUX_WORK_DIR=BASE で中身に、
+# LINUX_WORK_SIZE=4G。init は /now で時計を合わせる: 時計が 1970 年だと、zig cc がキャッシュを信じない)。1 行に 1 つ: 名前 秒 status user sys idle (/proc/stat の tick)
 B=$1
 export PATH=$B/bin HOME=$B LC_ALL=C
 export GIT_AUTHOR_NAME=a GIT_AUTHOR_EMAIL=a@a GIT_COMMITTER_NAME=a GIT_COMMITTER_EMAIL=a@a
