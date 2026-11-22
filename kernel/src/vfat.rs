@@ -673,6 +673,7 @@ impl Inode for FatNode {
             blocks: size.div_ceil(512),
             mtime,
             ctime: mtime,
+            atime: mtime,
         }
     }
 

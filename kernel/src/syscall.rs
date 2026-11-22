@@ -2030,6 +2030,8 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
                     return Err(-EPERM);
                 }
                 path = Some(p.clone());
+                // 写したファイルの atime (Linux の generic_file_mmap と shmem_mmap の file_accessed)
+                crate::vfs::file_accessed(ino, p, f.flags);
                 Backing::File { ino: ino.clone(), off, fend: usize::MAX, ver: crate::vm::file_ver(ino) }
             }
             // 装置やソケット (画面、音の再生の口、TCP のソケット: file.rs の mmap_dev。Linux の f_op->mmap)。ほかは ENODEV

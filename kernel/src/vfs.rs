@@ -49,6 +49,8 @@ pub struct Meta {
     pub blocks: u64,
     pub mtime: u64,
     pub ctime: u64,
+    /// 読んだ時刻 (ns。持たないファイルシステムは mtime と同じ)
+    pub atime: u64,
 }
 
 impl Meta {
@@ -173,6 +175,11 @@ pub trait Inode {
         false
     }
 
+    /// 大きなロックなしの read と getdents (vfs::atime_fresh) から: いまの Meta (ext4 だけ。ディスクを待つなら None)
+    // [lockless]
+    fn fast_meta(&self) -> Option<Meta> {
+        None
+    }
     /// 大きなロックなしの mmap (vm::fast_mmap_file) から: 同じファイルをさす新しい InodeRef と、いまの Meta。返す Rc は
     /// だれとも分けていない新しいもの (大きなロックなしの道で、分けている Rc の数を変えないため)。作れなければ None
     /// (ふつうの道で)。ext4 だけ (tmpfs の inode はそれ 1 つしかない)
@@ -311,6 +318,26 @@ pub trait Inode {
     /// fsx は印で表せないもの (xflags の共通でない印、extsize、projid、cowextsize) がわたされたときの projid
     fn set_fs_flags(&self, _flags: u32, _fsx: Option<u32>) -> Result<(), i64> {
         Err(-25)
+    }
+    /// 読んだ時刻を変える (relatime: vfs::file_accessed)。持たないものは何もしない。ctime は変えない
+    fn set_atime(&self, _ns: u64) -> Result<(), i64> {
+        Ok(())
+    }
+    /// atime を持つものは、その時刻の細かさ (ns: ext4 は 1 秒、tmpfs は 1 ns。Linux の s_time_gran)。0 は持たない
+    /// (読んでも変えない)
+    // [lockless]
+    fn atime_gran(&self) -> u64 {
+        0
+    }
+    /// utimensat: atime と mtime (None は変えない) と、ctime をいまに (Linux の notify_change の ATTR_CTIME)
+    fn set_times(&self, atime: Option<u64>, mtime: Option<u64>) -> Result<(), i64> {
+        if let Some(m) = mtime {
+            self.set_mtime(m)?;
+        }
+        if let Some(a) = atime {
+            self.set_atime(a)?;
+        }
+        Ok(())
     }
 }
 
@@ -754,6 +781,7 @@ fn mount_at(path: &str, fsroot: InodeRef, root_path: &str, source: &str, fstype:
         ro_mark(&ns);
     }
     let (target, dir) = lookup("", path, true)?;
+    note_attrs(attrs, &fsroot);
     ns.list.borrow_mut().push(Mount { id: new_mnt_id(), at: dir.id(), root: fsroot, root_path: root_path.into(), source: source.into(), target, fstype: fstype.into(), ro, attrs });
     // マウント先の表は、全体の版を進める前に (それを読んでから引くもの (statc) が、新しいマウント先を見落とさないように)
     mount_at_refresh();
@@ -854,6 +882,124 @@ pub fn check_writable(path: &str) -> Result<(), i64> {
         None => !SB_RO.get().is_empty() && sb_ro(root().id().0),
     };
     if ro { Err(-EROFS) } else { Ok(()) }
+}
+
+/// atime を覚えるファイルシステム (ext4) を strictatime でマウントしたことがあるか (あれば file_accessed は覚え
+/// (statc::atime_fresh) を使わず、毎回マウントを見る。覚えは inode ごとで、どのマウントから読んだかを持たないので)
+pub static STRICT_SEEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// どれかのファイルシステムを strictatime でマウントしたことがあるか (なければ、relatime の決まりで変えなくてよいものは
+/// マウントを見ずにすむ)
+static STRICT_ANY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn note_attrs(attrs: u32, root: &InodeRef) {
+    if attrs & ATTR_ATIME == ATTR_STRICTATIME {
+        STRICT_ANY.store(true, core::sync::atomic::Ordering::Relaxed);
+        if root.page_cacheable() {
+            STRICT_SEEN.store(true, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+const O_NOATIME: u32 = 0o1000000;
+const SEC: u64 = 1_000_000_000;
+
+/// relatime の決まり (Linux の relatime_need_update と、いまと同じなら書かない atime_needs_update) で、いま (now: その
+/// ファイルシステムの細かさに切ったもの) 読んでも atime を変えなくてよいなら、変えなくてよいあいだ (この秒の前まで):
+/// atime が mtime と ctime より新しければ 1 日たつまで、いまと同じなら、いまの秒のうち
+// [lockless]
+fn relatime_until(m: &Meta, now: u64) -> Option<u64> {
+    const DAY: u64 = 86400;
+    let (a, now_s) = (m.atime, now / SEC);
+    if m.mtime < a && m.ctime < a && now_s.saturating_sub(a / SEC) < DAY {
+        Some(a / SEC + DAY)
+    } else if a == now {
+        Some(now_s + 1)
+    } else {
+        None
+    }
+}
+
+/// 大きなロックなしの read と getdents: 読んでも atime を変えなくてよいか (O_NOATIME で開いた、atime を持たない、
+/// file_accessed が覚えた「変えなくてよい」がいまも正しい、覚えになければ inode の時刻 (fast_meta) が relatime の決まりで
+/// 変えなくてよい: それを覚える)。わからなければふつうの道へ (そこで file_accessed)
+// [lockless]
+pub fn atime_fresh(ino: &InodeRef, flags: u32) -> bool {
+    let gran = ino.atime_gran();
+    if flags & O_NOATIME != 0 || gran == 0 {
+        return true;
+    }
+    if STRICT_SEEN.load(core::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    let now = crate::timer::coarse_epoch_ns();
+    let now = now - now % gran;
+    let id = ino.id();
+    if crate::statc::atime_fresh(id, now / SEC) {
+        return true;
+    }
+    let ver = crate::statc::ino_ver(id);
+    match ino.fast_meta().and_then(|m| relatime_until(&m, now)) {
+        Some(until) => {
+            crate::statc::atime_learn(id, ver, until);
+            true
+        }
+        None => false,
+    }
+}
+
+/// 開いたファイルを読んだ (read、pread、mmap、getdents、exec: Linux の file_accessed と touch_atime)。O_NOATIME で開いた
+/// もの、atime を持たないもの (atime_gran が 0)、noatime のマウント、nodiratime のマウントのディレクトリ、chattr +A、
+/// 読むだけのマウントは変えない。relatime (ふつう) は、atime が mtime か ctime より前 (同じも) か、1 日より前のときだけ、
+/// strictatime はいつも。いまと同じ (その細かさで) なら書かない。ext4 は「変えなくてよい」を覚え (statc::atime_fresh)、
+/// 大きなロックなしの read と getdents はそれを見て、変えるかもしれなければふつうの道へ。覚えるのは、どのマウントから
+/// 読んでも同じになるわけ (relatime の決まり、いまと同じ、chattr +A) だけ: noatime などのマウントで読んだものは覚えない
+/// (同じ inode を relatime のマウントからも読めるので)
+pub fn file_accessed(ino: &InodeRef, path: &str, flags: u32) {
+    let gran = ino.atime_gran();
+    if flags & O_NOATIME != 0 || gran == 0 {
+        return;
+    }
+    // ext4 の秒は ext4 が書く時刻 (粗い時計) と同じもので
+    let now = if gran >= SEC { crate::timer::coarse_epoch_ns() } else { crate::timer::stamp_ns() };
+    let now = now - now % gran;
+    let id = ino.id();
+    let strict_seen = if ino.page_cacheable() { STRICT_SEEN.load(core::sync::atomic::Ordering::Relaxed) } else { STRICT_ANY.load(core::sync::atomic::Ordering::Relaxed) };
+    let cached = ino.page_cacheable() && !strict_seen;
+    if cached && crate::statc::atime_fresh(id, now / SEC) {
+        return;
+    }
+    let ver = crate::statc::ino_ver(id);
+    let m = ino.meta();
+    let learn = |until: u64| {
+        if cached {
+            crate::statc::atime_learn(id, ver, until);
+        }
+    };
+    let until = relatime_until(&m, now);
+    if !strict_seen && let Some(u) = until {
+        learn(u);
+        return;
+    }
+    // 開いたファイルのパスは / から (マウントの表は先頭の / なし)
+    let path = path.trim_start_matches('/');
+    let attrs = mount_flags(path);
+    if attrs & ATTR_ATIME == ATTR_NOATIME || (m.is_dir() && attrs & ATTR_NODIRATIME != 0) || check_writable(path).is_err() {
+        return;
+    }
+    if if attrs & ATTR_ATIME == ATTR_STRICTATIME { m.atime == now } else { until.is_some() } {
+        return;
+    }
+    // chattr +A (FS_NOATIME_FL): 印を変えれば inode を書くので、覚えはそのとき古くなる
+    if ino.fs_flags().is_ok_and(|f| f & 0x80 != 0) {
+        learn(u64::MAX);
+        return;
+    }
+    if ino.set_atime(now).is_ok()
+        && cached
+        && let Some(u) = relatime_until(&Meta { atime: now, ..m }, now)
+    {
+        crate::statc::atime_learn(id, crate::statc::ino_ver(id), u);
+    }
 }
 
 /// path (たどったあと) のあるマウントの印 (ATTR_NOEXEC など: exec、mmap、デバイスを開くときに見る)
@@ -1090,6 +1236,7 @@ fn detached_sweep() {
 /// 作ったファイルシステムの根を、はなれたマウントに (fsmount)。番号を返す
 pub fn detached_new(root: InodeRef, source: &str, fstype: &str, ro: bool, attrs: u32) -> u32 {
     detached_sweep();
+    note_attrs(attrs, &root);
     let id = new_mnt_id();
     let m = Mount { id, at: (0, 0), root, root_path: "/".into(), source: source.into(), target: String::new(), fstype: fstype.into(), ro, attrs };
     DETACHED.get().insert(id, Detached { mounts: alloc::vec![m], file: None });
@@ -1233,6 +1380,7 @@ pub fn set_mount_attrs(path: &str, set: u32, clr: u32, recursive: bool) -> Resul
         let a = ((m.attrs | if m.ro { ATTR_RDONLY } else { 0 }) & !clr) | set;
         m.ro = a & ATTR_RDONLY != 0;
         m.attrs = a & !ATTR_RDONLY;
+        note_attrs(m.attrs, &m.root);
     };
     let ns = current_mnt();
     if set & ATTR_RDONLY != 0 {

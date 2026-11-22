@@ -329,9 +329,9 @@ impl Inode for EfiNode {
     fn meta(&self) -> Meta {
         if self.ino == 1 {
             let t = self.fs.time;
-            return Meta { ino: 1, mode: S_IFDIR | 0o755, nlink: 2, uid: 0, gid: 0, size: 0, rdev: 0, blocks: 0, mtime: t, ctime: t };
+            return Meta { ino: 1, mode: S_IFDIR | 0o755, nlink: 2, uid: 0, gid: 0, size: 0, rdev: 0, blocks: 0, mtime: t, ctime: t, atime: t };
         }
-        self.var(|v| Meta { ino: v.ino, mode: v.mode, nlink: 1, uid: v.uid, gid: v.gid, size: v.size, rdev: 0, blocks: 0, mtime: v.mtime, ctime: v.ctime })
+        self.var(|v| Meta { ino: v.ino, mode: v.mode, nlink: 1, uid: v.uid, gid: v.gid, size: v.size, rdev: 0, blocks: 0, mtime: v.mtime, ctime: v.ctime, atime: v.mtime })
             .unwrap_or(Meta { ino: self.ino, mode: S_IFREG | 0o644, ..Meta::default() })
     }
 

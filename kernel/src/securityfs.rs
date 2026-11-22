@@ -180,7 +180,7 @@ impl Inode for SecInode {
 
     fn meta(&self) -> Meta {
         let now = crate::timer::epoch_ns();
-        Meta { ino: self.ino(), mode: self.mode(), nlink: 1, uid: 0, gid: 0, size: 0, rdev: 0, blocks: 0, mtime: now, ctime: now }
+        Meta { ino: self.ino(), mode: self.mode(), nlink: 1, uid: 0, gid: 0, size: 0, rdev: 0, blocks: 0, mtime: now, ctime: now, atime: now }
     }
 
     fn read_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, i64> {

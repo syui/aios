@@ -1070,6 +1070,10 @@ fn read_inode_file(f: &FileRef, ino: &InodeRef, path: &str, dst: &mut [u8]) -> R
     {
         crate::vfs::notify::file_event(path, ino, crate::vfs::notify::IN_ACCESS);
     }
+    if !dst.is_empty() {
+        let flags = f.borrow().flags;
+        vfs::file_accessed(ino, path, flags);
+    }
     r
 }
 
@@ -1153,6 +1157,7 @@ pub struct Stat {
     pub rdev: u64,
     pub size: u64,
     pub blocks: u64,
+    pub atime: u64,
     pub mtime: u64,
     pub ctime: u64,
 }
@@ -1175,6 +1180,7 @@ impl Stat {
             rdev: m.rdev,
             size: m.size,
             blocks: m.blocks,
+            atime: m.atime,
             mtime: m.mtime,
             ctime: m.ctime,
         }
@@ -1182,7 +1188,7 @@ impl Stat {
 
     /// ファイルシステムのないもの (anon_inode の dev。ソケットとパイプは呼ぶほうが dev を)
     pub fn dev(mode: u32, rdev: u64) -> Stat {
-        Stat { dev: vfs::encode_dev(vfs::ANON_DEV), ino: 0, mode, nlink: 1, uid: 0, gid: 0, rdev, size: 0, blocks: 0, mtime: 0, ctime: 0 }
+        Stat { dev: vfs::encode_dev(vfs::ANON_DEV), ino: 0, mode, nlink: 1, uid: 0, gid: 0, rdev, size: 0, blocks: 0, atime: 0, mtime: 0, ctime: 0 }
     }
 
     /// st_dev をカーネルの形 (major << 20 | minor) に (fdinfo の sdev)
@@ -1205,7 +1211,7 @@ impl Stat {
         b[48..56].copy_from_slice(&self.size.to_le_bytes());
         b[56..60].copy_from_slice(&4096u32.to_le_bytes()); // st_blksize
         b[64..72].copy_from_slice(&self.blocks.to_le_bytes()); // st_blocks
-        let times = [(72, self.mtime), (88, self.mtime), (104, self.ctime)];
+        let times = [(72, self.atime), (88, self.mtime), (104, self.ctime)];
         for (off, ns) in times {
             b[off..off + 8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
             b[off + 8..off + 16].copy_from_slice(&(ns % 1_000_000_000).to_le_bytes());
@@ -1243,7 +1249,7 @@ impl Stat {
         b[40..48].copy_from_slice(&self.size.to_le_bytes());
         b[48..56].copy_from_slice(&self.blocks.to_le_bytes());
         // atime, (btime なし), ctime, mtime
-        let times: &[(usize, u64)] = if cm { &[(64, self.mtime), (96, self.ctime), (112, self.mtime)] } else { &[(64, self.mtime)] };
+        let times: &[(usize, u64)] = if cm { &[(64, self.atime), (96, self.ctime), (112, self.mtime)] } else { &[(64, self.atime)] };
         for &(off, ns) in times {
             b[off..off + 8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
             b[off + 8..off + 12].copy_from_slice(&((ns % 1_000_000_000) as u32).to_le_bytes());
@@ -1295,6 +1301,9 @@ impl OpenFile {
                 self.offset += n;
                 if n > 0 {
                     crate::vfs::notify::file_event(path, ino, crate::vfs::notify::IN_ACCESS);
+                }
+                if !dst.is_empty() {
+                    vfs::file_accessed(ino, path, self.flags);
                 }
                 Ok(n)
             }
@@ -1390,7 +1399,7 @@ impl OpenFile {
             // dev と ino が同じなら同じファイルとみなす
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => {
                 use core::sync::atomic::Ordering::Relaxed;
-                Stat { dev: vfs::encode_dev(vfs::PIPE_DEV), ino: Rc::as_ptr(p) as usize as u64 & 0xffffff, uid: p.uid.load(Relaxed), gid: p.gid.load(Relaxed), mtime: p.mtime.load(Relaxed), ctime: p.ctime.load(Relaxed), ..Stat::dev(S_IFIFO | p.perm.load(Relaxed), 0) }
+                Stat { dev: vfs::encode_dev(vfs::PIPE_DEV), ino: Rc::as_ptr(p) as usize as u64 & 0xffffff, uid: p.uid.load(Relaxed), gid: p.gid.load(Relaxed), atime: p.mtime.load(Relaxed), mtime: p.mtime.load(Relaxed), ctime: p.ctime.load(Relaxed), ..Stat::dev(S_IFIFO | p.perm.load(Relaxed), 0) }
             }
             // pidfd はプロセス (スレッド) ごとの inode (Linux の pidfs: 同じものを指す pidfd は同じ ino。aios の pid は
             // 使いまわさないので番号そのもの)
@@ -1866,8 +1875,9 @@ pub const PIPE_SIZE: usize = 64 * 1024;
 pub static FAST_RW: [core::sync::atomic::AtomicU64; 12] = [const { core::sync::atomic::AtomicU64::new(0) }; 12];
 /// 大きなロックなしのファイルの read (fast_read_file) の数: [0] うまくいったもの、ほかはふつうの道へ行ったわけ
 /// (1 大きさか、わざとしくじらせる決まりがある、2 IN_ACCESS の見張り、3 fd の表をほかのスレッドが変えている途中、4 ほかの人がその開いたファイルの
-/// 位置を使っている途中 (pos_slow)、5 ext4 のファイルでない、6 ページキャッシュにない)。/proc/bkl に出す
-pub static FAST_READ: [core::sync::atomic::AtomicU64; 7] = [const { core::sync::atomic::AtomicU64::new(0) }; 7];
+/// 位置を使っている途中 (pos_slow)、5 ext4 のファイルでない、6 ページキャッシュにない、7 atime を変えるかもしれない
+/// (vfs::atime_fresh))。/proc/bkl に出す
+pub static FAST_READ: [core::sync::atomic::AtomicU64; 8] = [const { core::sync::atomic::AtomicU64::new(0) }; 8];
 pub const PIPE_MAX: usize = 1024 * 1024;
 
 /// パイプの中身: Linux の pipe_buffer と同じく、ページ (4KiB) ひとつずつの箱の列。箱の数はパイプの大きさ / 4KiB
@@ -2206,6 +2216,10 @@ fn fast_read_file_inner(me: &proc::Proc, fd: u64, va: usize, len: usize) -> Resu
     if !ino.page_cacheable() {
         return Err(5);
     }
+    // 読むと atime を変えるかもしれなければ、ふつうの道 (file_accessed) へ
+    if !crate::vfs::atime_fresh(ino, of.flags) {
+        return Err(7);
+    }
     let n = crate::vm::read_fast(me.pt(), ino.id(), of.offset, va, len).ok_or(6usize)?;
     of.offset += n;
     Ok(n as i64)
@@ -2288,8 +2302,9 @@ pub fn pos_fast(f: &FileRef) -> Option<PosFast> {
 
 /// 大きなロックなしの getdents64 の数: [0] 答えた、ふつうの道へ: [1] 口の形 (O_PATH、ルートの ext4 でない、IN_ACCESS の
 /// 見張り、fail)、[2] ext4 が読めない (ハッシュの順に読まない、キャッシュにない、消した、ディレクトリでない)、[3] 位置を
-/// 使っている途中、[4] はじめの項目が入らない (EINVAL) かユーザーのページが写っていない。/proc/bkl に出す
-pub static FAST_DENTS: [core::sync::atomic::AtomicU64; 5] = [const { core::sync::atomic::AtomicU64::new(0) }; 5];
+/// 使っている途中、[4] はじめの項目が入らない (EINVAL) かユーザーのページが写っていない、[5] atime を変えるかもしれない
+/// (vfs::atime_fresh)。/proc/bkl に出す
+pub static FAST_DENTS: [core::sync::atomic::AtomicU64; 6] = [const { core::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// 大きなロックなしの getdents64 (syscall::fast): ルートの ext4 のディレクトリを、ふつうの道 (OpenFile::getdents) と
 /// 同じ位置と並び (ハッシュの順。d_off は次の項目の位置、終わりは i64::MAX) で。開いた口の位置の札を取って (ほかの人が
@@ -2322,6 +2337,9 @@ fn fast_getdents_inner(me: &proc::Proc, fd: u64, va: usize, len: usize) -> Resul
         return Err(1);
     }
     let Kind::Inode(ino, _) = &of.kind else { return Err(1) };
+    if !crate::vfs::atime_fresh(ino, of.flags) {
+        return Err(5);
+    }
     let (fs, dir) = ino.id();
     let pos = of.offset as u64;
     let mut names = Vec::new();
@@ -2374,7 +2392,7 @@ pub fn fast_pread(me: &proc::Proc, fd: u64, va: usize, len: usize, off: i64) -> 
         return None;
     }
     let Kind::Inode(ino, _) = &of.kind else { return None };
-    if !ino.page_cacheable() {
+    if !ino.page_cacheable() || !crate::vfs::atime_fresh(ino, of.flags) {
         return None;
     }
     crate::vm::read_fast(me.pt(), ino.id(), off as usize, va, len).map(|n| n as i64)

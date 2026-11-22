@@ -214,6 +214,8 @@ fn exec_depth(t: Target, execfn: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth
     // #! で始まるスクリプトは、書かれたインタプリタにスクリプトのパスを渡して動かす
     let mut head = [0u8; 256];
     let n = read_file(&ino, 0, &mut head)?;
+    // 読んだプログラム (とスクリプト) の atime (Linux の prepare_binprm の kernel_read)
+    crate::vfs::file_accessed(&ino, &exe, 0);
     if n >= 2 && &head[..2] == b"#!" {
         const ELOOP: i64 = 40;
         if depth >= 4 {
@@ -254,6 +256,7 @@ fn exec_depth(t: Target, execfn: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth
             nondump |= !crate::cred::current().may(&im, crate::cred::R, false);
             let isize = im.size as usize;
             let i = load_elf(&mut pt, &iino, isize, INTERP_BASE, &ipath)?;
+            crate::vfs::file_accessed(&iino, &ipath, 0);
             if i.interp.is_some() {
                 return Err(-ENOEXEC);
             }

@@ -5,7 +5,7 @@
 #                 (test/ を http で見せている VM: test/vm.py start --www test。プログラムは bin/ から取る)
 # どれもしくじった数を終了コードで返す。1 行に ok NAME か FAIL NAME。おしまいに ctests: N failed
 # hang.c と watch.c はテストではなく、わざと止まる道具なので入れない
-TESTS="apparmor appendrace audit auditdir auditexec auditpath auditrules bigunmap chattr chosen chrootlink clone3 closerange closeshared cpuclock cpuid cputime cpuvuln createrace ctev ctnl cwdperm cwdrace dad6 dentsfast dev dirents drmatomic drmkms drmrender dumpable efivarfs epoll exec-thread fastmap fchroot fhandle flushrace forkcow frag6 fsrace fsuid fsx futex futex2 futexrace inet6 inet6net inetsock inotify ipcns landlock-eexist landlockabi listns loginuid madvfree madvise mincore mld6 mldrep6 mlock mmapcoh mnt mountinfo mremap mseal ndsilence netlink newmount nftables nfteval nfteval6 nftsk nice ns onlink6 opentreeattr openat2 opencache openfast openrace orphan pagecache pagetables pathcache peerpidfd pidfdinfo pidnswait pipeslots pivotns pivotroot pmtu6 portparity posrace prctl procfiles procknobs procmadv procmaps procmem procpid procstatus procwait ptrace ptrace2 pwfast random rcrace remapfp rdnss6 recverr6 rlimit rlock robust route rtnl6 rtnladdr rtnllink seccomp seccompnotify shm settime setns signalfd sigstatus sigtramp sleeps splice statc statmount statcache syncrange sysctl6 syslog sysmisc sysvipc temp6 threadmap ttou umountbusy uname unixrace unixsock userns vdso vgetrandom vmsplice xattr"
+TESTS="apparmor appendrace atime audit auditdir auditexec auditpath auditrules bigunmap chattr chosen chrootlink clone3 closerange closeshared cpuclock cpuid cputime cpuvuln createrace ctev ctnl cwdperm cwdrace dad6 dentsfast dev dirents drmatomic drmkms drmrender dumpable efivarfs epoll exec-thread fastmap fchroot fhandle flushrace forkcow frag6 fsrace fsuid fsx futex futex2 futexrace inet6 inet6net inetsock inotify ipcns landlock-eexist landlockabi listns loginuid madvfree madvise mincore mld6 mldrep6 mlock mmapcoh mnt mountinfo mremap mseal ndsilence netlink newmount nftables nfteval nfteval6 nftsk nice ns onlink6 opentreeattr openat2 opencache openfast openrace orphan pagecache pagetables pathcache peerpidfd pidfdinfo pidnswait pipeslots pivotns pivotroot pmtu6 portparity posrace prctl procfiles procknobs procmadv procmaps procmem procpid procstatus procwait ptrace ptrace2 pwfast random rcrace remapfp rdnss6 recverr6 rlimit rlock robust route rtnl6 rtnladdr rtnllink seccomp seccompnotify shm settime setns signalfd sigstatus sigtramp sleeps splice statc statmount statcache syncrange sysctl6 syslog sysmisc sysvipc temp6 threadmap ttou umountbusy uname unixrace unixsock userns vdso vgetrandom vmsplice xattr"
 
 case $1 in
 build)
@@ -60,6 +60,8 @@ run)
     remapfp) cmd="./$t $HOME /tmp" ;;
     # chattr (ext4 の印と file_getattr) も ext4 (ホーム) と tmpfs (/tmp) で、root で (CAP_LINUX_IMMUTABLE)
     chattr) cmd="sudo -n ./$t $HOME /tmp" ;;
+    # atime も ext4 (ホーム) と tmpfs (/tmp) で、root で (utimensat で決め、noatime などの tmpfs をマウントする)
+    atime) cmd="sudo -n ./$t $HOME /tmp" ;;
     # cwdperm (cwd からの相対パスは cwd から先だけの許可で) も ext4 (ホーム) と tmpfs (/tmp) で、root で (nobody になる)
     cwdperm) cmd="sudo -n ./$t $HOME /tmp" ;;
     # ptrace も root で (nobody で init に ATTACH して EPERM を見る)

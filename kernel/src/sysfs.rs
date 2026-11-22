@@ -463,7 +463,7 @@ impl Inode for SysInode {
             None => 4096,
         };
         let now = crate::timer::epoch_ns();
-        Meta { ino: self.ino(), mode, nlink: 1, uid: 0, gid: 0, size, rdev: 0, blocks: 0, mtime: now, ctime: now }
+        Meta { ino: self.ino(), mode, nlink: 1, uid: 0, gid: 0, size, rdev: 0, blocks: 0, mtime: now, ctime: now, atime: now }
     }
 
     fn read_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, i64> {

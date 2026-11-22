@@ -49,8 +49,8 @@ const NAME_BOXES: usize = 65536;
 pub const PATH: usize = 192;
 /// 覚える、通ったディレクトリと gates の数の上限。ディレクトリは 1 つの 64 語に入るだけ (12 のときは、/home/USER の下の
 /// 10 段のパス (fsbench の deep-stat) がいつも入らず、そのたびに表を引いて外れ、ふつうの道で覚えようとして断っていた)。
-/// 22 から 21 に: マウントの語 (MNT_W) のため
-const DIRS_MAX: usize = 21;
+/// 22 から 21 に: マウントの語 (MNT_W) のため。21 から 20 に: atime の語のため
+const DIRS_MAX: usize = 20;
 const GATES_MAX: usize = 4;
 
 // 1 つの並び (AtomicU64 の番号)
@@ -70,11 +70,11 @@ const GATE0: usize = DIR0 + DIRS_MAX;
 const GATE_MODES: usize = GATE0 + GATES_MAX;
 const PATH0: usize = GATE_MODES + 1;
 /// file::Stat: ino、mode | nlink << 32、uid | gid << 32、rdev << 32 | dev (どちらもカーネルの形の 32 ビット: major << 20 |
-/// minor)、size、blocks、mtime、ctime
+/// minor)、size、blocks、mtime、ctime、atime
 const STAT0: usize = PATH0 + PATH / 8;
-/// stat の 8 つのあとに、マウント (番号 | その根なら 1 << 63。0 はわからない: statx はふつうの道へ)
-const MNT_W: usize = STAT0 + 8;
-const WORDS: usize = STAT0 + 9;
+/// stat の 9 つのあとに、マウント (番号 | その根なら 1 << 63。0 はわからない: statx はふつうの道へ)
+const MNT_W: usize = STAT0 + 9;
+const WORDS: usize = STAT0 + 10;
 
 /// マウントの語 (番号、その根か)。0 はわからない
 fn mnt_word(m: Option<(u64, bool)>) -> u64 {
@@ -93,15 +93,15 @@ fn udev(k: u64) -> u64 {
     crate::vfs::encode_dev(((k >> 20) as u32, (k & 0xfffff) as u32))
 }
 
-/// Stat を表の 8 語に
+/// Stat を表の 9 語に
 // [lockless]
-fn stat_words(st: &Stat) -> [u64; 8] {
-    [st.ino, st.mode as u64 | (st.nlink as u64) << 32, st.uid as u64 | (st.gid as u64) << 32, kdev(st.rdev) << 32 | kdev(st.dev), st.size, st.blocks, st.mtime, st.ctime]
+fn stat_words(st: &Stat) -> [u64; 9] {
+    [st.ino, st.mode as u64 | (st.nlink as u64) << 32, st.uid as u64 | (st.gid as u64) << 32, kdev(st.rdev) << 32 | kdev(st.dev), st.size, st.blocks, st.mtime, st.ctime, st.atime]
 }
 
 // [lockless]
 fn words_stat(w: &[u64]) -> Stat {
-    Stat { dev: udev(w[3] & 0xffff_ffff), ino: w[0], mode: w[1] as u32, nlink: (w[1] >> 32) as u32, uid: w[2] as u32, gid: (w[2] >> 32) as u32, rdev: udev(w[3] >> 32), size: w[4], blocks: w[5], mtime: w[6], ctime: w[7] }
+    Stat { dev: udev(w[3] & 0xffff_ffff), ino: w[0], mode: w[1] as u32, nlink: (w[1] >> 32) as u32, uid: w[2] as u32, gid: (w[2] >> 32) as u32, rdev: udev(w[3] >> 32), size: w[4], blocks: w[5], mtime: w[6], ctime: w[7], atime: w[8] }
 }
 
 #[repr(align(64))]
@@ -188,6 +188,47 @@ pub fn ino_bump(id: (usize, u64)) {
 // [lockless]
 pub fn ino_ver(id: (usize, u64)) -> u64 {
     INOS[box_of(id)].load(Acquire)
+}
+
+/// atime を変えなくてよいとわかっている ext4 の inode (vfs::file_accessed が書き、大きなロックなしの read と getdents が
+/// atime_fresh で見る)。1 つは seq (書いているあいだ奇数)、inode (fs << 40 ^ ino | 1 << 63)、そのときの inode の箱の版
+/// (ino_ver)、その秒まで (relatime なら atime から 1 日)。inode を書けば (時刻が変われば) 版が進むので古くなる
+#[repr(align(32))]
+struct AtSlot([AtomicU64; 4]);
+
+const AT_SLOTS: usize = 1024;
+static ATIMES: [AtSlot; AT_SLOTS] = [const { AtSlot([Z; 4]) }; AT_SLOTS];
+
+// [lockless]
+fn at_key(id: (usize, u64)) -> u64 {
+    ((id.0 as u64) << 40 ^ id.1) | 1 << 63
+}
+
+/// id の atime は、いま (now_s 秒) 変えなくてよいか
+// [lockless]
+pub fn atime_fresh(id: (usize, u64), now_s: u64) -> bool {
+    let s = &ATIMES[box_of(id) % AT_SLOTS].0;
+    let seq = s[0].load(Acquire);
+    if seq & 1 != 0 {
+        return false;
+    }
+    let (key, ver, until) = (s[1].load(Relaxed), s[2].load(Relaxed), s[3].load(Relaxed));
+    core::sync::atomic::fence(Acquire);
+    s[0].load(Relaxed) == seq && key == at_key(id) && ver == ino_ver(id) && now_s < until
+}
+
+/// id の atime は、版が ver のあいだ、until 秒まで変えなくてよい (ほかの人が書いている途中なら覚えない)
+// [lockless]
+pub fn atime_learn(id: (usize, u64), ver: u64, until: u64) {
+    let s = &ATIMES[box_of(id) % AT_SLOTS].0;
+    let seq = s[0].load(Relaxed);
+    if seq & 1 != 0 || s[0].compare_exchange(seq, seq + 1, Acquire, Relaxed).is_err() {
+        return;
+    }
+    s[1].store(at_key(id), Relaxed);
+    s[2].store(ver, Relaxed);
+    s[3].store(until, Relaxed);
+    s[0].store(seq + 2, Release);
 }
 
 /// 箱 b (name_box) の版 (vfs::fast_stat_trail が、パスの覚えがいまも正しいかを確かめる前に読む)
@@ -915,7 +956,7 @@ fn check(p: &Proc, key: &[u8], follow: bool, ino: bool) -> Option<Answer> {
             return None;
         }
     }
-    let mut w = [0u64; 9];
+    let mut w = [0u64; 10];
     for (i, w) in w.iter_mut().enumerate() {
         *w = s[STAT0 + i].load(Relaxed);
     }
@@ -928,5 +969,5 @@ fn check(p: &Proc, key: &[u8], follow: bool, ino: bool) -> Option<Answer> {
         return Some(Answer::Missing(false));
     }
     let st = words_stat(&w);
-    Some(Answer::Found(st, shape >> 40 & 1 != 0, shape >> 42 & 1 != 0, fresh, w[8]))
+    Some(Answer::Found(st, shape >> 40 & 1 != 0, shape >> 42 & 1 != 0, fresh, w[9]))
 }

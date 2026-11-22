@@ -289,6 +289,7 @@ struct Attr {
     nlink: u32,
     mtime: u64,
     ctime: u64,
+    atime: u64,
 }
 
 pub struct TmpInode {
@@ -349,7 +350,7 @@ impl TmpInode {
         };
         let nlink = if matches!(node, Node::Dir(_)) { 2 } else { 1 };
         let t = now();
-        Rc::new(TmpInode { fs, ino, attr: RefCell::new(Attr { mode, uid: 0, gid: 0, nlink, mtime: t, ctime: t }), node: RefCell::new(node), seals: core::cell::Cell::new(None), linkable: core::cell::Cell::new(false), pos: RefCell::new(DirPos::default()) })
+        Rc::new(TmpInode { fs, ino, attr: RefCell::new(Attr { mode, uid: 0, gid: 0, nlink, mtime: t, ctime: t, atime: t }), node: RefCell::new(node), seals: core::cell::Cell::new(None), linkable: core::cell::Cell::new(false), pos: RefCell::new(DirPos::default()) })
     }
 
     fn touch(&self) {
@@ -607,7 +608,7 @@ impl Inode for TmpInode {
             Node::Dev(ma, mi) => (0, ((*ma as u64) << 8) | *mi as u64),
             Node::Fifo => (0, 0),
         };
-        Meta { ino: self.ino, mode: a.mode, nlink: a.nlink, uid: a.uid, gid: a.gid, size, rdev, blocks: pages * 8, mtime: a.mtime, ctime: a.ctime }
+        Meta { ino: self.ino, mode: a.mode, nlink: a.nlink, uid: a.uid, gid: a.gid, size, rdev, blocks: pages * 8, mtime: a.mtime, ctime: a.ctime, atime: a.atime }
     }
 
     fn read_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, i64> {
@@ -1022,6 +1023,28 @@ impl Inode for TmpInode {
 
     fn set_mtime(&self, ns: u64) -> Result<(), i64> {
         self.attr.borrow_mut().mtime = ns;
+        Ok(())
+    }
+
+    fn set_atime(&self, ns: u64) -> Result<(), i64> {
+        self.attr.borrow_mut().atime = ns;
+        Ok(())
+    }
+
+    // [lockless]
+    fn atime_gran(&self) -> u64 {
+        1
+    }
+
+    fn set_times(&self, atime: Option<u64>, mtime: Option<u64>) -> Result<(), i64> {
+        let mut a = self.attr.borrow_mut();
+        if let Some(t) = atime {
+            a.atime = t;
+        }
+        if let Some(t) = mtime {
+            a.mtime = t;
+        }
+        a.ctime = now();
         Ok(())
     }
 

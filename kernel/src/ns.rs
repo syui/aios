@@ -776,7 +776,7 @@ impl crate::vfs::Inode for NsInode {
     }
 
     fn meta(&self) -> crate::vfs::Meta {
-        crate::vfs::Meta { ino: self.which.id(), mode: crate::vfs::S_IFREG | 0o444, nlink: 1, uid: 0, gid: 0, size: 0, rdev: 0, blocks: 0, mtime: 0, ctime: 0 }
+        crate::vfs::Meta { ino: self.which.id(), mode: crate::vfs::S_IFREG | 0o444, nlink: 1, uid: 0, gid: 0, size: 0, rdev: 0, blocks: 0, mtime: 0, ctime: 0, atime: 0 }
     }
 
     fn as_any(&self) -> &dyn core::any::Any {

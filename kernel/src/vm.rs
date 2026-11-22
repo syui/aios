@@ -842,6 +842,10 @@ pub fn fast_mmap_file(me: &crate::proc::Proc, fd: u64, len: usize, prot: u64, of
         return None;
     }
     let Kind::Inode(ino, path) = &of.kind else { return None };
+    // 写すと atime を変えるかもしれなければ、ふつうの道 (file_accessed) へ
+    if !crate::vfs::atime_fresh(ino, of.flags) {
+        return None;
+    }
     let (dup, meta) = ino.fast_dup()?;
     if meta.mode & crate::vfs::S_IFMT != crate::vfs::S_IFREG {
         return None;

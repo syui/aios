@@ -834,6 +834,17 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   GETREGSET / SETREGSET の NT_PRFPREG (v0〜v31、fpsr、fpcr: 528 バイト) と NT_ARM_SYSTEM_CALL (入口で番号を変える。
   -1 なら呼ばない。ユーザーの x8 は変えない)、PTRACE_GET_SYSCALL_INFO (入口 80、出口 33、ほか 24 バイト)。
   のこりは todo.json の syscall-gaps
+- atime (test/atime.c、root で ext4 と tmpfs とマウントの印で Linux と 5 行同じ): 前は持たなかった (stat の atime は mtime、
+  utimensat の atime は捨てていた)。いまは ext4 は inode の i_atime (秒)、tmpfs は自分の属性に持ち、stat と statx に出す。
+  utimensat は atime も決め、ctime をいまに (Linux の notify_change。前は ctime を変えなかった)。読んだら (read、pread、
+  readv、mmap、getdents、splice、exec のプログラムと ld.so) vfs::file_accessed (Linux の file_accessed と touch_atime) が
+  relatime の決まりで変える: atime が mtime か ctime より前 (同じも) か、1 日より前のときだけ、いまと同じなら書かない。
+  strictatime のマウントはいつも、noatime と、nodiratime のマウントのディレクトリ、O_NOATIME、chattr +A、読むだけの
+  マウントは変えない。書くのも stat も変えない。大きなロックなしの read、pread、getdents、mmap は、変えるかもしれなければ
+  ふつうの道へ: ext4 の inode ごとに「変えなくてよい (いつまで)」を表に覚え (statc::atime_learn。inode を書けば版が
+  進んで古くなる)、なければ inode の時刻をロックなしで読んで (fast_meta) relatime の決まりを見る。覚えるのは、どの
+  マウントから読んでも同じになるわけだけ (ext4 を strictatime でマウントしたことがあれば覚えを使わない)。fsbench の
+  read-4k (作ったばかりのファイルをはじめて読む) は 1.1 倍 (Linux も atime を書く)
 - cwd からの相対パスの許可 (test/cwdperm.c、root で ext4 と tmpfs で Linux と同じ): Linux は cwd (と開いているディレクトリ)
   から先だけを通れればよい (0700 のディレクトリの中に cd してから setuid した人も、cwd の中は使える)。aios のパスの覚えと
   ロックなしの stat の表は根からのパスで引くので、上のディレクトリが通れないと EACCES だった。いまは、根からたどって

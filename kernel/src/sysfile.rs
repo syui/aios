@@ -754,6 +754,12 @@ fn pread_flags(fd: u64, buf: usize, len: usize, off: i64, flags: u32, ra: usize)
     {
         inotify::file_event(path, i, inotify::IN_ACCESS);
     }
+    if let Some((i, path)) = &ino
+        && len > 0
+    {
+        let flags = f.borrow().flags;
+        vfs::file_accessed(i, path, flags);
+    }
     Ok(done as i64)
 }
 
@@ -1691,7 +1697,16 @@ pub fn getdents64(fd: u64, buf: usize, len: usize) -> R {
         return Err(-EBADF);
     }
     let mut v = Vec::new();
-    f.borrow_mut().getdents(&mut v, len)?;
+    let r = f.borrow_mut().getdents(&mut v, len);
+    // 読んだディレクトリの atime (Linux の iterate_dir: 消されたもの (ENOENT) とディレクトリでないもののほか、
+    // 入れ物が小さい (EINVAL) ときも)
+    if !matches!(r, Err(e) if e == -ENOTDIR || e == -vfs::ENOENT) {
+        let b = f.borrow();
+        if let Kind::Inode(i, path) = &b.kind {
+            vfs::file_accessed(i, path, b.flags);
+        }
+    }
+    r?;
     out(buf, &v)?;
     Ok(v.len() as i64)
 }
@@ -2464,7 +2479,7 @@ pub fn utimensat(dirfd: i64, pathp: usize, times: usize, flags: u64) -> R {
                 return Err(crate::why::inval());
             }
             let c = cred::current();
-            let m = vfs::Meta { ino: 0, mode, nlink: 1, uid, gid, size: 0, rdev: 0, blocks: 0, mtime: 0, ctime: 0 };
+            let m = vfs::Meta { ino: 0, mode, nlink: 1, uid, gid, size: 0, rdev: 0, blocks: 0, mtime: 0, ctime: 0, atime: 0 };
             let touch = t.is_none_or(|t| t[0].1 == UTIME_NOW && t[1].1 == UTIME_NOW);
             if !c.owns(&m) {
                 if !touch {
@@ -2527,17 +2542,15 @@ pub fn utimensat(dirfd: i64, pathp: usize, times: usize, flags: u64) -> R {
         }
     }
     let now = crate::timer::stamp_ns();
-    let mtime = match t {
+    let when = |i: usize| match t {
         None => Some(now),
-        Some(t) => match t[1] {
+        Some(t) => match t[i] {
             (_, UTIME_OMIT) => None,
             (_, UTIME_NOW) => Some(now),
             (sec, ns) => Some(sec.max(0) as u64 * 1_000_000_000 + ns as u64),
         },
     };
-    if let Some(x) = mtime {
-        ino.set_mtime(x)?;
-    }
+    ino.set_times(when(0), when(1))?;
     if by_fd {
         attrib_fd(dirfd as u64);
     } else {

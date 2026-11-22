@@ -361,6 +361,9 @@ fn splice_file_to_pipe(f: &FileRef, pos: &mut i64, p: &alloc::rc::Rc<file::PipeC
     if done > 0 {
         inotify::file_event(&path, &ino, inotify::IN_ACCESS);
     }
+    // Linux の filemap_splice_read の file_accessed
+    let flags = f.borrow().flags;
+    vfs::file_accessed(&ino, &path, flags);
     Ok(done)
 }
 

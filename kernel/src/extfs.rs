@@ -908,6 +908,7 @@ fn meta_of(ino: u32, r: &Raw, bsize: usize) -> Meta {
         blocks: r.blocks512(bsize),
         mtime: u32_at(b, 16) as u64 * 1_000_000_000,
         ctime: u32_at(b, 12) as u64 * 1_000_000_000,
+        atime: u32_at(b, 8) as u64 * 1_000_000_000,
     }
 }
 
@@ -4888,7 +4889,7 @@ impl ExtFs {
             })
         })?;
         let (ino, m, v) = ino;
-        let st = crate::file::Stat { dev: crate::vfs::st_dev(self.fs), ino: m.ino, mode: m.mode, nlink: m.nlink, uid: m.uid, gid: m.gid, rdev: m.rdev, size: m.size, blocks: m.blocks, mtime: m.mtime, ctime: m.ctime };
+        let st = crate::file::Stat { dev: crate::vfs::st_dev(self.fs), ino: m.ino, mode: m.mode, nlink: m.nlink, uid: m.uid, gid: m.gid, rdev: m.rdev, size: m.size, blocks: m.blocks, atime: m.atime, mtime: m.mtime, ctime: m.ctime };
         Some((ExtInode::make(self, ino), st, v))
     }
 
@@ -5888,7 +5889,7 @@ impl Inode for ExtInode {
         // 覚え (metas) になかったものだけ (あれば BTreeMap を 1 度引くだけ)
         let _p = crate::prof::span("extfs:meta");
         let Ok(r) = self.raw() else {
-            return Meta { ino: self.ino as u64, mode: 0, nlink: 0, uid: 0, gid: 0, size: 0, rdev: 0, blocks: 0, mtime: 0, ctime: 0 };
+            return Meta { ino: self.ino as u64, mode: 0, nlink: 0, uid: 0, gid: 0, size: 0, rdev: 0, blocks: 0, mtime: 0, ctime: 0, atime: 0 };
         };
         let m = meta_of(self.ino, &r, self.fs.bsize);
         let mut c = self.fs.metas.borrow_mut();
@@ -5914,6 +5915,13 @@ impl Inode for ExtInode {
     // [lockless]
     fn fast_stat(&self) -> bool {
         true
+    }
+
+    /// いまの Meta (覚えか、キャッシュにある inode のブロックから。ディスクを読むなら None)。ext4 のロックをいっしょに持って
+    // [lockless]
+    fn fast_meta(&self) -> Option<Meta> {
+        let _e = fs_lock_shared();
+        crate::proc::noio(|| self.fs.meta_now(self.ino))
     }
 
     /// 同じ inode の新しい ExtInode (数は帳簿の中で: ExtInode::counted) と、いまの Meta (覚えか、キャッシュにある inode の
@@ -6494,6 +6502,35 @@ impl Inode for ExtInode {
         let _e = fs_lock();
         let _p = crate::prof::span("extfs:setattr");
         self.write_op(|| self.update(|r| put32(&mut r.0, 16, (ns / 1_000_000_000) as u32)))
+    }
+
+    /// i_atime (秒: ext4 の inode の 8。aios は ns の extra を使わない)
+    fn set_atime(&self, ns: u64) -> Result<(), i64> {
+        let _e = fs_lock();
+        let _p = crate::prof::span("extfs:setattr");
+        self.write_op(|| self.update(|r| put32(&mut r.0, 8, (ns / 1_000_000_000) as u32)))
+    }
+
+    // [lockless]
+    fn atime_gran(&self) -> u64 {
+        1_000_000_000
+    }
+
+    /// utimensat: 1 度に書く (ctime はいまに)
+    fn set_times(&self, atime: Option<u64>, mtime: Option<u64>) -> Result<(), i64> {
+        let _e = fs_lock();
+        let _p = crate::prof::span("extfs:setattr");
+        self.write_op(|| {
+            self.update(|r| {
+                if let Some(a) = atime {
+                    put32(&mut r.0, 8, (a / 1_000_000_000) as u32);
+                }
+                if let Some(m) = mtime {
+                    put32(&mut r.0, 16, (m / 1_000_000_000) as u32);
+                }
+                put32(&mut r.0, 12, now_secs());
+            })
+        })
     }
 
     fn sync(&self) -> Result<(), i64> {
