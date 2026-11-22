@@ -101,7 +101,7 @@ enum Node {
     /// /proc/PID/uid_map、gid_map、setgroups (ユーザーの namespace の地図。0 uid、1 gid、2 setgroups)
     IdMap(u32, u8),
     /// /proc/PID/task (スレッドの一覧)、task/TID、その中のスレッドごとのもの (TASK_FILES の番号: stat status comm
-    /// syscall sched personality)。番号は本当のもの。ほかの名前はプロセスのもの (Linux の tid_base_stuff と同じ並び)
+    /// syscall sched personality io schedstat wchan)。番号は本当のもの。ほかの名前はプロセスのもの (Linux の tid_base_stuff と同じ並び)
     TaskDir(u32),
     Task(u32, u32),
     TaskFile(u32, u32, u8),
@@ -123,6 +123,12 @@ enum Node {
     Mountstats(u32),
     TimensOffsets(u32),
     ClearRefs(u32),
+    /// /proc/PID/io (読み書きの数: スレッドグループのもの)、schedstat (走った時間、待った時間、走った回数)、wchan (眠って
+    /// いるところの Linux の関数の名前)、coredump_filter (core に書くものの印)
+    Io(u32),
+    Schedstat(u32),
+    Wchan(u32),
+    CoredumpFilter(u32),
     /// /proc/net (self/net へのリンク: Linux と同じ)
     NetLink,
     /// /proc/PID/mem (ほかのプロセスのメモリを読み書き: 番地がファイルの位置)、pagemap (ページごとの 8 バイト)
@@ -179,7 +185,7 @@ pub fn new_root() -> InodeRef {
 /// /proc/PID/attr の中 (LSM の属性: AppArmor が使うもの)
 const ATTRS: [&str; 3] = ["current", "exec", "prev"];
 /// task/TID の中のスレッドごとのもの (Node::TaskFile の番号)
-const TASK_FILES: [&str; 6] = ["stat", "status", "comm", "syscall", "sched", "personality"];
+const TASK_FILES: [&str; 9] = ["stat", "status", "comm", "syscall", "sched", "personality", "io", "schedstat", "wchan"];
 /// task/TID の中のプロセスのもの (Linux の tid_base_stuff のうち、スレッドごとでないもの)
 const TASK_SHARED: [&str; 30] = [
     "fd", "fdinfo", "ns", "net", "environ", "auxv", "limits", "cmdline", "statm", "maps", "mem", "cwd", "root", "exe", "mounts", "mountinfo", "clear_refs", "smaps",
@@ -335,6 +341,10 @@ impl ProcInode {
             Node::Mountstats(p) => (p as u64) << 16 | 0x6a,
             Node::TimensOffsets(p) => (p as u64) << 16 | 0x6b,
             Node::ClearRefs(p) => (p as u64) << 16 | 0x6c,
+            Node::Io(p) => (p as u64) << 16 | 0x70,
+            Node::Schedstat(p) => (p as u64) << 16 | 0x71,
+            Node::Wchan(p) => (p as u64) << 16 | 0x72,
+            Node::CoredumpFilter(p) => (p as u64) << 16 | 0x73,
             Node::NetLink => 58,
             Node::Mem(p) => (p as u64) << 16 | 0x6d,
             Node::Pagemap(p) => (p as u64) << 16 | 0x6e,
@@ -375,7 +385,7 @@ impl ProcInode {
 
     fn pid(&self) -> Option<u32> {
         match self.node {
-            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Environ(p) | Node::Statm(p) | Node::Comm(p) | Node::Cwd(p) | Node::RootLink(p) | Node::Exe(p) | Node::Maps(p) | Node::Smaps(p) | Node::Stack(p) | Node::FdDir(p) | Node::Fd(p, _) | Node::FdInfoDir(p) | Node::FdInfo(p, _) | Node::NsDir(p) | Node::NsLink(p, _) | Node::PidMounts(p) | Node::MountInfo(p) | Node::IdMap(p, _) | Node::TaskDir(p) | Node::Task(p, _) | Node::TaskFile(p, _, _) | Node::AttrDir(p, _) | Node::Attr(p, ..) | Node::LoginUid(p) | Node::SessionId(p) | Node::Limits(p) | Node::Personality(p) | Node::TimerSlack(p) | Node::OomScore(p) | Node::OomAdj(p) | Node::OomScoreAdj(p) | Node::Auxv(p) | Node::Syscall(p) | Node::Sched(p) | Node::SmapsRollup(p) | Node::Mountstats(p) | Node::TimensOffsets(p) | Node::ClearRefs(p) | Node::Mem(p) | Node::Pagemap(p) | Node::MapFilesDir(p) | Node::MapFile(p, ..) => Some(p),
+            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Environ(p) | Node::Statm(p) | Node::Comm(p) | Node::Cwd(p) | Node::RootLink(p) | Node::Exe(p) | Node::Maps(p) | Node::Smaps(p) | Node::Stack(p) | Node::FdDir(p) | Node::Fd(p, _) | Node::FdInfoDir(p) | Node::FdInfo(p, _) | Node::NsDir(p) | Node::NsLink(p, _) | Node::PidMounts(p) | Node::MountInfo(p) | Node::IdMap(p, _) | Node::TaskDir(p) | Node::Task(p, _) | Node::TaskFile(p, _, _) | Node::AttrDir(p, _) | Node::Attr(p, ..) | Node::LoginUid(p) | Node::SessionId(p) | Node::Limits(p) | Node::Personality(p) | Node::TimerSlack(p) | Node::OomScore(p) | Node::OomAdj(p) | Node::OomScoreAdj(p) | Node::Auxv(p) | Node::Syscall(p) | Node::Sched(p) | Node::SmapsRollup(p) | Node::Mountstats(p) | Node::TimensOffsets(p) | Node::ClearRefs(p) | Node::Mem(p) | Node::Pagemap(p) | Node::MapFilesDir(p) | Node::MapFile(p, ..) | Node::Io(p) | Node::Schedstat(p) | Node::Wchan(p) | Node::CoredumpFilter(p) => Some(p),
             _ => None,
         }
     }
@@ -638,6 +648,10 @@ impl ProcInode {
                 aa_ptrace(pid, false)?;
                 syscall_text(leader(pid)?)
             }
+            Node::Io(pid) => io_text(pid, leader(pid)?, false)?,
+            Node::Schedstat(pid) => schedstat_text(leader(pid)?),
+            Node::Wchan(pid) => wchan_text(pid, leader(pid)?),
+            Node::CoredumpFilter(pid) => format!("{:08x}\n", leader(pid)?.mm().coredump_filter),
             Node::Sched(pid) => sched_text(leader_any(pid)?),
             Node::SmapsRollup(pid) => {
                 let pt = &leader(pid)?.mm().pt;
@@ -687,6 +701,9 @@ impl ProcInode {
                         syscall_text(t)
                     }
                     4 => sched_text(t),
+                    6 => io_text(pid, t, true)?,
+                    7 => schedstat_text(t),
+                    8 => wchan_text(pid, t),
                     _ => {
                         aa_ptrace(pid, false)?;
                         format!("{:08x}\n", t.personality)
@@ -737,6 +754,46 @@ fn syscall_text(t: &mut Proc) -> String {
     } else {
         format!("{} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}\n", nr, orig, tf.x[1], tf.x[2], tf.x[3], tf.x[4], tf.x[5], tf.sp_el0, tf.elr)
     }
+}
+
+/// /proc/PID/io と task/TID/io (Linux の do_io_accounting: ptrace で読める人だけ、でなければ EACCES)。プロセスのものは
+/// 生きているスレッドと、終わったスレッドと回収した子の分
+fn io_text(pid: u32, t: &Proc, thread: bool) -> Result<String, i64> {
+    aa_ptrace(pid, true)?;
+    let v = proc::io_counts(t, thread);
+    Ok(format!(
+        "rchar: {}\nwchar: {}\nsyscr: {}\nsyscw: {}\nread_bytes: {}\nwrite_bytes: {}\ncancelled_write_bytes: {}\n",
+        v[0], v[1], v[2], v[3], v[4], v[5], v[6]
+    ))
+}
+
+/// /proc/PID/schedstat (Linux の proc_pid_schedstat: 走った時間 ns、走れるのに待った時間 ns、走らせた回数)。プロセスの
+/// ものは代表スレッドの
+fn schedstat_text(t: &Proc) -> String {
+    format!("{} {} {}\n", proc::cpu_ns(t), t.run_delay, t.pcount)
+}
+
+/// /proc/PID/wchan (Linux の proc_pid_wchan: 眠っているところの関数の名前。走っているか、ptrace で読めなければ 0。改行は
+/// ない)。aios は Linux の関数を持たないので、眠っているシステムコールと待っているものから、Linux 7.4 の名前に
+fn wchan_text(pid: u32, t: &Proc) -> String {
+    use crate::syscall::nr::*;
+    if ptrace_may(pid, true).is_err() || t.state != State::Sleeping {
+        return "0".into();
+    }
+    let name = match t.sysno as u64 {
+        NANOSLEEP | CLOCK_NANOSLEEP => "hrtimer_nanosleep",
+        WAIT4 | WAITID => "do_wait",
+        FUTEX | FUTEX_WAITV => "futex_wait_queue",
+        EPOLL_PWAIT | EPOLL_PWAIT2 => "ep_poll",
+        PPOLL | PSELECT6 => "poll_schedule_timeout",
+        RT_SIGSUSPEND => "sigsuspend",
+        RT_SIGTIMEDWAIT => "do_sigtimedwait",
+        // 読み書きで眠るのは、パイプ (Linux 7.x の匿名のパイプ) がほとんど
+        READ | READV => "anon_pipe_read",
+        WRITE | WRITEV => "anon_pipe_write",
+        _ => "0",
+    };
+    name.into()
 }
 
 /// /proc/PID/sched (Linux の proc_sched_show_task と同じ名前と形: 名前は 45 の左寄せ、数は 21、時間は ms の小数 6 けた)。
@@ -1257,7 +1314,8 @@ impl Inode for ProcInode {
             Node::TimerSlack(_) => S_IFREG | 0o666,
             Node::Personality(_) => S_IFREG | 0o400,
             Node::TaskFile(_, _, 2 | 4) => S_IFREG | 0o644,
-            Node::TaskFile(_, _, 3 | 5) => S_IFREG | 0o400,
+            Node::TaskFile(_, _, 3 | 5 | 6) | Node::Io(_) => S_IFREG | 0o400,
+            Node::CoredumpFilter(_) => S_IFREG | 0o644,
             // 持ち主だけが読む (Linux の S_IRUSR のもの)
             Node::Environ(_) | Node::Stack(_) => S_IFREG | 0o400,
             Node::NetConntrack => S_IFREG | 0o440,
@@ -1494,6 +1552,23 @@ impl Inode for ProcInode {
             t.timer_slack_ns = if v == 0 { t.default_slack_ns } else { v };
             return Ok(b.len());
         }
+        // /proc/PID/coredump_filter (proc_coredump_filter_write): kstrtouint (0x で 16 進、0 で 8 進、ほか 10 進。終わりの
+        // 改行はよい)。下の 9 ビットだけ (MMF_DUMP_FILTER_BITS)
+        if let Node::CoredumpFilter(pid) = self.node {
+            let s = core::str::from_utf8(b).map_err(|_| crate::why::inval())?;
+            let s = s.strip_suffix('\n').unwrap_or(s);
+            let s = s.strip_prefix('+').unwrap_or(s);
+            let v = if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                u32::from_str_radix(h, 16)
+            } else if s.len() > 1 && s.starts_with('0') {
+                u32::from_str_radix(&s[1..], 8)
+            } else {
+                s.parse::<u32>()
+            }
+            .map_err(|_| crate::why::inval())?;
+            leader(pid)?.mm().coredump_filter = v & 0x1ff;
+            return Ok(b.len());
+        }
         // /proc/PID/attr/current と exec: AppArmor の change_profile (自分のものだけ: Linux も current でなければ EACCES)
         if let Node::Attr(pid, _, k) = self.node {
             if leader(pid)?.pid != proc::current().pid {
@@ -1562,7 +1637,7 @@ impl Inode for ProcInode {
             return Ok(());
         }
         // uid_map や attr/current など (書けるかは書くときに決める)
-        if matches!(self.node, Node::IdMap(..) | Node::Attr(..) | Node::LoginUid(_) | Node::Comm(_) | Node::TaskFile(_, _, 2) | Node::OomAdj(_) | Node::OomScoreAdj(_) | Node::TimerSlack(_) | Node::ClearRefs(_) | Node::Sched(_) | Node::TaskFile(_, _, 4) | Node::TimensOffsets(_)) {
+        if matches!(self.node, Node::IdMap(..) | Node::Attr(..) | Node::LoginUid(_) | Node::Comm(_) | Node::TaskFile(_, _, 2) | Node::OomAdj(_) | Node::OomScoreAdj(_) | Node::TimerSlack(_) | Node::ClearRefs(_) | Node::Sched(_) | Node::TaskFile(_, _, 4) | Node::TimensOffsets(_) | Node::CoredumpFilter(_)) {
             return Ok(());
         }
         Err(-EACCES)
@@ -1710,6 +1785,10 @@ impl Inode for ProcInode {
             (Node::Pid(p), "smaps_rollup") => Node::SmapsRollup(p),
             (Node::Pid(p), "mountstats") => Node::Mountstats(p),
             (Node::Pid(p), "timens_offsets") => Node::TimensOffsets(p),
+            (Node::Pid(p), "io") => Node::Io(p),
+            (Node::Pid(p), "schedstat") => Node::Schedstat(p),
+            (Node::Pid(p), "wchan") => Node::Wchan(p),
+            (Node::Pid(p), "coredump_filter") => Node::CoredumpFilter(p),
             (Node::Pid(p), "clear_refs") => Node::ClearRefs(p),
             (Node::Pid(p), "projid_map") => Node::IdMap(p, 3),
             (Node::Pid(p), "mem") => Node::Mem(p),
@@ -1891,6 +1970,10 @@ impl Inode for ProcInode {
                 add("mem".into(), Node::Mem(p));
                 add("pagemap".into(), Node::Pagemap(p));
                 add("map_files".into(), Node::MapFilesDir(p));
+                add("io".into(), Node::Io(p));
+                add("schedstat".into(), Node::Schedstat(p));
+                add("wchan".into(), Node::Wchan(p));
+                add("coredump_filter".into(), Node::CoredumpFilter(p));
             }
             // ptrace で読める人だけ (proc_map_files_readdir: EACCES)
             Node::MapFilesDir(p) => {

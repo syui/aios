@@ -695,7 +695,10 @@ impl Cache {
             }
             Mark::Data(b) => {
                 self.dirty.remove(&b);
-                self.data.insert(b);
+                // きれいなブロックを書いて dirty にした: 書いた人の write_bytes に (Linux の folio_account_dirtied)
+                if self.data.insert(b) {
+                    crate::proc::io_add(crate::proc::IO_WRITE_BYTES, self.bsize);
+                }
             }
             Mark::Lazy(b, ino, generation) => {
                 self.lazy_csum.insert(b, (ino, generation, Later::Extent));
@@ -718,7 +721,11 @@ impl Cache {
     // [lockless]
     fn forget_blocks(&mut self, start: u64, end: u64) {
         self.dirty.extract_if(start..end, |_| true).for_each(drop);
-        self.data.extract_if(start..end, |_| true).for_each(drop);
+        // 書き出す前の中身を捨てた: 切りつめた人の cancelled_write_bytes に (Linux の folio_account_cleaned)
+        let n = self.data.extract_if(start..end, |_| true).count() as u64;
+        if n > 0 {
+            crate::proc::io_add(crate::proc::IO_CANCELLED, n * self.bsize);
+        }
         self.lazy_csum.extract_if(start..end, |_, _| true).for_each(drop);
         self.forget_range(start, end);
     }
@@ -755,6 +762,8 @@ impl Cache {
 }
 
 struct Cache {
+    /// ブロックの大きさ (/proc/PID/io の write_bytes と cancelled_write_bytes に足す数)
+    bsize: u64,
     map: BTreeMap<u64, *mut u8>,
     order: VecDeque<u64>,
     /// まだディスクに書いていないメタデータのブロック (ジャーナルを通す)
@@ -1345,6 +1354,7 @@ impl ExtFs {
             gdt: Shared::with(Vec::new(), &ALLOC),
             adirty: Shared::with(AllocDirty { sb: false, gd: BTreeSet::new(), bb: BTreeSet::new(), ib: BTreeSet::new() }, &ALLOC),
             cache: Shared::new(Cache {
+                bsize: bsize as u64,
                 map: BTreeMap::new(),
                 order: VecDeque::new(),
                 dirty: BTreeSet::new(),

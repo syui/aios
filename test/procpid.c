@@ -1,6 +1,7 @@
 // /proc/self と /proc/self/task/TID のならび (名前、種類、許可) が Linux と同じか。手本の Linux (test/linux.config) に
-// 合わせたもの: cgroup、io、wchan などはどちらにもない。stack は aios にはあるが (0400)、手本は CONFIG_STACKTRACE が
-// ないのでないため見ない。中身は test/procfiles.c、procknobs.c、procmem.c、rlimit.c
+// 合わせたもの: cgroup、timers などはどちらにもない (io、wchan、schedstat、coredump_filter は 2026-11-22 から両方に)。stack は
+// aios にはあるが (0400)、手本は CONFIG_STACKTRACE がないのでないため見ない。中身は test/procfiles.c、procknobs.c、procmem.c、
+// rlimit.c、procio.c
 #include <dirent.h>
 #include <errno.h>
 #include <stdio.h>

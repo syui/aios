@@ -615,9 +615,29 @@ test/madvfree.c (redis の起動のたしかめと同じ: 書いた無名のペ�
   map_files (ファイルを写した領域の はじめ-終わり。readlink はだれでも、たどって開くのは CAP_SYS_ADMIN (vfs の may_follow:
   EPERM)、root がたどると写しているファイルそのもの)。test/procmem.c は Linux 7.4 と 12 行同じ。ちがい: aios の tmpfs の
   ページは、ファイルシステムと写しの両方が参照を持つので、pagemap の exclusive (写しているのが 1 つ) がずれることがある
-- task/TID: Linux と同じ 36 の名前 (スレッドごとのものは stat、status、comm、syscall、sched、personality。ほかはプロセスのもの)。
-  test/procpid.c は /proc/self (41) と task/TID (36) のならびと種類と許可が Linux 7.4 と同じ (stack は手本にないので見ない)
-- まだ: cgroup、io、wchan、schedstat、coredump_filter、timers など (手本の Linux の設定にもない)
+- task/TID: Linux と同じ 39 の名前 (スレッドごとのものは stat、status、comm、syscall、sched、personality、io、schedstat、wchan。
+  ほかはプロセスのもの)。test/procpid.c は /proc/self (45) と task/TID (39) のならびと種類と許可が Linux 7.4 と同じ (stack は
+  手本にないので見ない)
+- io、schedstat、wchan、coredump_filter (2026-11-22)。ふつうの配布の Linux と同じく、手本の test/linux.config にも
+  TASKSTATS、TASK_DELAY_ACCT (SCHED_INFO)、TASK_XACCT、TASK_IO_ACCOUNTING、KALLSYMS、COREDUMP、ELF_CORE を足して作りなおした
+  (/proc のくらべ 9 つは新しい手本でも同じ)。
+  io (proc.rs の IoAc: スレッドごとの atomic の 7 つ。0400、ptrace で読める人だけで、でなければ EACCES): rchar と wchar は
+  read と write の仲間 (pread、readv、preadv2 …) が運んだバイト、syscr と syscw はその回数で、しくじったもの (EAGAIN など) も
+  数える (Linux の vfs_read は中身の read のあとに inc_syscr)。fd がない・読めない (EBADF) と位置のないものへの pread
+  (ESPIPE) は数えない。sendfile と copy_file_range は両方に。大きなロックなしの道 (syscall::fast) もふつうの道も、出口の
+  1 か所 (syscall.rs の io_account) で数える。read_bytes はディスクから読んだバイト (block.rs)、write_bytes は ext4 の
+  キャッシュのきれいなブロックを書いて dirty にしたとき (Cache::apply の Mark::Data。Linux の folio_account_dirtied と同じく
+  tmpfs は数えない)、cancelled_write_bytes は書き出す前に切りつめで捨てた dirty のブロック (forget_blocks)。/proc/PID/io は
+  スレッドグループのもの: 生きているスレッド、終わったスレッド、wait で回収した子 (とその子孫) の分 (Linux の
+  wait_task_zombie が親の signal->ioac に足す)。task/TID/io はスレッドのもの。
+  schedstat: 走った時間 (cpu_ns)、走れるようになってから走るまで待った時間、走らせた回数 (スケジューラが走らせるたびに:
+  Linux の sched_info_arrive)。wchan: 走っているか ptrace で読めなければ 0、眠っていれば Linux 7.4 の関数の名前を、いま
+  入っているシステムコールから (nanosleep は hrtimer_nanosleep、wait4 は do_wait、パイプの read は anon_pipe_read、futex は
+  futex_wait_queue、epoll は ep_poll …。改行なし)。coredump_filter: アドレス空間の印 (既定 00000033、0644、kstrtouint の
+  16 進・8 進・10 進、下の 9 ビット、fork と exec で受けつぐ)。aios は core を作らないので、覚えて見せるだけ。
+  直したもの: exec で受けつぐはずの PR_SET_THP_DISABLE の印が、exec で外れていた (load_image が、前のアドレス空間を外した
+  あとに見ていた)。test/procio.c は Linux 7.4 と同じ答え
+- まだ: cgroup (aios に cgroup がない)、timers (CHECKPOINT_RESTORE)、/proc/kallsyms (手本は KALLSYMS で持つ) など
 
 madvise と prctl も Linux の答えに (2026-11-15。前は知らない値も 0 で受け、多くを何もせず 0 にしていた):
 

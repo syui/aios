@@ -190,14 +190,16 @@ pub fn proc_diskstats() -> String {
     s
 }
 
-/// root の区画から読む (extfs)
+/// root の区画から読む (extfs)。読んだバイトは読ませたスレッドの /proc/PID/io の read_bytes に (Linux の submit_bio)
 pub fn read(sector: u64, buf: &mut [u8]) -> Result<(), i64> {
+    crate::proc::io_add(crate::proc::IO_READ_BYTES, buf.len() as u64);
     read_part(&root(), sector, buf)
 }
 
 /// root の区画から、眠って待って読む (extfs の読むだけの道。大きなロックはほかの CPU が使う)
 pub fn read_wait(sector: u64, buf: &mut [u8]) -> Result<(), i64> {
     let _p = crate::prof::span("block:read");
+    crate::proc::io_add(crate::proc::IO_READ_BYTES, buf.len() as u64);
     let p = root();
     if sector + (buf.len() / SECTOR) as u64 > p.len {
         return Err(-5);

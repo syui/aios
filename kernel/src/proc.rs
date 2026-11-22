@@ -140,7 +140,13 @@ pub struct Mm {
     /// PR_GET_DUMPABLE / PR_SET_DUMPABLE (0 作らない、1 作る、2 root の権利で)。exec で 1 (setuid / setgid のもので
     /// id が変わったら 0: Linux の suid_dumpable の既定)。fork で引き継ぐ。PIDFD_GET_INFO の coredump の印と、ptrace の許し
     pub dumpable: u8,
+    /// /proc/PID/coredump_filter (Linux の mm->flags の MMF_DUMP_FILTER: 下の 9 ビット、既定 0x33)。fork でも exec でも
+    /// うけつぐ (mmf_init_flags)
+    pub coredump_filter: u32,
 }
+
+/// coredump_filter の既定 (MMF_DUMP_FILTER_DEFAULT: 無名の private と shared、ELF の頭、hugetlb の private)
+pub const COREDUMP_FILTER_DEFAULT: u32 = 0x33;
 
 impl Mm {
     /// 作る (exe_id の箱を数える: maybe_executing)
@@ -399,6 +405,80 @@ pub const CRED_SANDBOX: u8 = 2;
 /// ptrace されている (システムコールの入口と出口、シグナルで止まる: 大きなロックなしの道 (syscall::fast) を通らない)
 pub const CRED_PTRACE: u8 = 4;
 
+/// 読み書きの数 (Linux の struct task_io_accounting: /proc/PID/io の 7 つ)。rchar と wchar は read と write の
+/// システムコールが運んだバイト、syscr と syscw はその回数 (しくじったものも: Linux の vfs_read が中身の read を呼んだあと
+/// に数える)、read_bytes はディスクから読んだバイト、write_bytes はページキャッシュのきれいなページを書いて dirty にした
+/// バイト (ext4。tmpfs は書き出さないので数えない)、cancelled_write_bytes は書き出す前に切りつめで捨てた dirty のバイト
+pub struct IoAc([core::sync::atomic::AtomicU64; 7]);
+
+pub const IO_RCHAR: usize = 0;
+pub const IO_WCHAR: usize = 1;
+pub const IO_SYSCR: usize = 2;
+pub const IO_SYSCW: usize = 3;
+pub const IO_READ_BYTES: usize = 4;
+pub const IO_WRITE_BYTES: usize = 5;
+pub const IO_CANCELLED: usize = 6;
+
+impl IoAc {
+    pub const fn new() -> IoAc {
+        IoAc([const { core::sync::atomic::AtomicU64::new(0) }; 7])
+    }
+
+    // [lockless]
+    pub fn add(&self, k: usize, n: u64) {
+        self.0[k].fetch_add(n, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> [u64; 7] {
+        core::array::from_fn(|k| self.0[k].load(core::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// いまのスレッドの読み書きの数に足す (起動のときやアイドルなら何もしない)
+// [lockless]
+pub fn io_add(k: usize, n: u64) {
+    if let Some(i) = cur() {
+        procs()[i].ioac.add(k, n);
+    }
+}
+
+/// read のシステムコール 1 回 (Linux の vfs_read の add_rchar と inc_syscr): 読めたバイトを rchar に、回数を syscr に
+// [lockless]
+pub fn io_read(r: Result<usize, i64>) {
+    if let Ok(n) = r
+        && n > 0
+    {
+        io_add(IO_RCHAR, n as u64);
+    }
+    io_add(IO_SYSCR, 1);
+}
+
+/// write のシステムコール 1 回 (add_wchar と inc_syscw)
+// [lockless]
+pub fn io_write(r: Result<usize, i64>) {
+    if let Ok(n) = r
+        && n > 0
+    {
+        io_add(IO_WCHAR, n as u64);
+    }
+    io_add(IO_SYSCW, 1);
+}
+
+/// スレッドかスレッドグループ (生きているスレッドと終わったスレッドの分) の読み書きの数
+pub fn io_counts(p: &Proc, thread: bool) -> [u64; 7] {
+    if thread {
+        return p.ioac.get();
+    }
+    let mut v = find_leader_any(p.tgid).map_or([0; 7], |l| l.ioac_dead);
+    for q in live().filter(|q| q.state != State::Unused && q.tgid == p.tgid) {
+        let t = q.ioac.get();
+        for k in 0..7 {
+            v[k] += t[k];
+        }
+    }
+    v
+}
+
 pub struct Proc {
     pub state: State,
     /// 走っている (最後に走った) CPU
@@ -480,6 +560,16 @@ pub struct Proc {
     /// CPU をゆずった数: 眠った (自分から) と、走れるままゆずった (Linux の nvcsw と nivcsw: /proc/PID/sched)
     pub nvcsw: u64,
     pub nivcsw: u64,
+    /// 走れるようになってから走るまで待った時間 (ns) と、走れるようになった時刻 (Linux の sched_info.run_delay と
+    /// last_queued: /proc/PID/schedstat)
+    pub run_delay: u64,
+    queued_at: u64,
+    /// CPU で走らせた回数 (Linux の sched_info.pcount)
+    pub pcount: u64,
+    /// 読み書きの数 (Linux の task_io_accounting: /proc/PID/io)。大きなロックなしの道でも足すので atomic
+    pub ioac: IoAc,
+    /// 代表スレッドだけ: 終わったスレッドの ioac (Linux の signal->ioac)
+    pub ioac_dead: [u64; 7],
     pub timers: Vec<PosixTimer>,
     /// 親が SIGCHLD を無視しているので、終わったらすぐ片付ける
     autoreap: bool,
@@ -684,6 +774,11 @@ impl Proc {
         mce_kill: 0,
         nvcsw: 0,
         nivcsw: 0,
+        run_delay: 0,
+        queued_at: 0,
+        pcount: 0,
+        ioac: IoAc::new(),
+        ioac_dead: [0; 7],
         timers: Vec::new(),
         autoreap: false,
         cred: crate::cred::Cred::ROOT,
@@ -840,8 +935,9 @@ impl Proc {
         if (img.setuid.is_some() || img.setgid.is_some()) && !self.cred.no_new_privs && self.cred.ns.user.is_none() {
             self.personality &= !PER_CLEAR_ON_SETID;
         }
-        let thp_disable = self.mm.as_ref().is_some_and(|m| m.get().thp_disable);
-        self.mm = Some(Mm::shared(Mm { pt: img.pagetable, heap_start: img.brk, brk: img.brk, mmap_next: MMAP_BASE, exe: img.exe, exe_id: img.exe_id, args: img.args, dumpable: 1, auxv: img.auxv, thp_disable, def_lock: 0, peak_vm: 0, peak_rss: 0 }));
+        // exec で受けつぐ印 (PR_SET_THP_DISABLE と coredump_filter) は、呼ぶ側が前のアドレス空間から写す (exec はここへ来る
+        // 前に前のものを外している)
+        self.mm = Some(Mm::shared(Mm { pt: img.pagetable, heap_start: img.brk, brk: img.brk, mmap_next: MMAP_BASE, exe: img.exe, exe_id: img.exe_id, args: img.args, dumpable: 1, auxv: img.auxv, thp_disable: false, def_lock: 0, peak_vm: 0, peak_rss: 0, coredump_filter: COREDUMP_FILTER_DEFAULT }));
         let tf = self.tf();
         *tf = TrapFrame::zeroed();
         tf.elr = img.entry as u64;
@@ -1329,6 +1425,9 @@ fn wq_leave(i: usize) {
 
 /// 走れるようにする (Runnable にして RUNQ に入れる)。Runnable にするのは、みなここから
 fn make_runnable(p: &mut Proc) {
+    if p.state != State::Runnable {
+        p.queued_at = crate::timer::uptime_ns();
+    }
     p.state = State::Runnable;
     if p.rq.head == NONE {
         link(slot_of(p), RUNQ, |p| &mut p.rq);
@@ -1674,7 +1773,7 @@ pub fn kthread(name: &[u8], main: extern "C" fn() -> !) -> Option<u32> {
     let pt = PageTable::new()?;
     let p = alloc_proc()?;
     p.kthread = true;
-    p.mm = Some(Mm::shared(Mm { pt, heap_start: 0, brk: 0, mmap_next: MMAP_BASE, exe: String::new(), exe_id: (0, 0), args: (0, 0, 0), dumpable: 1, auxv: Vec::new(), thp_disable: false, def_lock: 0, peak_vm: 0, peak_rss: 0 }));
+    p.mm = Some(Mm::shared(Mm { pt, heap_start: 0, brk: 0, mmap_next: MMAP_BASE, exe: String::new(), exe_id: (0, 0), args: (0, 0, 0), dumpable: 1, auxv: Vec::new(), thp_disable: false, def_lock: 0, peak_vm: 0, peak_rss: 0, coredump_filter: COREDUMP_FILTER_DEFAULT }));
     p.files = Some(Shared::new(Files { fds: Vec::new(), cwd: String::new(), root: String::new(), nofile: NOFILE_SOFT, umask: 0o022, gate: Gate::default(), shelf: Default::default(), posix_locked: false }));
     p.sigacts = Some(crate::signal::new_table());
     p.set_comm(name);
@@ -1840,6 +1939,12 @@ pub fn scheduler() -> ! {
                 // 切りかえはいつもカーネルの中なので、走りはじめはカーネルの時間から
                 let t = crate::timer::uptime_ns().max(1);
                 (p.ran_at, p.kern_at) = (t, t);
+                // 走れるようになってから待った時間と、走らせた回数 (Linux の sched_info_arrive: /proc/PID/schedstat)
+                if p.queued_at != 0 {
+                    p.run_delay += t.saturating_sub(p.queued_at);
+                    p.queued_at = 0;
+                }
+                p.pcount += 1;
                 swtch(sched_ctx(), &p.context);
                 crate::smp::set_user_pt(0);
                 crate::smp::set_user_files(0);
@@ -2184,10 +2289,15 @@ fn exit_status(status: i32) -> ! {
         let t = core::mem::take(&mut p.utime);
         let (c, s) = (cpu_ns(p), sys_ns(p));
         (p.cpu_ns, p.ran_at, p.sys_ns, p.kern_at) = (0, 0, 0, 0);
+        let io = p.ioac.get();
+        p.ioac = IoAc::new();
         if let Some(l) = find(p.tgid) {
             l.utime += t;
             l.cpu_dead_ns += c;
             l.sys_dead_ns += s;
+            for k in 0..7 {
+                l.ioac_dead[k] += io[k];
+            }
             // プロセスに来て預かっていたシグナルは代表に (Linux の shared_pending はプロセスのもの)
             crate::signal::hand_over(p, l);
         }
@@ -2368,7 +2478,7 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
             None => m.pt.fork(),
         };
         let pt = pt.ok_or(-ENOMEM)?;
-        Mm::shared(Mm { pt, heap_start: m.heap_start, brk: m.brk, mmap_next: m.mmap_next, exe: m.exe.clone(), exe_id: m.exe_id, args: m.args, dumpable: m.dumpable, auxv: m.auxv.clone(), thp_disable: m.thp_disable, def_lock: 0, peak_vm: m.peak_vm, peak_rss: m.peak_rss })
+        Mm::shared(Mm { pt, heap_start: m.heap_start, brk: m.brk, mmap_next: m.mmap_next, exe: m.exe.clone(), exe_id: m.exe_id, args: m.args, dumpable: m.dumpable, auxv: m.auxv.clone(), thp_disable: m.thp_disable, def_lock: 0, peak_vm: m.peak_vm, peak_rss: m.peak_rss, coredump_filter: m.coredump_filter })
     };
     let files = if flags & CLONE_FILES != 0 {
         parent.files.clone().unwrap()
@@ -2617,6 +2727,13 @@ fn finish_exec(p: &mut Proc, img: Image, comm: &str) {
     crate::futex::exit_robust_list();
     let old = p.mm.take();
     p.load_image(img);
+    // 前のアドレス空間から受けつぐ印: PR_SET_THP_DISABLE (MMF_DISABLE_THP) と coredump_filter (Linux の mmf_init_flags。
+    // 前は load_image が外したあとの self.mm を見ていて、どちらも exec で既定にもどっていた)
+    if let Some(o) = old.as_ref() {
+        let (thp, filter) = (o.get().thp_disable, o.get().coredump_filter);
+        p.mm().thp_disable = thp;
+        p.mm().coredump_filter = filter;
+    }
     if p.cred.euid != old_euid || p.cred.egid != old_egid || p.cred.fsuid != old_fsuid || p.cred.fsgid != old_fsgid {
         dumpable = suid_dumpable;
     }
@@ -2709,10 +2826,15 @@ pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
                     // 子の走った時間 (Linux の wait_task_zombie: 子の分と、子が回収した孫の分)
                     let (u, s) = user_sys_ns(c, false);
                     let (cc, cs) = (u + s + c.child_cpu_ns, s + c.child_sys_ns);
+                    // 子の読み書きの数 (子のスレッドと、子が回収した孫の分) は親のプロセスの数に (task_io_accounting_add)
+                    let io = io_counts(c, false);
                     free_slot(c);
                     procs()[leader].cutime += t;
                     procs()[leader].child_cpu_ns += cc;
                     procs()[leader].child_sys_ns += cs;
+                    for k in 0..7 {
+                        procs()[leader].ioac_dead[k] += io[k];
+                    }
                 }
                 return Ok(r);
             }

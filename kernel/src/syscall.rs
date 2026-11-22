@@ -816,6 +816,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         },
     };
     tf.x[0] = r.unwrap_or_else(|e| e) as u64;
+    io_account(nr, r);
     crate::debug::trace_sys_exit(nr, r.unwrap_or_else(|e| e));
     if proc::current().audit.is_some() {
         if let Some(plan) = plan {
@@ -1102,10 +1103,33 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
         _ => return false,
     };
     tf.x[0] = r as u64;
+    io_account(nr, if r < 0 && r > -4096 { Err(r) } else { Ok(r) });
     // /proc/sysstat を読みはじめてから、速い道で終わったものだけ数える
     crate::debug::count_fast(nr);
     crate::debug::trace_sys_fast(nr, a[0], r);
     true
+}
+
+/// 読み書きのシステムコールを /proc/PID/io に数える (Linux の vfs_read / vfs_write の add_rchar と inc_syscr、
+/// do_sendfile と vfs_copy_file_range は両方)。中身の read / write の前にしくじったもの (fd がない・読めない EBADF、
+/// 位置のないものへの pread の ESPIPE) は数えない
+// [lockless]
+fn io_account(nr: u64, r: Result<i64, i64>) {
+    use nr::*;
+    const ESPIPE: i64 = 29;
+    if matches!(r, Err(e) if e == -EBADF || e == -ESPIPE) {
+        return;
+    }
+    let n = r.map(|n| n as usize);
+    match nr {
+        READ | READV | PREAD64 | PREADV | PREADV2 => proc::io_read(n),
+        WRITE | WRITEV | PWRITE64 | PWRITEV | PWRITEV2 => proc::io_write(n),
+        SENDFILE | COPY_FILE_RANGE => {
+            proc::io_read(n);
+            proc::io_write(n);
+        }
+        _ => {}
+    }
 }
 
 /// clock_gettime: 時計は timer::clock_of (知らないもの、いない CPU の時計は EINVAL)
