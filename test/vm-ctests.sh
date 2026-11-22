@@ -1,8 +1,9 @@
 #!/bin/sh
 # カーネルの C のテスト (test/*.c) を aios の中で動かす。CI の VM test で、vm-check.sh のあとに:
-#   作る (外で): test/vm-ctests.sh build [CC]   test/bin/NAME に静的なプログラム (既定は gcc。aarch64 の Linux で)
-#   動かす (中で): fetch http://10.0.2.2:8000/vm-ctests.sh > /tmp/t.sh && sh /tmp/t.sh run
+#   作る (外で): test/vm-ctests.sh build [CC] [NAME...]   test/bin/NAME に静的なプログラム (既定は gcc。aarch64 の Linux で)
+#   動かす (中で): fetch http://10.0.2.2:8000/vm-ctests.sh > /tmp/t.sh && sh /tmp/t.sh run [NAME...]
 #                 (test/ を http で見せている VM: test/vm.py start --www test。プログラムは bin/ から取る)
+#   NAME をあげれば、それだけを (TESTS にないテストも。aish-vm の ctests が使う)
 # どれもしくじった数を終了コードで返す。1 行に ok NAME か FAIL NAME。おしまいに ctests: N failed
 # hang.c と watch.c はテストではなく、わざと止まる道具なので入れない
 TESTS="apparmor appendrace atime audit auditdir auditexec auditpath auditrules bigunmap chattr chosen chrootlink clone3 closerange closeshared cpuclock cpuid cputime cpuvuln createrace ctev ctnl cwdperm cwdrace dad6 dentsfast dev dirents drmatomic drmkms drmrender dumpable efivarfs epoll exec-thread fastmap fchroot fhandle flushrace forkcow frag6 fsrace fsuid fsx futex futex2 futexrace inet6 inet6net inetsock inotify ipcns landlock-eexist landlockabi listns loginuid madvfree madvise mincore mld6 mldrep6 mlock mmapcoh mnt mountinfo mremap mseal ndsilence netlink newmount nftables nfteval nfteval6 nftsk nice ns onlink6 opentreeattr openat2 opencache openfast openrace orphan pagecache pagetables pathcache peerpidfd pidfdinfo pidnswait pipeslots pivotns pivotroot pmtu6 portparity posrace prctl procfiles procknobs procmadv procmaps procmem procpid procstatus procwait ptrace ptrace2 pwfast random rcrace remapfp rdnss6 recverr6 rlimit rlock robust route rtnl6 rtnladdr rtnllink seccomp seccompnotify shm settime setns signalfd sigstatus sigtramp sleeps splice statc statmount statcache syncrange sysctl6 syslog sysmisc sysvipc temp6 threadmap ttou umountbusy uname unixrace unixsock userns vdso vgetrandom vmsplice xattr"
@@ -10,12 +11,16 @@ TESTS="apparmor appendrace atime audit auditdir auditexec auditpath auditrules b
 case $1 in
 build)
   cc=${2:-gcc}
+  [ $# -gt 2 ] && shift 2 && TESTS="$*"
   cd "$(dirname "$0")" && mkdir -p bin || exit 2
   for t in $TESTS; do
+    # .c より新しいものは作りなおさない (CI は作りたてのリポジトリなので、みな作る)
+    [ "bin/$t" -nt "$t.c" ] && continue
     $cc -O2 -static -pthread -o "bin/$t" "$t.c" || { echo "vm-ctests: cannot build $t" >&2; exit 2; }
   done
   ;;
 run)
+  [ $# -gt 1 ] && shift && TESTS="$*"
   dir=/tmp/ctests
   mkdir -p "$dir" && cd "$dir" || exit 2
   fail=0

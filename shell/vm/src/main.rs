@@ -24,6 +24,7 @@
 // aios.img を使うと壊れるので、同時には動かさない
 // リポジトリは dir か、いまのディレクトリから上にたどって test/vm.py があるところ、なければ $AIOS_SRC
 mod bench;
+mod ctests;
 mod ldiff;
 mod sysdiff;
 
@@ -37,9 +38,10 @@ const VM: &str = r#"{"type":"object","properties":{"op":{"type":"string","descri
 const TRY: &str = r#"{"type":"object","properties":{"code":{"type":"string","description":"C のソース (main のあるもの)"},"file":{"type":"string","description":"code のかわりにソースのファイル"},"lang":{"type":"string","description":"c (既定) か c++"},"cflags":{"type":"array","items":{"type":"string"},"description":"zig cc に足すもの (-lpthread、-DX=1 など)"},"args":{"type":"string","description":"中で動かすときの引数 (シェルの書き方で)"},"timeout":{"type":"number","description":"秒 (既定 30、50 まで)"},"dir":{"type":"string"}}}"#;
 const AB: &str = r#"{"type":"object","properties":{"a":{"type":"string","description":"くらべる 1 つめのカーネル (パス / . / git のコミット。既定 HEAD)"},"b":{"type":"string","description":"2 つめ (既定 . = 作業中のソース)"},"cmd":{"type":"string","description":"中で動かして時間を測るコマンド"},"setup":{"type":"string","description":"起こしたあとに 1 度だけ動かすもの (測らない)"},"www":{"type":"string","description":"このディレクトリを http://10.0.2.2:8000/ に出す (setup で fetch して使う)"},"n":{"type":"integer","description":"カーネルごとに何回 (既定 5)"},"timeout":{"type":"number","description":"1 回の上限 (秒、既定 300)"},"wait_ms":{"type":"integer","description":"待つ長さ (既定 30000、50000 まで)"},"dir":{"type":"string"}},"required":["cmd"]}"#;
 const BOX: &str = r#"{"type":"object","properties":{"off":{"type":"array","items":{"type":"string"},"description":"切るもの (kernel.json の off のあるもの: extra、quirk と core の ns・vdso。いっしょに切る)"},"each":{"type":"boolean","description":"off のかわりに、切れるものを 1 つずつ全部 (どのテストがどれを要るかの表。長い)"},"test":{"type":"string","description":"中で動かすもの (既定: CI と同じ vm-check.sh と vm-ctests.sh。test/ を http で出して中から取る)。FAIL で始まる行をくらべる"},"www":{"type":"string","description":"test のために http://10.0.2.2:8000/ に出すディレクトリ (既定の test なら test)"},"kernel":{"type":"string","description":"カーネル (パス / . / git のコミット。既定 .)"},"baseline":{"type":"boolean","description":"何も切らないものも動かしてくらべる (既定 true)"},"timeout":{"type":"number","description":"1 回の test の上限 (秒、既定 1200)"},"wait_ms":{"type":"integer","description":"待つ長さ (既定 30000、50000 まで)"},"dir":{"type":"string"}}}"#;
-const BENCH: &str = r#"{"type":"object","properties":{"kind":{"type":"string","description":"fs (既定: ファイルまわり、test/fsbench.c)、net (ループバックの TCP / UDP / AF_UNIX とパイプ、test/netbench.c)、smp (いくつもの CPU でいっしょに: op ごとに 1 つのプロセスと CPU の数だけのプロセスで、伸びと /proc/ai/bkl。test/smpbench.c)"},"kernel":{"type":"string","description":"測るカーネル (パス / . / git のコミット。既定 .)"},"against":{"type":"string","description":"くらべる aios のカーネル (あれば。たとえば HEAD)。op ごとに、kernel の時間が against の何倍か"},"linux":{"type":"boolean","description":"同じプログラムを Linux (test/linux-vm.sh の latest) の VM でも動かし、op ごとに aios の時間が Linux の何倍か (VM はどちらも cortex-a72、smp 個の CPU、2 GiB)"},"record":{"type":"boolean","description":"結果を bench/KIND.jsonl (1 行 1 回の記録。リポジトリに入れる) に足し、bench/KIND.md (表) を作りなおす。ops、off、against なしで"},"show":{"type":"boolean","description":"測らずに、記録のいちばん新しいものと、その前からの変わりかた、Linux との比"},"smp":{"type":"integer","description":"VM の CPU の数 (既定 1、kind smp は 4。Linux も同じ)"},"ops":{"type":"array","items":{"type":"string"},"description":"net: 測る op だけ (pipe_rr futex_rr unix_rr tcp_rr udp_rr tcp_rr_epoll unix_local tcp_local udp_local unix_stream tcp_stream tcp_stream_4k tcp_connect)"},"n":{"type":"integer","description":"カーネルごとに何回 (既定 3。まんなかを使う)"},"scale":{"type":"integer","description":"量 (既定 1)"},"off":{"type":"array","items":{"type":"string"},"description":"切って測る extra や quirk (起動の引数 aios.off=)"},"wait_ms":{"type":"integer","description":"待つ長さ (既定 30000、50000 まで)"},"dir":{"type":"string"}}}"#;
+const BENCH: &str = r#"{"type":"object","properties":{"kind":{"type":"string","description":"fs (既定: ファイルまわり、test/fsbench.c)、net (ループバックの TCP / UDP / AF_UNIX とパイプ、test/netbench.c)、smp (いくつもの CPU でいっしょに: op ごとに 1 つのプロセスと CPU の数だけのプロセスで、伸びと /proc/ai/bkl。test/smpbench.c)"},"kernel":{"type":"string","description":"測るカーネル (パス / . / git のコミット。既定 .)"},"against":{"type":"string","description":"くらべる aios のカーネル (あれば。たとえば HEAD)。op ごとに、kernel の時間が against の何倍か"},"linux":{"type":"boolean","description":"同じプログラムを Linux (test/linux-vm.sh の latest) の VM でも動かし、op ごとに aios の時間が Linux の何倍か (VM はどちらも cortex-a72、smp 個の CPU、2 GiB)"},"record":{"type":"boolean","description":"結果を bench/KIND.jsonl (1 行 1 回の記録。リポジトリに入れる) に足し、bench/KIND.md (表) を作りなおす。ops、off、against なしで"},"show":{"type":"boolean","description":"測らずに、記録のいちばん新しいものと、その前からの変わりかた、Linux との比"},"smp":{"type":"integer","description":"VM の CPU の数 (既定 1、kind smp は 4。Linux も同じ)"},"ops":{"type":"array","items":{"type":"string"},"description":"net: 測る op だけ (pipe_rr futex_rr unix_rr tcp_rr udp_rr tcp_rr_epoll unix_local tcp_local udp_local unix_stream tcp_stream tcp_stream_4k tcp_connect)"},"n":{"type":"integer","description":"カーネルごとに何回 (既定 3。まんなかを使う)"},"scale":{"type":"integer","description":"量 (既定 1)"},"off":{"type":"array","items":{"type":"string"},"description":"切って測る extra や quirk (起動の引数 aios.off=)"},"full":{"type":"boolean","description":"答えをみな (両方のカーネルの数と prof、lockbench、note)。既定は短く: op ごとの数 1 つ、ちがいがはっきりしたくらべだけ、CPU の時間の多い part と区間の上のほう (ぜんぶは saved のファイル)"},"wait_ms":{"type":"integer","description":"待つ長さ (既定 30000、50000 まで)"},"dir":{"type":"string"}}}"#;
 const SYSDIFF: &str = r#"{"type":"object","properties":{"seeds":{"type":"integer","description":"いくつの種 (既定 300)"},"from":{"type":"integer","description":"はじめの種 (既定 1)"},"ops":{"type":"integer","description":"種ごとの op の数 (既定 30、200 まで)"},"kernel":{"type":"string","description":"aios のカーネル (パス / . / git のコミット。既定 .)"},"fs":{"type":"string","description":"動かすところ: home (ホームの ext4。既定) か tmp (tmpfs)。Linux も同じ種類のところで"},"base":{"type":"string","description":"手本の Linux: latest (既定。kernel.org の最新の安定版を test/linux-vm.sh が arm64 で作り (版ごとに一度、数分)、QEMU で起こした中で nobody で動かす)、版 (7.2.11 など)、host (このマシンのカーネル)"},"linux":{"type":"string","description":"Linux の答えのファイル (ほかの Linux、たとえば aios(main) で cc -O2 -o sysdiff test/sysdiff.c して sysdiff -n OPS DIR FROM-TO > FILE としたもの)。なければ base の Linux で動かす (縮めるのはいつも base で)"},"shrink":{"type":"integer","description":"縮めるちがいの数 (多いものから。既定 12、0 で縮めない)"},"wait_ms":{"type":"integer","description":"待つ長さ (既定 30000、50000 まで)"},"dir":{"type":"string"}}}"#;
-const LDIFF: &str = r#"{"type":"object","properties":{"tests":{"type":"array","items":{"type":"string"},"description":"くらべるテスト: \"NAME ARG...\" (test/NAME.c。引数の @home は ext4 のところ: Linux は /work、aios はホーム)。続けて動かす"},"name":{"type":"string","description":"tests のかわりに 1 つ"},"args":{"type":"array","items":{"type":"string"},"description":"name の引数"},"linux_only":{"type":"boolean","description":"aios では動かさず、手本の Linux の出力と終わりの番号だけ (VM は要らない)"},"root":{"type":"boolean","description":"Linux は root、aios は sudo -n で"},"net":{"type":"boolean","description":"手本の Linux に virtio-net をつなぐ"},"linux":{"type":"string","description":"手本の Linux の版 (既定 mainline。latest や 7.3.4 も)"},"fresh":{"type":"boolean","description":"とっておいた Linux の答えを使わずに動かしなおす"},"kernel":{"type":"string","description":"はじめに、このカーネル (パス / . / git のコミット) で VM を起こしなおす (test/ を出して、-snapshot で)"},"wait_ms":{"type":"integer","description":"待つ長さ (既定 30000、50000 まで)"},"dir":{"type":"string"}}}"#;
+const LDIFF: &str = r#"{"type":"object","properties":{"tests":{"type":"array","items":{"type":"string"},"description":"くらべるテスト: \"NAME ARG...\" (test/NAME.c。引数の @home は ext4 のところ: Linux は /work、aios はホーム)。続けて動かす"},"name":{"type":"string","description":"tests のかわりに 1 つ"},"args":{"type":"array","items":{"type":"string"},"description":"name の引数"},"linux_only":{"type":"boolean","description":"aios では動かさず、手本の Linux の出力と終わりの番号だけ (VM は要らない)"},"aios_only":{"type":"boolean","description":"Linux では動かさず、aios の出力と終わりの番号だけ (aios だけのテスト。Linux が何も出さなかったときも、aios の出力を見せる)"},"root":{"type":"boolean","description":"Linux は root、aios は sudo -n で"},"net":{"type":"boolean","description":"手本の Linux に virtio-net をつなぐ"},"linux":{"type":"string","description":"手本の Linux の版 (既定 mainline。latest や 7.3.4 も)"},"fresh":{"type":"boolean","description":"とっておいた Linux の答えを使わずに動かしなおす"},"kernel":{"type":"string","description":"はじめに、このカーネル (パス / . / git のコミット) で VM を起こしなおす (test/ を出して、-snapshot で)"},"wait_ms":{"type":"integer","description":"待つ長さ (既定 30000、50000 まで)"},"dir":{"type":"string"}}}"#;
+const CTESTS: &str = r#"{"type":"object","properties":{"tests":{"type":"array","items":{"type":"string"},"description":"動かすテストの名前 (test/NAME.c。TESTS にないものも)。なければ CI と同じ全部 (5 分ほど)"},"name":{"type":"string","description":"tests のかわりに 1 つ"},"kernel":{"type":"string","description":"このカーネル (パス / . / git のコミット) で VM を起こしなおしてから。なければ、test/ を出している VM があればそれで、なければ作業中のソース (.) で起こす"},"timeout":{"type":"number","description":"上限 (秒、既定 1200)"},"wait_ms":{"type":"integer","description":"待つ長さ (既定 30000、50000 まで)"},"dir":{"type":"string"}}}"#;
 const BISECT: &str = r#"{"type":"object","properties":{"good":{"type":"string","description":"test が通るコミット"},"bad":{"type":"string","description":"test が通らないコミット (既定 HEAD)"},"test":{"type":"string","description":"中で動かすコマンド。終了コード 0 で good、125 で skip、ほかは bad (起動しない、時間切れも bad)"},"timeout":{"type":"number","description":"1 回の test の上限 (秒、既定 300)"},"wait_ms":{"type":"integer","description":"待つ長さ (既定 30000、50000 まで)"},"dir":{"type":"string"}},"required":["good","test"]}"#;
 
 fn main() {
@@ -55,6 +57,7 @@ fn main() {
             "bench" => bench::job(&root, &a),
             "sysdiff" => sysdiff::job(&root, &a),
             "ldiff" => ldiff::job(&root, &a),
+            "ctests" => ctests::job(&root, &a),
             _ => Err(format!("{}: unknown", cmd)),
         };
         match r {
@@ -71,13 +74,14 @@ fn main() {
         hooks: &[],
         keys: &[],
         tools: &[
-            Tool { name: "vm", desc: "開発のマシンで aios の VM を動かす (test/vm.py): start (kernel: パス / . / git のコミット) stop status run (シリアルの端末でコマンド。bg でうしろで動かして job で様子と出力) put (ファイルを中へ) get (中のファイルを外へ。中で作った png やログを Read で見るなど。16 MB まで) shot (画面を png に。Read で見る) keys (画面のキーボード: @alt-b @ctrl-l @ret、ほかは文字) log (シリアルの終わり、grep) mon (QEMU のモニタ) reboot (中で sudo reboot してプロンプトまで待つ。reset_after 秒で来なければリセット)", input: VM },
+            Tool { name: "vm", desc: "開発のマシンで aios の VM を動かす (test/vm.py): start (kernel: パス / . / git のコミット) stop status run (シリアルの端末でコマンド。bg でうしろで動かして job で様子と出力) put (ファイルを中へ) get (中のファイルを外へ。中で作った png やログを Read で見るなど。16 MB まで) shot (画面を png に。Read で見る) keys (画面のキーボード: @alt-b @ctrl-l @ret、ほかは文字) log (シリアルの終わり、grep) mon (QEMU のモニタ) reboot (中で sudo reboot してプロンプトまで待つ。reset_after 秒で来なければリセット)。中のカーネルが panic していれば、run と job の時間切れと status の答えに panic (わけと、関数の名前にした backtrace)", input: VM },
             Tool { name: "try", desc: "C (か C++) のコードを aarch64-linux-musl の静的なプログラムにして (zig cc -O2 -static -s。zig がなければ aarch64-linux-gnu-gcc で glibc)、動いている VM の中で動かし、出力と終了コードを返す。カーネルのふるまいをすぐ確かめるため (VM は vm の start で先に)", input: TRY },
             Tool { name: "ab", desc: "2 つのカーネル (a、b: パス / . / git のコミット) で同じ cmd を n 回ずつ動かし、時間 (ms のまんなか、いちばん短い、長い) と大きなロックを持っていた割合をくらべる。動いている VM を止めて -snapshot で起こしなおす。うしろで動くので、終わっていなければ running。もういちど呼ぶと続きを待つ", input: AB },
             Tool { name: "bisect", desc: "test が通る good と通らない bad のあいだのコミットを git bisect で探す (別の作業場所 build/aish-vm/wt で)。コミットごとにカーネルを作り、VM (-snapshot) で test を動かす: 0 で good、125 で skip、ほか (起動しない、時間切れも) bad。変わるのはカーネルだけ。うしろで動くので、もういちど呼ぶと様子か結果 (first_bad)", input: BISECT },
-            Tool { name: "bench", desc: "速さを測って記録し、くらべる。kind fs (既定): ファイルまわり (test/fsbench.c: create、stat、open、4 KiB の書き読み、readdir、rename、unlink、mkdir、16 MiB の書き読み、fsync など)。kind net: ループバック (test/netbench.c: パイプ、AF_UNIX、TCP、UDP の 1 バイトの往復を 2 つのプロセスと 1 つのプロセスで、futex で起こしあう 2 つのスレッドの往復、epoll で待つ往復、64 KiB と 4 KiB の流しこみ、connect)。kind smp: いくつもの CPU でいっしょに (test/smpbench.c: getppid、umask、futex、stat、open、4 KiB の読み書き、作って消す、パイプ、AF_UNIX、mmap、fork を、1 つのプロセスと CPU の数だけのプロセス (それぞれ自分のファイルなど) で。伸び (1 つのときの何倍まわせたか) を Linux とくらべ、op ごとに /proc/ai/bkl の大きなロックを待った割合と長く持ったシステムコール)。VM (-snapshot、smp 個の CPU) で n 回動かして op ごとの µs (流しこみは MB/s) のまんなかと、prof をつけた回で part (kernel.json の名前) ごとの CPU の時間の割合 (どこがボトルネックか。眠って待った時間は wait_us) と、時間の多い区間 (net は op ごと)。lock は lockbench の 5 回のまんなか。against で 2 つの aios のカーネルを、linux で同じプログラムを Linux の VM (cortex-a72) でくらべる。record で bench/KIND.jsonl に記録を足して bench/KIND.md の表を作りなおす (いつも、前の記録からの変わりかたも出す)。show で測らずに記録を見る。結果は build/aish-vm/bench/ にも残る。うしろで動くので、終わっていなければ running。もういちど呼ぶと続きを待つ", input: BENCH },
+            Tool { name: "bench", desc: "速さを測って記録し、くらべる。kind fs (既定): ファイルまわり (test/fsbench.c: create、stat、open、4 KiB の書き読み、readdir、rename、unlink、mkdir、16 MiB の書き読み、fsync など)。kind net: ループバック (test/netbench.c: パイプ、AF_UNIX、TCP、UDP の 1 バイトの往復を 2 つのプロセスと 1 つのプロセスで、futex で起こしあう 2 つのスレッドの往復、epoll で待つ往復、64 KiB と 4 KiB の流しこみ、connect)。kind smp: いくつもの CPU でいっしょに (test/smpbench.c: getppid、umask、futex、stat、open、4 KiB の読み書き、作って消す、パイプ、AF_UNIX、mmap、fork を、1 つのプロセスと CPU の数だけのプロセス (それぞれ自分のファイルなど) で。伸び (1 つのときの何倍まわせたか) を Linux とくらべ、op ごとに /proc/ai/bkl の大きなロックを待った割合と長く持ったシステムコール)。VM (-snapshot、smp 個の CPU) で n 回動かして op ごとの µs (流しこみは MB/s) のまんなかと、prof をつけた回で part (kernel.json の名前) ごとの CPU の時間の割合 (どこがボトルネックか。眠って待った時間は wait_us) と、時間の多い区間 (net は op ごと)。lock は lockbench の 5 回のまんなか。against で 2 つの aios のカーネルを、linux で同じプログラムを Linux の VM (cortex-a72) でくらべる。record で bench/KIND.jsonl に記録を足して bench/KIND.md の表を作りなおす (いつも、前の記録からの変わりかたも出す)。show で測らずに記録を見る。答えは短く (はっきりしたちがいだけ。full でみな)、ぜんぶは build/aish-vm/bench/ に残る。うしろで動くので、終わっていなければ running。もういちど呼ぶと続きを待つ", input: BENCH },
             Tool { name: "sysdiff", desc: "Linux と答えあわせ (test/sysdiff.c): 種から決まるシステムコールの並び (open、read、write、stat、mkdir、rename、link、symlink、chmod、access、getdents、dup、fcntl、pipe など。fd は前の op が開けたもの) を、手本の Linux (既定は kernel.org の最新の安定版を作って QEMU で。base: host でこのマシンのもの。どれも nobody で) と VM (-snapshot) の aios で動かし、case ごとに最初にちがう行をくらべる。ちがいは (op、Linux の答え、aios の答え) でまとめ、多いものから、op を減らしても同じちがいが同じ op で出るいちばん小さな並び (SEED:I,J,...) に縮める。aios がえらんだちがい (test/sysdiff.c の chosen、doc/aios.md) は Linux でもそのふるまいをまねて答えにし、chosen に何 case で使ったかを分けて出す (手本の Linux のまちがい (linux_bugs) も、Linux の側でただして同じように)。答えはアーキテクチャによらない形 (フラグは名前、stat は種類と許可と数)。結果は build/aish-vm/sysdiff/ にも残る。うしろで動くので、終わっていなければ running。もういちど呼ぶと続きを待つ", input: SYSDIFF },
-            Tool { name: "ldiff", desc: "出すだけのテスト (test/NAME.c) を、手本の Linux (既定 mainline を QEMU で。答えはとっておく) と動いている aios の VM (test/ を出しているもの。なければ kernel で起こす) で動かし、出力をくらべる (test/ldiff.sh)。tests にいくつでも。テストごとに same、differ (diff -u の頭: --- Linux、+++ aios)、error だけを返す。手本の Linux に足りない機能は note に。linux_only で Linux の出力だけ (作るテストの答えを先に見る)。うしろで動くので、終わっていなければ running。もういちど呼ぶと続きを待つ", input: LDIFF },
+            Tool { name: "ldiff", desc: "出すだけのテスト (test/NAME.c) を、手本の Linux (既定 mainline を QEMU で。答えはとっておく) と動いている aios の VM (test/ を出しているもの。なければ kernel で起こす) で動かし、出力をくらべる (test/ldiff.sh)。tests にいくつでも。テストごとに same、differ (diff -u の頭: --- Linux、+++ aios)、error だけを返す。手本の Linux に足りない機能は note に。linux_only で Linux の出力だけ (作るテストの答えを先に見る)、aios_only で aios の出力だけ (aios だけのテスト。Linux が何も出さなかったものも aios の出力を aios_only に)。うしろで動くので、終わっていなければ running。もういちど呼ぶと続きを待つ", input: LDIFF },
+            Tool { name: "ctests", desc: "カーネルの C のテスト (test/vm-ctests.sh: CI の VM test と同じ、テストごとの引数や sudo も) を名前を選んで VM で動かす: 外で test/bin/NAME を作り (古いものだけ)、test/ を出している VM (なければ kernel か作業中のソースで起こす) の中で動かして、ok の数と、FAIL したもの (終わりの番号とそのテストの出力の終わり) だけを返す。時間切れなら、どこまで進んだか (last_ok) と中のカーネルの panic。うしろで動くので、終わっていなければ running。もういちど呼ぶと続きを待つ", input: CTESTS },
             Tool { name: "box", desc: "カーネルの砂場: kernel.json の off のあるもの (extra、quirk と core の ns・vdso) を切って (起動の引数 aios.off=) VM (-snapshot) を起こし、test (既定は CI と同じ vm-check と vm-ctests) を動かして、何も切らないときと FAIL の行をくらべる。それがなくても動くか、quirk がまだ要るかを確かめる。each で 1 つずつ全部 (どのテストがどれを要るか)。うしろで動くので、終わっていなければ running。もういちど呼ぶと続きを待つ", input: BOX },
         ],
     };
@@ -95,6 +99,7 @@ fn main() {
                 "bench" => job(&mut jobs, &root, "bench", a),
                 "sysdiff" => job(&mut jobs, &root, "sysdiff", a),
                 "ldiff" => job(&mut jobs, &root, "ldiff", a),
+                "ctests" => job(&mut jobs, &root, "ctests", a),
                 n => error(format!("{}: no such tool", n)),
             }
         }
@@ -217,7 +222,8 @@ fn vm(jobs: &mut HashMap<String, Job>, root: &Path, a: &Value) -> Value {
     };
     match op {
         "start" => job(jobs, root, "start", a),
-        "stop" | "status" => res(vmpy(root, &[op], &[], short)),
+        "stop" => res(vmpy(root, &[op], &[], short)),
+        "status" => with_panic(root, res(vmpy(root, &[op], &[], short))),
         "run" if a["bg"] == true => {
             // 中でうしろで (vm.py bg)。様子と出力は op job で
             let (st, out, err, ms, to) = vmpy(root, &["bg", s(a, "cmd")], &[], short);
@@ -250,13 +256,15 @@ fn vm(jobs: &mut HashMap<String, Job>, root: &Path, a: &Value) -> Value {
                     }
                     r
                 }
-                _ => res((st, out, err, ms, to)),
+                _ => with_panic(root, res((st, out, err, ms, to))),
             }
         }
         "run" => {
             let t = secs(a, "timeout", 50.0, 50.0);
             let (st, out, err, ms, to) = vmpy(root, &["run", s(a, "cmd"), "-t", &format!("{}", t)], &[], Duration::from_secs_f64(t + 5.0));
-            res((st, cut(root, symbolize(root, out)), err, ms, to))
+            // vm.py run は時間切れなら 124 (中のコマンドが終わらないか、VM が止まった)
+            let r = res((st, cut(root, symbolize(root, out)), err, ms, to));
+            if to || st == 124 { with_panic(root, r) } else { r }
         }
         "put" => {
             let local = s(a, "local");
@@ -628,6 +636,33 @@ fn symbolize(root: &Path, text: String) -> String {
     format!("{}\nbacktrace (addr2line):\n{}", text, names.join("\n"))
 }
 
+/// シリアルの終わりに、いまのカーネルの panic (行の頭が "panic: ") があれば、その行から 30 行 (わけと backtrace を
+/// 関数の名前にしたもの)。そのあとに起動しなおした (aios init:) ものは古いので見ない。VM が答えないとき (run や job の
+/// 時間切れ) と status の答えに足す: 止まったわけを log で探しにいかなくてよいように
+fn panic_note(root: &Path) -> Option<String> {
+    let (_, out, _, _, _) = vmpy(root, &["log", "400"], &[], Duration::from_secs(15));
+    find_panic(&out).map(|t| symbolize(root, t))
+}
+
+/// シリアルの出力の中の、いちばん終わりの panic (その行から 30 行)。そのあとに起動しなおしていれば None
+fn find_panic(log: &str) -> Option<String> {
+    let lines: Vec<&str> = log.lines().collect();
+    let i = lines.iter().rposition(|l| l.trim_start().starts_with("panic: "))?;
+    if lines[i..].iter().any(|l| l.starts_with("aios init:")) {
+        return None;
+    }
+    Some(lines[i..].iter().take(30).copied().collect::<Vec<_>>().join("\n"))
+}
+
+/// 答えに panic を足す (あれば)
+fn with_panic(root: &Path, mut r: Value) -> Value {
+    if let Some(p) = panic_note(root) {
+        r["panic"] = json!(p);
+        r["hint"] = json!("the kernel in the VM panicked (panic has the message and backtrace): vm op start boots it again");
+    }
+    r
+}
+
 /// VM を止めて、kernel で起こす (snapshot ならディスクに書き残さない、off は切って)。起動に失敗したら Err
 fn boot(root: &Path, kernel: Option<&Path>, snapshot: bool, www: &str, off: &[String]) -> Result<Value, String> {
     boot_env(root, kernel, snapshot, www, off, &[])
@@ -834,13 +869,16 @@ fn switchable(root: &Path) -> Result<Vec<String>, String> {
 const DEFAULT_TEST: &str = "fetch http://10.0.2.2:8000/vm-check.sh > /tmp/vm-check.sh && sh /tmp/vm-check.sh; a=$?; \
 fetch http://10.0.2.2:8000/vm-ctests.sh > /tmp/vm-ctests.sh && sh /tmp/vm-ctests.sh run; b=$?; exit $((a + b))";
 
-fn build_ctests(root: &Path) -> Result<(), String> {
+/// test/bin/NAME を作る (names が空なら vm-ctests.sh の TESTS みな)
+fn build_ctests(root: &Path, names: &[String]) -> Result<(), String> {
     let cc = ["aarch64-linux-gnu-gcc", "gcc"].into_iter().find(|c| {
         let (st, out, _, _, _) = sh(root, c, &["-dumpmachine"], &[], Duration::from_secs(10));
         st == 0 && out.starts_with("aarch64")
     });
     let Some(cc) = cc else { return Err("no aarch64 C compiler for the C tests (aarch64-linux-gnu-gcc)".into()) };
-    let (st, _, err, _, _) = sh(root, "sh", &["test/vm-ctests.sh", "build", cc], &[], Duration::from_secs(600));
+    let mut args = vec!["test/vm-ctests.sh", "build", cc];
+    args.extend(names.iter().map(String::as_str));
+    let (st, _, err, _, _) = sh(root, "sh", &args, &[], Duration::from_secs(600));
     if st != 0 {
         return Err(format!("test/vm-ctests.sh build: {}", err.lines().last().unwrap_or("")));
     }
@@ -865,7 +903,7 @@ fn job_box(root: &Path, a: &Value) -> Result<Value, String> {
     };
     if custom.is_empty() {
         note(json!({ "step": "ctests" }));
-        build_ctests(root)?;
+        build_ctests(root, &[])?;
     }
     let spec = a["kernel"].as_str().filter(|x| !x.is_empty()).unwrap_or(".");
     note(json!({ "step": "kernel", "spec": spec }));
@@ -965,6 +1003,17 @@ fn spread(v: &[f64]) -> (f64, f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panic_in_log() {
+        let log = "ok madvise\npid 3674 (madvise): killed by signal 11\npanic: panicked at kernel/src/extfs.rs:264:31:\nRefCell already borrowed\nbacktrace: 0xffffff80403c1158 0xffffff80403c0f38\n";
+        let p = find_panic(log).unwrap();
+        assert!(p.starts_with("panic: panicked at kernel/src/extfs.rs") && p.contains("RefCell already borrowed") && p.contains("backtrace: 0x"));
+        // 起動しなおしたあとなら古い
+        assert!(find_panic(&format!("{}aios init: 12 units, 9 enabled\n", log)).is_none());
+        // ユーザーのプログラムの出力の中の panic という字は数えない
+        assert!(find_panic("thread 'main' panicked at src/main.rs\nok\n").is_none());
+    }
 
     #[test]
     fn adopt_jobs() {

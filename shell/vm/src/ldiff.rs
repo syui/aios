@@ -1,6 +1,8 @@
 // ldiff: 出すだけのテスト (test/NAME.c) を手本の Linux と aios の VM で動かしてくらべる (test/ldiff.sh) を、うしろで
 // いくつでも続けて。答えはテストごとに same / differ (diff -u の頭) / error と、まとめだけ (進みぐあいの行は出さない)。
-// linux_only なら aios では動かさず、Linux の出力を見る (作るテストの答えを先に。VM は要らない)。kernel は
+// linux_only なら aios では動かさず、Linux の出力を見る (作るテストの答えを先に。VM は要らない)。aios_only なら Linux
+// では動かさず aios の出力を (aios だけのテスト)。Linux が何も出さなければ (aios だけのテストか、Linux で動かせない)、
+// error にせず aios の出力を見せる (aios)。kernel は
 // はじめのテストの前に 1 度だけ (そのカーネルで VM を起こしなおす。あとのテストはその VM で)
 // 前は run で test/ldiff.sh を 1 つずつ動かし、Linux を作る数分や aios の長いテストで 60 秒を過ぎていた (2026-11-13)
 use super::{note, sh};
@@ -22,7 +24,7 @@ fn tests(a: &Value) -> Vec<Vec<String>> {
     t
 }
 
-/// ldiff.sh の答えを短く: (same / differ / linux / error, 本文)
+/// ldiff.sh の答えを短く: (same / differ / linux / aios / error, 本文)
 fn summary(code: i32, out: &str, err: &str, linux_only: bool) -> (&'static str, String) {
     let lines: Vec<&str> = out.lines().collect();
     let clip = |ls: &[&str]| -> String {
@@ -31,10 +33,21 @@ fn summary(code: i32, out: &str, err: &str, linux_only: bool) -> (&'static str, 
         }
         format!("{}\n... ({} more lines)", ls[..MAX_LINES].join("\n"), ls.len() - MAX_LINES)
     };
+    // aios だけの出力は、まとめと終わりの番号が終わりにあるので、頭を少しと終わりを多めに
+    let ends = |ls: &[&str]| -> String {
+        if ls.len() <= MAX_LINES {
+            return ls.join("\n");
+        }
+        let (h, t) = (MAX_LINES / 4, MAX_LINES - MAX_LINES / 4);
+        format!("{}\n... ({} lines) ...\n{}", ls[..h].join("\n"), ls.len() - h - t, ls[ls.len() - t..].join("\n"))
+    };
     match code {
         0 if linux_only => ("linux", clip(&lines)),
+        0 if lines.last().is_some_and(|l| l.starts_with("aios only: ")) => ("aios", ends(&lines)),
         0 => ("same", lines.join("\n")),
         1 => ("differ", clip(&lines)),
+        // Linux が何も出さなかった: aios の出力と Linux のエラーの終わり (ldiff.sh)
+        3 => ("aios", ends(&lines)),
         _ => {
             let e: Vec<&str> = err.lines().filter(|l| !l.trim().is_empty()).collect();
             ("error", e[e.len().saturating_sub(5)..].join("\n"))
@@ -49,7 +62,7 @@ pub fn job(root: &Path, a: &Value) -> Result<Value, String> {
     }
     let linux_only = a["linux_only"] == true;
     let mut flags: Vec<String> = Vec::new();
-    for (k, f) in [("root", "--root"), ("net", "--net"), ("fresh", "--fresh"), ("linux_only", "--linux-only")] {
+    for (k, f) in [("root", "--root"), ("net", "--net"), ("fresh", "--fresh"), ("linux_only", "--linux-only"), ("aios_only", "--aios-only")] {
         if a[k] == true {
             flags.push(f.into());
         }
@@ -58,7 +71,7 @@ pub fn job(root: &Path, a: &Value) -> Result<Value, String> {
         flags.extend(["--linux".to_string(), s(a, "linux").to_string()]);
     }
     let mut kernel = s(a, "kernel").to_string();
-    let (mut same, mut differ, mut errors, mut text) = (Vec::new(), Vec::new(), Vec::new(), String::new());
+    let (mut same, mut differ, mut errors, mut aios, mut text) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), String::new());
     let mut seen: Vec<String> = Vec::new();
     for t in &list {
         let mut args: Vec<String> = vec!["test/ldiff.sh".into()];
@@ -90,6 +103,10 @@ pub fn job(root: &Path, a: &Value) -> Result<Value, String> {
                 text.push_str(&format!("{}:\n{}\n", name, body));
             }
             "linux" => text.push_str(&format!("{} (Linux):\n{}\n", name, body)),
+            "aios" => {
+                aios.push(name.clone());
+                text.push_str(&format!("{} (aios):\n{}\n", name, body));
+            }
             _ => {
                 errors.push(name.clone());
                 text.push_str(&format!("{}: error\n{}\n", name, body));
@@ -105,7 +122,12 @@ pub fn job(root: &Path, a: &Value) -> Result<Value, String> {
         text.push('\n');
     }
     let ok = differ.is_empty() && errors.is_empty();
-    Ok(json!({ "text": text, "ok": ok, "same": same.len(), "differ": differ, "errors": errors, "files": "build/ldiff/NAME.linux, NAME.aios" }))
+    let mut r = json!({ "text": text, "ok": ok, "same": same.len(), "differ": differ, "errors": errors, "files": "build/ldiff/NAME.linux, NAME.aios" });
+    // Linux とくらべていないもの (aios_only か、Linux が何も出さなかった)
+    if !aios.is_empty() {
+        r["aios_only"] = json!(aios);
+    }
+    Ok(r)
 }
 
 #[cfg(test)]
@@ -130,5 +152,13 @@ mod t {
         assert_eq!(k, "error");
         assert!(b.contains("no aios VM"));
         assert_eq!(summary(0, "a\nlinux only: Linux 7.3 exit 0\n", "", true).0, "linux");
+        assert_eq!(summary(0, "ok fast\naios only: aios exit 0\n", "", false).0, "aios");
+        let (k, b) = summary(3, "ok fast\naios exit 0; Linux 7.4 gave no output (an aios-only test? use --aios-only):\nlinux: x\n", "", false);
+        assert_eq!(k, "aios");
+        assert!(b.contains("ok fast"));
+        let long = format!("{}aios only: aios exit 0\n", "ok x\n".repeat(100));
+        let (k, b) = summary(0, &long, "", false);
+        assert_eq!(k, "aios");
+        assert!(b.ends_with("aios only: aios exit 0") && b.contains("(61 lines)"));
     }
 }

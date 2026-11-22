@@ -159,6 +159,16 @@ pub fn ship(v: &Value) -> Value {
                 }
                 if t0.elapsed() + Duration::from_secs(3) > wait {
                     let mut text = format!("{}: publishing ({}s, {})\n{}", short, st["started"].as_u64().map_or(0, |t0| now().saturating_sub(t0)), log, tail(&log, 2));
+                    // CI を待っているあいだは、publish.sh がいまの step と前に通った run のその長さを 1 分に 1 度書く。
+                    // いつもよりずっと長ければ、止まっているかもしれない (VM test の中でカーネルが panic など)
+                    if let Some(l) = txt.lines().rev().find(|l| l.starts_with("ci: step ")) {
+                        if !tail(&log, 2).contains(l) {
+                            text.push_str(&format!("  {}\n", l));
+                        }
+                        if l.contains("slow:") {
+                            text.push_str("  the CI step takes much longer than the last passing run: look at the run (ci), and stop the publish (ship stop: true) if it hangs\n");
+                        }
+                    }
                     // publish はさいごに作業中の変更を見て、あれば base を作らずに止まる (2026-11-14、publish の
                     // あいだに shell/ と user/ を書きかえていて止まった)
                     let c = cfg(&top);

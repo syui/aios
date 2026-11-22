@@ -47,11 +47,48 @@ RUNS
     echo "ci: no unix.yml run for $(git rev-parse --short HEAD) (paths-ignore); using the run of $(git rev-parse --short "$rsha") (nothing CI builds changed since)"
   fi
 fi
+# CI のいまの step と、前に通った run でのその step の長さ (1 分に 1 度、変わったら 1 行: ship が publish のログの
+# 終わりを見せるので、どこで待っているか、いつもより長いか (止まっていないか) がわかる。2026-11-22 に VM test が
+# panic で止まり、GitHub を見にいくまでわからなかった)
+step_times() {
+  python3 -c '
+import json, sys
+from datetime import datetime
+t = lambda s: datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+for j in json.load(sys.stdin).get("jobs", []):
+    for st in j.get("steps", []):
+        if st.get("started_at") and st.get("completed_at"):
+            print("%s\t%d" % (st["name"], t(st["completed_at"]) - t(st["started_at"])))'
+}
+step_now() {
+  python3 -c '
+import json, sys, time
+from datetime import datetime
+usual = dict(l.rsplit("\t", 1) for l in sys.argv[1].splitlines() if "\t" in l)
+m = lambda s: "%dm" % (s // 60) if s >= 60 else "%ds" % s
+for j in json.load(sys.stdin).get("jobs", []):
+    for st in j.get("steps", []):
+        if st.get("status") == "in_progress" and st.get("started_at"):
+            took = time.time() - datetime.fromisoformat(st["started_at"].replace("Z", "+00:00")).timestamp()
+            u = int(usual[st["name"]]) if st["name"] in usual else None
+            slow = u is not None and took > 1.5 * u + 120
+            print("ci: step \"%s\" for %s%s%s" % (st["name"], m(int(took)), " (usually %s)" % m(u) if u is not None else "", "; slow: stuck? look at the run" if slow else ""))
+            sys.exit(0)' "$1"
+}
 if [ -n "$run" ]; then
+  prev=$(curl -fsS "$api/actions/workflows/unix.yml/runs?branch=main&status=success&per_page=1" 2>/dev/null | json 'd["workflow_runs"][0]["id"] if d["workflow_runs"] else ""' 2>/dev/null) || prev=
+  usual=
+  [ -z "$prev" ] || usual=$(curl -fsS "$api/actions/runs/$prev/jobs?per_page=50" 2>/dev/null | step_times 2>/dev/null) || usual=
+  n=0 last=
   while :; do
     st=$(curl -fsS "$api/actions/runs/$run" | json 'd["status"] + " " + str(d["conclusion"])')
     case "$st" in completed*) break ;; esac
     [ -n "$dry" ] && break
+    if [ $((n % 4)) = 0 ]; then
+      line=$(curl -fsS "$api/actions/runs/$run/jobs?per_page=50" 2>/dev/null | step_now "$usual" 2>/dev/null) || line=
+      [ -z "$line" ] || [ "$line" = "$last" ] || { echo "$line"; last=$line; }
+    fi
+    n=$((n + 1))
     sleep 15
   done
   echo "ci: $st (https://github.com/syui/aios/actions/runs/$run)"

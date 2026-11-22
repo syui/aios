@@ -160,7 +160,7 @@ pub fn job(root: &Path, a: &Value) -> Result<Value, String> {
         out["off"] = json!(off);
     }
     if !only.is_empty() {
-        out["ops"] = json!(only);
+        out["ops_only"] = json!(only);
     }
     if let Some(b) = &base {
         out["against"] = b.clone();
@@ -203,7 +203,60 @@ pub fn job(root: &Path, a: &Value) -> Result<Value, String> {
     if std::fs::write(&saved, format!("{}\n", out)).is_ok() {
         out["saved"] = json!(saved.display().to_string());
     }
-    Ok(out)
+    Ok(if a["full"].as_bool() == Some(true) { out } else { brief(&out) })
+}
+
+/// 答えを短く (既定): op ごとの数 1 つ、くらべたもののうち、ちがいがはっきりしたものだけ (同じくらいのものは数だけ)、
+/// CPU の時間の多い part と区間の上のほう。ぜんぶは saved のファイル (full: true でも)。前は両方のカーネルの prof を
+/// みな返して、1 回の答えが 20 KB をこえていた (2026-11-22)
+fn brief(out: &Value) -> Value {
+    let mut b = json!({ "bench": out["bench"], "n": out["n"] });
+    let vm = &out["vm"];
+    b["vm"] = json!(format!("{}, {} CPU, {}, {}", s(vm, "cpu"), vm["smp"], s(vm, "mem"), s(vm, "accel")));
+    let mut ops = json!({});
+    if let Some(o) = out["result"]["ops"].as_object() {
+        for (k, v) in o {
+            let one = match (v["us"].as_f64(), v["mb_s"].as_f64()) {
+                (Some(us), _) => format!("{} us", us),
+                (_, Some(mb)) => format!("{} MB/s", mb),
+                _ => v.to_string(),
+            };
+            ops[k.as_str()] = json!(one);
+        }
+    }
+    b["ops"] = ops;
+    // くらべた行: はっきりしたものだけ。同じくらいのものは数
+    let clear = |k: &str, b: &mut Value| {
+        let Some(lines) = out[k].as_array() else { return };
+        let (keep, same): (Vec<&Value>, Vec<&Value>) = lines.iter().partition(|l| !l.as_str().is_some_and(|x| x.contains("no clear difference")));
+        b[k] = json!(keep);
+        if !same.is_empty() {
+            b[format!("{}_same", k)] = json!(same.len());
+        }
+    };
+    clear("compare", &mut b);
+    clear("since_last", &mut b);
+    for k in ["vs_linux", "speedup", "speedup_linux", "off", "ops_only", "recorded", "saved"] {
+        if !out[k].is_null() {
+            b[k] = out[k].clone();
+        }
+    }
+    // CPU の時間の多いところ (prof をつけた回): part の上 4 つと、区間の上 5 つ
+    if let Some(all) = out["result"]["prof"].as_object() {
+        let mut prof = json!({});
+        for (op, p) in all {
+            let parts: Vec<String> = p["parts"].as_array().map(|a| a.iter().take(4).map(|x| format!("{} {}%", s(x, "part"), x["pct"])).collect()).unwrap_or_default();
+            let spans: Vec<String> = p["spans"].as_array().map(|a| a.iter().take(5).map(|x| format!("{} {} us x{}", s(x, "name"), x["avg_us"], x["count"])).collect()).unwrap_or_default();
+            if !parts.is_empty() || !spans.is_empty() {
+                prof[op.as_str()] = json!({ "parts": parts, "spans": spans });
+            }
+        }
+        if prof.as_object().is_some_and(|o| !o.is_empty()) {
+            b["prof"] = prof;
+        }
+    }
+    b["hint"] = json!("short answer: full: true (or read saved) for every number, both kernels' prof and the lockbench");
+    b
 }
 
 struct Cfg {
@@ -785,6 +838,27 @@ fn show(root: &Path, kind: &str) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn brief_answer() {
+        // 本物の答え (2026-11-22 の fs、against HEAD) を短く
+        let out = json!({ "bench": "fs", "n": 5, "vm": { "cpu": "cortex-a72", "smp": 1, "mem": "2G", "accel": "tcg" },
+            "result": { "ops": { "create": { "us": 54.71, "min": 52.31, "max": 85.8 }, "read-seq": { "mb_s": 2804.0, "min": 2599.7, "max": 2951.1 } },
+                "prof": { "all": { "parts": [{ "part": "extfs", "pct": 59.5 }, { "part": "sysfile", "pct": 28.3 }, { "part": "vfs", "pct": 4.2 }, { "part": "block", "pct": 3.6 }, { "part": "jbd2", "pct": 2.9 }],
+                    "spans": [{ "name": "extfs:rename", "avg_us": 50.07, "count": 2000 }] } } },
+            "against": { "ops": {}, "prof": { "all": { "parts": [] } } },
+            "compare": ["create: 1.09x the time of HEAD (slower)", "stat: 0.98x the time of HEAD (no clear difference)", "lockbench uptime_ns: 1.00x the time of HEAD (no clear difference)"],
+            "since_last": ["create: 0.54x the time of the last record (faster)"], "saved": "/x/1.json", "note": "long" });
+        let b = brief(&out);
+        assert_eq!(b["ops"]["create"], "54.71 us");
+        assert_eq!(b["ops"]["read-seq"], "2804 MB/s");
+        assert_eq!(b["compare"], json!(["create: 1.09x the time of HEAD (slower)"]));
+        assert_eq!(b["compare_same"], 2);
+        assert_eq!(b["prof"]["all"]["parts"].as_array().unwrap().len(), 4);
+        assert_eq!(b["prof"]["all"]["spans"][0], "extfs:rename 50.07 us x2000");
+        assert!(b.get("against").is_none() && b.get("note").is_none() && b["saved"] == "/x/1.json");
+        assert_eq!(b["vm"], "cortex-a72, 1 CPU, 2G, tcg");
+    }
 
     #[test]
     fn smp_ops() {

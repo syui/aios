@@ -1,6 +1,6 @@
 #!/bin/sh
 # 出すだけのテスト (test/NAME.c) を、手本の Linux と aios の VM で動かして、出力をくらべる (答えあわせを 1 つの口で)
-#   test/ldiff.sh [--root] [--net] [--linux VER] [--fresh] [--kernel .|FILE|COMMIT] [--linux-only] NAME [ARG...]
+#   test/ldiff.sh [--root] [--net] [--linux VER] [--fresh] [--kernel .|FILE|COMMIT] [--linux-only | --aios-only] NAME [ARG...]
 #     1. test/NAME.c を aarch64 の静的なもの (test/bin/NAME) に作る (なければ、.c のほうが新しければ)
 #     2. 手本の Linux (test/linux-vm.sh exec VER。既定は mainline) で動かす。答えは build/linux-answers/ にとっておき、
 #        プログラムと引数と Linux の版と test/linux.config が同じなら、もう一度は動かさない (--fresh で動かしなおす)
@@ -11,16 +11,19 @@
 #   --net: 手本の Linux に virtio-net をつなぐ (ip=dhcp で 10.0.2.15/24、ゲートウェイ 10.0.2.2: aios の VM と同じ。
 #     test/route.c)
 #   --linux-only: aios では動かさず、手本の Linux の出力と終わりの番号だけ (VM は要らない。作るテストの答えを先に見る)
+#   --aios-only: Linux では動かさず、aios の出力と終わりの番号だけ (aios だけのテスト: /proc/ai や aios のロックなしの道を
+#     見るもの)。ふつうのときも、Linux が何も出さなければ aios の出力を出して 3 で終わる
 #   引数の @home は ext4 のところ: Linux は /work、aios はホーム ($HOME) に読みかえる (test/chosen.c @home /tmp など)
 #     5. 手本の Linux に足りない機能 (aios にはある) を知らせる: test/features.c を両方で動かしてくらべる。テストが使う
 #        機能が手本の Linux になければ、ENOSYS や EINVAL がテストの答えにかくれて同じに見えることがある (そのときは
 #        test/linux.config に足す)。LDIFF_NO_FEATURES=1 で見ない
-#   出力: build/ldiff/NAME.linux と NAME.aios。終わりの番号: 同じなら 0、ちがえば 1、動かせなければ 2
+#   出力: build/ldiff/NAME.linux と NAME.aios。終わりの番号: 同じなら 0、ちがえば 1、動かせなければ 2、Linux が何も
+#   出さなかった (aios の出力だけ) なら 3
 # Linux は nobody で、aios は ai で動く。uid や pid の番号をじかに出すテストは、そのぶんちがって見える (あてはまるかを出す)
 set -e
 top=$(cd "$(dirname "$0")/.." && pwd)
 cd "$top"
-root= ver=mainline fresh= kernel= net= lonly=
+root= ver=mainline fresh= kernel= net= lonly= aonly=
 while :; do
   case "$1" in
   --root) root=1; shift ;;
@@ -29,11 +32,12 @@ while :; do
   --linux) ver=$2; shift 2 ;;
   --fresh) fresh=1; shift ;;
   --linux-only) lonly=1; shift ;;
+  --aios-only) aonly=1; shift ;;
   *) break ;;
   esac
 done
 name=$1
-[ -n "$name" ] || { sed -n '2,19p' "$0" >&2; exit 2; }
+[ -n "$name" ] || { sed -n '2,23p' "$0" >&2; exit 2; }
 shift
 src=test/$name.c bin=test/bin/$name
 [ -f "$src" ] || { echo "ldiff: no $src" >&2; exit 2; }
@@ -62,7 +66,9 @@ key=$(cat "$bin" test/linux.config | sha256sum | cut -c1-16)-$(printf '%s %s %s%
 ans=build/linux-answers/$name-$key
 lout=build/ldiff/$name.linux aout=build/ldiff/$name.aios
 lpid=
-if [ -z "$fresh" ] && [ -s "$ans.out" ]; then
+if [ -n "$aonly" ]; then
+  :
+elif [ -z "$fresh" ] && [ -s "$ans.out" ]; then
   echo "ldiff: Linux $v: using the saved answer ($ans.out)" >&2
 else
   echo "ldiff: running $name in Linux $v" >&2
@@ -113,11 +119,23 @@ while :; do
 done
 python3 test/vm.py get "/tmp/ldiff/$name.out" "$aout" >/dev/null
 ast=$(python3 test/vm.py run "cat /tmp/ldiff/$name.st; tail -3 /tmp/ldiff/$name.err" -t 30 || true)
+if [ -n "$aonly" ]; then
+  cat "$aout"
+  echo "aios only: aios exit $(echo "$ast" | head -1)"
+  echo "$ast" | tail -n +2 | sed 's/^/aios stderr: /'
+  exit 0
+fi
 
 if [ -n "$lpid" ]; then
   kill -0 "$lpid" 2>/dev/null && echo "ldiff: waiting for Linux $v (its progress: $ans.err)" >&2
   wait "$lpid" || true
-  [ -s "$ans.out" ] || { echo "ldiff: Linux gave no output:" >&2; tail -5 "$ans.err" >&2; exit 2; }
+fi
+# Linux が何も出さなかった (aios だけのテストか、Linux で動かせなかった): aios の出力と、Linux のエラーの終わり
+if [ ! -s "$ans.out" ]; then
+  cat "$aout"
+  echo "aios exit $(echo "$ast" | head -1); Linux $v gave no output (an aios-only test? use --aios-only):"
+  tail -5 "$ans.err" | sed 's/^/linux: /'
+  exit 3
 fi
 cp "$ans.out" "$lout"
 lst=$(cat "$ans.st" 2>/dev/null || echo '?')
