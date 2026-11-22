@@ -2461,18 +2461,31 @@ DTB がなくても ACPI の表で起きる (Linux の drivers/acpi/tables.c と
   ではいつもつけなおし (Linux の PCI_REASSIGN_ALL_BUS)、ACPI はファームウェアのもの。設定空間の大きさ (256 か 4096)
   は Linux の pci_cfg_space_size と同じ。見つけたものを `pci 0000:00:00.0: [1b36:0008] type 00 class 0x060000
   conventional PCI endpoint` と kmsg に
+- BAR とブリッジの窓 (2026-11-22): BAR と ROM の大きさを 1 を書いてはかり (Linux の __pci_read_base。はかるあいだは
+  装置の読み書きを止める)、ブリッジの窓の大きさを下から決め (Linux 7.4 の pbus_size_io と pbus_size_mem、
+  calculate_head_align。PCIe のホットプラグのスロットは IO 256、MEM 2 MiB、PREF 2 MiB の余り)、並べる単位の大きい順に
+  ホストブリッジの窓へ置いて (pbus_assign_resources_sorted と __pci_assign_resource: 64 ビットのものは 4 GiB より上を
+  先に、プリフェッチの合う窓を先に)、BAR とブリッジの窓のレジスタに書く。ホストブリッジの窓は DTB の ranges か、
+  ACPI の PNP0A08 の _CRS (入れ子の Device をとばして読む)。ACPI でもファームウェアのものは使わずにみな割り当てなおす
+  (Linux の pci_acpi_scan_root: _DSM の「残せ」がなければ。QEMU の EDK2 の割り当ては Linux とちがう)。ブリッジ制御の
+  SERR# を入れる (pci_configure_serr)。PCIe のリンクの ASPM は、DTB なら両はしにある L0s と L1 を入れる (Linux 6.18
+  からの devicetree の既定。QEMU は書いても読みなおすと 0 なので、Linux と同じく入れたものを覚えておく)
+- /sys の装置に resource (BAR、ROM、ブリッジの窓)、resourceN と resourceN_wc (0600。IO の BAR は 1、2、4 バイトずつ
+  口を読み書き、MEM は EIO)、rom (EINVAL)、reset と reset_method (flr、af_flr、pm、bus)、link/l0s_aspm と l1_aspm
+  (0 と 1 を書ける)
 - /sys/bus/pci (devices/NAME のリンク、drivers/ と slots/ (空)、drivers_autoprobe など) と装置のディレクトリは Linux
   7.4 と同じ形: ACPI は /sys/devices/pci0000:00、DTB はホストブリッジの platform の装置の下
   (/sys/devices/platform/4010000000.pcie/pci0000:00。その uevent と modalias は DTB のノードから)。装置ごとに vendor、
   device、class、revision、subsystem_*、config (root は全部、ほかは頭の 64 バイト。root は書ける)、uevent、modalias、
   irq、resource、PCIe ならリンクの速さと幅、ブリッジなら secondary / subordinate_bus_number と下の装置 (入れ子)、
-  pci_bus/0000:BB と /sys/class/pci_bus。test/pci.c は、QEMU の virt (ホストブリッジだけ) で DTB と ACPI の両方で
-  手本の Linux と同じ (CPU の数と、aios が見せていない of_node・driver・firmware_node のリンクのほか。2026-11-22)。
+  pci_bus/0000:BB と /sys/class/pci_bus。test/pci.c は、QEMU の virt (ホストブリッジだけ) と、装置を足したもの
+  (pcie-root-port と下の virtio-rng-pci、pci-bridge と下の virtio-rng-pci、多機能の virtio-rng-pci 2 つ) で、DTB と
+  ACPI の両方で手本の Linux と同じ (CPU の数と、aios が見せていない of_node・driver・firmware_node のリンクのほか。
+  ACPI のブリッジのコマンドの bus master は、ファームウェアの起こしかた (aiboot か -kernel か) でちがう。2026-11-22)。
   手本の Linux に CONFIG_PCI_HOST_GENERIC を足し、-netdev がないときに QEMU が足す virtio-net-pci を `-nic none` で
   消した (aios の VM にはない)。QEMU に装置を足すのは AIOS_QEMU_ARGS と LINUX_QEMU_ARGS (ldiff の答えの鍵にも入る)
-- まだ: ほんものの UEFI の機械、PCI の BAR の割り当て (DTB のとき Linux は pci_assign_unassigned_bus_resources で
-  割り当てる。ACPI はファームウェアのものをそのまま。resource と resourceN、reset_method、link/ の ASPM)、
-  virtio でない機器のドライバ、Method の _CRS。virtio-blk は 1 台だけ見る (はじめのもの)
+- まだ: ほんものの UEFI の機械、PCI のドライバ (MSI / INTx の割り込み、virtio-pci と virtio でない機器)、
+  Method の _CRS と _DSM、/sys/firmware/devicetree。virtio-blk は 1 台だけ見る (はじめのもの)
 
 ### CPU のぜい弱性 (/sys/devices/system/cpu/vulnerabilities、SSBS)
 

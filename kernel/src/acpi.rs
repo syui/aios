@@ -291,6 +291,22 @@ fn name_in(body: &[u8], name: &[u8; 4]) -> Option<usize> {
     None
 }
 
+/// name_in と同じだが、入れ子の Device はその長さだけとばして続ける
+fn name_skipping(body: &[u8], name: &[u8; 4]) -> Option<usize> {
+    let mut i = 0;
+    while i + 5 < body.len() {
+        if body[i] == 0x5b && body[i + 1] == 0x82 {
+            i += 2 + pkglen(body, i + 2)?.0;
+            continue;
+        }
+        if body[i] == 0x08 && &body[i + 1..i + 5] == name {
+            return Some(i + 5);
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Device(...) を見つけて、_HID と _CRS を Dev に
 fn aml(i: &mut Info, b: &[u8]) {
     let mut p = 0;
@@ -336,17 +352,89 @@ fn device(body: &[u8]) -> Option<Dev> {
     if let Some(u) = name_in(body, b"_UID") {
         d.uid = integer(body, u).map_or(0, |(v, _)| v as u32);
     }
-    if let Some(c) = name_in(body, b"_CRS")
-        && body.get(c) == Some(&0x11)
-    {
-        let (len, n) = pkglen(body, c + 1)?;
-        let (_, sz) = integer(body, c + 1 + n)?;
-        let s = c + 1 + n + sz;
-        if let Some(res) = body.get(s..c + 1 + len) {
-            resources(res, &mut d);
-        }
+    if let Some(res) = crs_of(body, false) {
+        resources(res, &mut d);
     }
     Some(d)
+}
+
+/// Name(_CRS, Buffer) の中身 (ResourceTemplate)。deep なら入れ子の Device をとばして探す (QEMU の PCI0 は
+/// 割り込みの GSI0..3 の Device のあとに _CRS がある)
+fn crs_of(body: &[u8], deep: bool) -> Option<&[u8]> {
+    let c = if deep { name_skipping(body, b"_CRS")? } else { name_in(body, b"_CRS")? };
+    if body.get(c) != Some(&0x11) {
+        return None;
+    }
+    let (len, n) = pkglen(body, c + 1)?;
+    let (_, sz) = integer(body, c + 1 + n)?;
+    body.get(c + 1 + n + sz..c + 1 + len)
+}
+
+/// AML の Device(...) の中身をみな (入れ子も)
+fn each_device(b: &[u8], mut f: impl FnMut(&[u8])) {
+    let mut p = 0;
+    while p + 2 < b.len() {
+        if b[p] != 0x5b || b[p + 1] != 0x82 {
+            p += 1;
+            continue;
+        }
+        let Some((len, n)) = pkglen(b, p + 2) else { break };
+        let end = p + 2 + len;
+        if let Some(nl) = name_len(b, p + 2 + n)
+            && end <= b.len()
+            && len >= n + nl
+        {
+            f(&b[p + 2 + n + nl..end]);
+        }
+        p += 2;
+    }
+}
+
+/// PCI のホストブリッジ (PNP0A08 か PNP0A03) の _CRS の窓 (Linux の acpi_pci_root_create が読むもの): Word、DWord、
+/// QWord の Address Space のうち MEM と IO。(0 MEM / 1 IO, バスの番地, 長さ, CPU の番地との差, プリフェッチか)
+pub fn pci_windows() -> alloc::vec::Vec<(u8, u64, u64, u64, bool)> {
+    let i = INFO.get();
+    let mut v = alloc::vec::Vec::new();
+    for &(sig, pa, len) in &i.tables[..i.ntables] {
+        if &sig != b"DSDT" && &sig != b"SSDT" {
+            continue;
+        }
+        let Some(t) = phys(pa, len as usize).and_then(|t| t.get(36..)) else { continue };
+        each_device(t, |body| {
+            if !v.is_empty() || !device(body).is_some_and(|d| hid_is(&d, "PNP0A08") || hid_is(&d, "PNP0A03")) {
+                return;
+            }
+            let Some(r) = crs_of(body, true) else { return };
+            let mut o = 0;
+            while o < r.len() {
+                let t = r[o];
+                if t & 0x80 == 0 {
+                    if (t >> 3) & 0xf == 0xf {
+                        break;
+                    }
+                    o += 1 + (t & 7) as usize;
+                    continue;
+                }
+                let l = u16_at(r, o + 1) as usize;
+                let Some(e) = r.get(o + 3..o + 3 + l) else { break };
+                let w = match t & 0x7f {
+                    0x08 if l >= 13 => Some((u16_at(e, 5) as u64, u16_at(e, 11) as u64, u16_at(e, 9) as u64)),
+                    0x07 if l >= 23 => Some((u32_at(e, 7) as u64, u32_at(e, 19) as u64, u32_at(e, 15) as u64)),
+                    0x0a if l >= 43 => Some((u64_at(e, 11), u64_at(e, 35), u64_at(e, 27))),
+                    _ => None,
+                };
+                if let Some((min, size, tra)) = w
+                    && e[0] <= 1
+                    && size > 0
+                {
+                    // MEM の種類のビット (1..2) が 3 ならプリフェッチ
+                    v.push((e[0], min, size, tra, e[0] == 0 && (e[2] >> 1) & 3 == 3));
+                }
+                o += 3 + l;
+            }
+        });
+    }
+    v
 }
 
 /// ResourceTemplate: はじめの番地の範囲 (Memory32Fixed、Memory32、DWord / QWord の Memory) と割り込み (Extended Interrupt)

@@ -28,13 +28,13 @@ static void content(const char *p, const char *name, int depth) {
     return;
   }
   static unsigned char b[8192];
-  ssize_t n = 0, r;
+  ssize_t n = 0, r = 0;
   while (n < (ssize_t)sizeof b && (r = read(fd, b + n, sizeof b - n)) > 0)
     n += r;
-  r = n < 0 ? -errno : 0;
+  int err = r < 0 ? errno : 0;
   close(fd);
-  if (r < 0) {
-    printf("%*s  = %s\n", depth * 2, "", strerror(-r));
+  if (err && !n) {
+    printf("%*s  = %s\n", depth * 2, "", strerror(err));
     return;
   }
   if (!strcmp(name, "config")) {

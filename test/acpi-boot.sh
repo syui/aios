@@ -4,7 +4,8 @@
 #   読むもの) を KERNEL (ELF。既定 build/aish-vm/kernels/work) から作ったものにかえて、QEMU の virt,acpi=on と AAVMF
 #   (EDK2) で起こす。ファームウェアは ACPI の表をわたし、DTB はわたさない (ほんものの UEFI の機械と同じ)。ディスクは
 #   -snapshot。シリアルは build/acpi-boot.log に、終わりを出す (AIOS_ACPI_TAIL 行。GIC の版は AIOS_GIC)
-#   AIOS_ACPI_CMD があれば、プロンプトが出たらそれを打つ (そのあと 5 秒待つ)
+#   AIOS_ACPI_CMD があれば、プロンプトが出たらそれを打つ (そのあと 5 秒待つ)。AIOS_QEMU_ARGS は QEMU にそのまま足す
+#   (PCI の装置: test/pci.c)
 set -e
 top=$(cd "$(dirname "$0")/.." && pwd)
 cd "$top"
@@ -32,7 +33,8 @@ rm -f "$log"
 set -- -machine "virt,acpi=on${AIOS_GIC:+,gic-version=$AIOS_GIC}" -cpu "${AIOS_CPU:-cortex-a72}" -smp "${AIOS_SMP:-2}" -m "${AIOS_MEM:-2G}" \
   -nographic -no-reboot -drive if=pflash,format=raw,readonly=on,file="$code" -drive if=pflash,format=raw,file="$vars" \
   -drive file="$disk",if=none,format=raw,id=root,snapshot=on -device virtio-blk-device,drive=root \
-  -global virtio-mmio.force-legacy=false -netdev user,id=n0 -device virtio-net-device,netdev=n0 -device virtio-rng-device
+  -global virtio-mmio.force-legacy=false -netdev user,id=n0 -device virtio-net-device,netdev=n0 -device virtio-rng-device \
+  ${AIOS_QEMU_ARGS:-}
 if [ -n "$AIOS_ACPI_CMD" ]; then
   python3 - "$secs" "$log" "$AIOS_ACPI_CMD" qemu-system-aarch64 "$@" <<'EOF'
 import os, select, subprocess, sys, time

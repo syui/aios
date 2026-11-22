@@ -138,6 +138,9 @@ enum Node {
     PciFile(u8, u8),
     PciSubsys(u8),
     PciLinkDir(u8),
+    /// BAR のファイル (resourceN、resourceN_wc、rom: pci::bar_file の番号) と、link/ の ASPM (pci::ASPM_FILES の番号)
+    PciBar(u8, u8),
+    PciAspm(u8, u8),
     /// pci_bus (ルートのバスは ROOT_BUS、ほかはブリッジの装置の番号) と、その中の 0000:BB、ファイル (PCI_BUS_FILES)、
     /// リンク (0 device、1 subsystem)
     PciBusDir(u8),
@@ -377,6 +380,8 @@ impl SysInode {
             Node::PciBusLink(i, k) => 0x9_0000 + ((i as u64) << 8) + 8 + k as u64,
             Node::PciBusFile(i, k) => 0x9_0000 + ((i as u64) << 8) + 0x10 + k as u64,
             Node::PciFile(i, k) => 0x9_0000 + ((i as u64) << 8) + 0x40 + k as u64,
+            Node::PciBar(i, k) => 0x9_0000 + ((i as u64) << 8) + 0x80 + k as u64,
+            Node::PciAspm(i, k) => 0x9_0000 + ((i as u64) << 8) + 0xa0 + k as u64,
         }
     }
 
@@ -444,7 +449,8 @@ impl SysInode {
                 Some(u) => Node::PciDev(u as u8),
                 None => Node::PciRoot,
             },
-            Node::PciFile(i, _) | Node::PciSubsys(i) | Node::PciLinkDir(i) => Node::PciDev(i),
+            Node::PciFile(i, _) | Node::PciSubsys(i) | Node::PciLinkDir(i) | Node::PciBar(i, _) => Node::PciDev(i),
+            Node::PciAspm(i, _) => Node::PciLinkDir(i),
             Node::PciBusDir(b) => if b == ROOT_BUS { Node::PciRoot } else { Node::PciDev(b) },
             Node::PciBus(b) => Node::PciBusDir(b),
             Node::PciBusFile(b, _) | Node::PciBusLink(b, _) => Node::PciBus(b),
@@ -555,6 +561,7 @@ impl SysInode {
             Node::CpuOnline(_) => "1\n".into(),
             Node::BusPciFile(k) => crate::pci::bus_file(k as usize),
             Node::PciFile(i, f) => pci_dev(i)?.file(f as usize),
+            Node::PciAspm(i, k) => crate::pci::aspm_file(i as usize, k as usize).ok_or(-ENOENT)?,
             Node::PciRootFile(k) => if k == 0 { String::new() } else { "0\n".into() },
             Node::PciBusFile(b, k) => match PCI_BUS_FILES[k as usize].0 {
                 "cpuaffinity" => crate::pci::cpus(false),
@@ -621,6 +628,8 @@ impl Inode for SysInode {
             Node::PlatUevent(_) | Node::ChrUevent(_) | Node::AcpiForceRemove | Node::AcpiHpEnabled(_) | Node::PciRootFile(0) => S_IFREG | 0o644,
             Node::BusPciFile(k) => S_IFREG | crate::pci::BUS_FILES[k as usize].1,
             Node::PciFile(_, f) => S_IFREG | crate::pci::DEV_FILES[f as usize].1,
+            Node::PciBar(..) => S_IFREG | 0o600,
+            Node::PciAspm(..) => S_IFREG | 0o644,
             Node::PciHostFile(k) => S_IFREG | HOST_FILES[k as usize].1,
             Node::PciBusFile(_, k) => S_IFREG | PCI_BUS_FILES[k as usize].1,
             _ => S_IFREG | 0o444,
@@ -628,6 +637,11 @@ impl Inode for SysInode {
         let size = match &link {
             _ if self.is_dir() => 0,
             Some(l) => l.len() as u64,
+            // BAR のファイルは BAR の大きさ
+            None if matches!(self.node, Node::PciBar(..)) => {
+                let Node::PciBar(i, k) = self.node else { unreachable!() };
+                pci_dev(i).ok().and_then(|d| crate::pci::bar_file(d, k as usize)).map_or(0, |b| b.1)
+            }
             // config は設定空間の大きさ (Linux の pci_dev_config_attr_bin_size)
             None if matches!(self.node, Node::PciFile(_, f) if crate::pci::DEV_FILES[f as usize].0 == "config") => {
                 let Node::PciFile(i, _) = self.node else { unreachable!() };
@@ -644,6 +658,9 @@ impl Inode for SysInode {
     }
 
     fn read_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, i64> {
+        if let Node::PciBar(i, k) = self.node {
+            return crate::pci::bar_rw(pci_dev(i)?, k as usize, off, buf, false);
+        }
         // PCI の設定空間 (Linux の pci_read_config: CAP_SYS_ADMIN がなければ頭の 64 バイト、CardBus は 128)
         if let Node::PciFile(i, f) = self.node
             && crate::pci::DEV_FILES[f as usize].0 == "config"
@@ -687,6 +704,11 @@ impl Inode for SysInode {
             Node::PlatUevent(_) | Node::ChrUevent(_) | Node::PciRootFile(0) | Node::PciHostFile(2) | Node::PciBusFile(_, 3) => Ok(b.len()),
             // /sys/bus/pci の uevent と rescan、pci_bus と装置の rescan (たどりなおしても同じものしかない: 受けとるだけ)
             Node::BusPciFile(2 | 4) | Node::PciBusFile(_, 2) => Ok(b.len()),
+            Node::PciBar(i, k) => {
+                let mut v = b.to_vec();
+                crate::pci::bar_rw(pci_dev(i)?, k as usize, off, &mut v, true)
+            }
+            Node::PciAspm(i, k) => crate::pci::aspm_write(i as usize, k as usize, b).map(|_| b.len()).map_err(|_| -EINVAL),
             Node::PciFile(i, f) => match crate::pci::DEV_FILES[f as usize].0 {
                 "uevent" | "rescan" => Ok(b.len()),
                 // 設定空間に書く (Linux の pci_write_config: CAP_SYS_ADMIN。mode 0644 で root だけが開ける)
@@ -777,11 +799,19 @@ impl Inode for SysInode {
                     match name {
                         "subsystem" => Node::PciSubsys(i),
                         "link" => Node::PciLinkDir(i),
-                        _ => Node::PciFile(i, (0..crate::pci::DEV_FILES.len()).find(|&f| crate::pci::DEV_FILES[f].0 == name && crate::pci::visible(d, f)).ok_or(-ENOENT)? as u8),
+                        _ if (0..13).any(|k| crate::pci::bar_file(d, k).is_some_and(|b| b.0 == name)) => {
+                            Node::PciBar(i, (0..13).find(|&k| crate::pci::bar_file(d, k).is_some_and(|b| b.0 == name)).unwrap_or(0) as u8)
+                        }
+                        _ => Node::PciFile(i, (0..crate::pci::DEV_FILES.len()).find(|&f| crate::pci::DEV_FILES[f].0 == name && crate::pci::visible(i as usize, f)).ok_or(-ENOENT)? as u8),
                     }
                 } else {
                     Node::PciRootFile(pci_root_files().find(|f| f.1 == name).ok_or(-ENOENT)?.0 as u8)
                 }
+            }
+            Node::PciLinkDir(i) => {
+                let k = crate::pci::ASPM_FILES.iter().position(|f| f.0 == name).ok_or(-ENOENT)?;
+                crate::pci::aspm_file(i as usize, k).ok_or(-ENOENT)?;
+                Node::PciAspm(i, k as u8)
             }
             Node::PciBusDir(b) if pci_bus_path(b).is_some_and(|p| p.0.ends_with(&format!("/{}", name))) => Node::PciBus(b),
             Node::PciBus(b) => match name {
@@ -999,7 +1029,14 @@ impl Inode for SysInode {
                 add("pci".into(), Node::BusPci);
                 add("platform".into(), Node::BusPlatform);
             }
-            Node::BusPlatform | Node::BusPciSub(_) | Node::PciLinkDir(_) => {}
+            Node::BusPlatform | Node::BusPciSub(_) => {}
+            Node::PciLinkDir(i) => {
+                for (k, f) in crate::pci::ASPM_FILES.iter().enumerate() {
+                    if crate::pci::aspm_file(i as usize, k).is_some() {
+                        add(f.0.into(), Node::PciAspm(i, k as u8));
+                    }
+                }
+            }
             Node::BusPci => {
                 add("devices".into(), Node::BusPciDevs);
                 add("drivers".into(), Node::BusPciSub(0));
@@ -1033,8 +1070,13 @@ impl Inode for SysInode {
                 match self.node {
                     Node::PciDev(i) => {
                         let d = pci_dev(i)?;
-                        for f in (0..crate::pci::DEV_FILES.len()).filter(|&f| crate::pci::visible(d, f)) {
+                        for f in (0..crate::pci::DEV_FILES.len()).filter(|&f| crate::pci::visible(i as usize, f)) {
                             add(crate::pci::DEV_FILES[f].0.into(), Node::PciFile(i, f as u8));
+                        }
+                        for k in 0..13 {
+                            if let Some((n, _)) = crate::pci::bar_file(d, k) {
+                                add(n, Node::PciBar(i, k as u8));
+                            }
                         }
                         add("subsystem".into(), Node::PciSubsys(i));
                         add("link".into(), Node::PciLinkDir(i));
