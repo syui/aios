@@ -2510,7 +2510,7 @@ spec_store_bypass と、x86 などのもの) を出す (kernel/src/cpuvuln.rs)�
 
 | ファイル | aios | Linux |
 |---|---|---|
-| meltdown | 当たれば Vulnerable (KPTI をしない) | KPTI で Mitigation: PTI |
+| meltdown | 当たれば KPTI で Mitigation: PTI (`kpti=0` なら Vulnerable) | 同じ |
 | spectre_v1 | Mitigation: __user pointer sanitization (ユーザーのポインタはユーザーのページ表を引いてから、カーネルの写しで読み書きする: vm.rs の copy_in / copy_out) | 同じ文 (uaccess のマスク) |
 | spectre_v2 | CSV2 か安全な表のものは Not affected。ほかはファームウェアの WORKAROUND_1 があれば Branch predictor hardening (ユーザーのアドレス空間を載せかえるときと、ユーザーからカーネルのアドレスで落ちたとき: 命令のフォルト、PC のそろい、ブレークポイント、ステップ、割りこみ)、なければ Vulnerable。Spectre-BHB (v2 が Vulnerable でないとき) は、ユーザーから入るベクタ (trap.rs の 5 とおりのベクタから起動のときに選ぶ) で、ハードウェア (ECBHB) / CLRBHB の命令 / CPU ごとの回数のループ (A76 は 24、A710 と V1 は 32 など) / ファームウェアの WORKAROUND_3 | 同じ (proton-pack.c と entry.S の __bp_harden_el1_vectors) |
 | spec_store_bypass | SSBS があれば Linux と同じ「prctl で」: カーネルは SSBS を落として動き (SCTLR_EL1.DSSBS = 0)、ユーザーはふだん立てて、prctl で止めたスレッドだけ落とす。SSBS がなければ Vulnerable | SSBS がなければファームウェアの WORKAROUND_2 |
@@ -2526,9 +2526,27 @@ QEMU の cortex-a72、cortex-a76、cortex-a710、neoverse-n1、neoverse-v1、max
 A76 などは `Mitigation: CSV2, BHB` (ループ)、max は `Mitigation: CSV2, but not BHB`)。手本の Linux (test/linux.config) は
 tinyconfig から作るので、Spectre-BHB の手当て (CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY) と KPTI
 (CONFIG_UNMAP_KERNEL_AT_EL0) が切れていて、前は A76 でも `but not BHB` だった: ふつうの配布の Linux と同じく入れた。
-Linux より弱いところは KPTI だけ (Meltdown に当たる A75 などで動かすときに足す。QEMU には当たる CPU で Linux が起きる
-ものがない)。ファームウェアの手当て (WORKAROUND_1 / 3) は、QEMU にファームウェアがないので、その機械 (ラズパイ 4 の
-A72 など) でたしかめる。
+ファームウェアの手当て (WORKAROUND_1 / 3) は、QEMU にファームウェアがないので、その機械 (ラズパイ 4 の A72 など) で
+たしかめる。
+
+KPTI (2026-11-22、Linux の UNMAP_KERNEL_AT_EL0。trap.rs と memlayout.rs): Meltdown に当たる CPU (安全な表になく CSV3 も
+ない: A75、Falkor、A64FX など) では、ユーザーが動いているあいだカーネルを写さない。起動の引数 `kpti=0` / `kpti=1` で
+決められる (Linux と同じ。当たらない CPU でも `kpti=1` で入る: たしかめるため。meltdown は Linux と同じく
+Not affected のまま):
+
+- ASID を 2 つ: TCR.A1 で ASID を TTBR1 のものにし、カーネルは 0、ユーザーは 1。KPTI のときはカーネルの写像 (TTBR1 の
+  1 GiB のブロック、ラズパイの 2 MiB のブロック、あとから写す装置) をみな nG にする: ASID 0 の TLB にだけ入り、
+  ユーザー (ASID 1) からは TLB にも見えない。ユーザーのページは vaae1 (すべての ASID) で消すのでそのまま。KPTI で
+  なければ ASID はいつも 0 で、いままでと同じ
+- ユーザーのあいだの TTBR1 は、トランポリン (16 KiB にそろえた 16 KiB) だけを同じ仮想アドレスに 4 KiB ずつ写す表
+  (tramp_l1。boot_l1_hi のすぐ後ろに置き、asm は TTBR1 から 4096 を足し引きして切りかえる)。トランポリンには、カーネルの
+  ベクタの 5 とおり (Spectre-BHB の手当ての種類) に 1 つずつのベクタがあり、ユーザーから入ると x30 を tpidrro_el0 に
+  置き (trap_common がもどして消す)、TTBR1 をカーネルの表 (ASID 0) に、VBAR をカーネルのベクタにして、その同じ入口へ
+  まっすぐ (間接でない分岐で) 跳ぶ。Spectre-BHB の手当てはいままでどおりカーネルのベクタの入口で (その前に間接分岐は
+  ない)。帰るときは x29 を far_el1 に置き、トランポリンの tramp_exit で VBAR をトランポリンのベクタに、TTBR1 を
+  トランポリンの表 (ASID 1) にして eret (Linux の tramp_exit と同じ)
+- たしかめかた: `kpti=1` の QEMU (cortex-a72) で ctests が 149 こ通る、Meltdown に当たる QEMU の a64fx で起きて
+  自動で入る (`CPU features: detected: Kernel page table isolation (KPTI)`)
 
 ### カーネルの砂場 (aios.off= と aish の box)
 

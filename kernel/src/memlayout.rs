@@ -16,12 +16,19 @@ pub const PGSIZE: usize = 4096;
 pub const MAX_RAM: usize = 16 * GIB;
 
 unsafe extern "C" {
-    /// boot.rs の TTBR1 の L1 (1 GiB ずつ)
-    static mut boot_l1_hi: [u64; 512];
+    /// boot.rs の TTBR1 の L1 (1 GiB ずつ) と、そのすぐ後ろの KPTI のトランポリンの表 (tramp_l1、tramp_l2、tramp_l3)
+    static mut boot_l1_hi: [[u64; 512]; 4];
 }
 
 /// boot.rs と同じ、通常のメモリの 1 GiB ブロックの属性
 const ATTR_NORMAL: u64 = (1 << 54) | (1 << 10) | (3 << 8) | (1 << 2) | 1;
+/// KPTI のとき、カーネルの写像に足す nG (ASID 0 の TLB にだけ入り、ユーザー (ASID 1) からは TLB でも見えない)
+const PTE_NG: u64 = 1 << 11;
+static NG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn ng() -> u64 {
+    NG.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 unsafe extern "C" {
     /// boot.rs が書く: カーネルの置かれた場所 - 0x80000
@@ -75,9 +82,9 @@ pub fn set_ram(base: usize, size: usize) {
     let size = size.min(MAX_RAM);
     let blocks = size.div_ceil(GIB);
     unsafe {
-        let l1 = &mut *(&raw mut boot_l1_hi);
+        let l1 = &mut (*(&raw mut boot_l1_hi))[0];
         for i in 0..MAX_RAM / GIB {
-            l1[1 + i] = if i < blocks { (base + i * GIB) as u64 | ATTR_NORMAL } else { 0 };
+            l1[1 + i] = if i < blocks { (base + i * GIB) as u64 | ATTR_NORMAL | ng() } else { 0 };
         }
         core::arch::asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb");
     }
@@ -107,8 +114,8 @@ pub fn map_device(pa: usize, len: usize) -> Option<usize> {
     let first = pa & !(GIB - 1);
     let n = (end - first).div_ceil(GIB);
     unsafe {
-        let l1 = &mut *(&raw mut boot_l1_hi);
-        let want = |k: usize| (first + k * GIB) as u64 | ATTR_DEVICE;
+        let l1 = &mut (*(&raw mut boot_l1_hi))[0];
+        let want = |k: usize| (first + k * GIB) as u64 | ATTR_DEVICE | ng();
         // 写してあるものか、n こ続いたあき
         let slot = (DEV_SLOT..DEV_SLOT + DEV_SLOTS - n + 1)
             .find(|&s| (0..n).all(|k| l1[s + k] == want(k)))
@@ -120,6 +127,42 @@ pub fn map_device(pa: usize, len: usize) -> Option<usize> {
             core::arch::asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb");
         }
         Some(KBASE + slot * GIB + (pa - first))
+    }
+}
+
+/// KPTI (Linux の UNMAP_KERNEL_AT_EL0 と kpti_install_ng_mappings): カーネルの写像 (TTBR1 の L1 のブロックと、その下の
+/// L2 のブロック) をみな nG にし、[va, va + len) (トランポリン: 16 KiB にそろえた 16 KiB まで) だけを写す表を作る。
+/// トランポリンは同じ仮想アドレスに写す (カーネルの表ではブロックの中、こちらは 4 KiB のページ。どちらも nG で
+/// ASID がちがうので TLB でぶつからない)。ほかの CPU を起こす前に呼ぶ
+pub fn kpti_tables(va: usize, len: usize) {
+    /// 4 KiB のページ: 通常のメモリ、EL1 だけが読める (AP 10)、ユーザーは実行できない、nG
+    const ATTR_TRAMP: u64 = (1 << 54) | PTE_NG | (1 << 10) | (3 << 8) | (2 << 6) | (1 << 2) | 3;
+    assert!(va % 0x4000 == 0 && len <= 0x4000, "kpti: trampoline layout");
+    NG.store(PTE_NG, core::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        let l1 = &mut (*(&raw mut boot_l1_hi))[0];
+        for e in l1.iter_mut() {
+            match *e & 3 {
+                1 => *e |= PTE_NG,
+                // ラズパイの 2 MiB ずつの表
+                3 => {
+                    let l2 = &mut *(p2v((*e & 0x0000_ffff_ffff_f000) as usize) as *mut [u64; 512]);
+                    for b in l2.iter_mut().filter(|b| **b & 3 == 1) {
+                        *b |= PTE_NG;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // KPTI のときのユーザーのあいだの TTBR1 の表 (L1、L2、L3)
+        let [_, t1, t2, t3] = &mut *(&raw mut boot_l1_hi);
+        t1[(va - KBASE) >> 30] = v2p(t2.as_ptr() as usize) as u64 | 3;
+        t2[(va >> 21) & 511] = v2p(t3.as_ptr() as usize) as u64 | 3;
+        for k in 0..len.div_ceil(PGSIZE) {
+            t3[((va >> 12) & 511) + k] = (v2p(va) + k * PGSIZE) as u64 | ATTR_TRAMP;
+        }
+        // nG にする前の (global の) カーネルの TLB を消す
+        core::arch::asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb");
     }
 }
 

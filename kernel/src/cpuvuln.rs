@@ -7,7 +7,7 @@
 // ファームウェアへの問いあわせ (SMCCC の ARCH_FEATURES で ARCH_WORKAROUND_1 / 2 / 3。PSCI と同じ道 (hvc / smc) で、
 // SMCCC 1.1 からあるときだけ)。
 // 「対策」は aios がしていることだけを書く (Linux より正直に):
-//   meltdown           当たれば Vulnerable (aios は KPTI をしない)
+//   meltdown           当たれば KPTI で Mitigation: PTI (kpti=0 なら Vulnerable。trap.rs のトランポリン)
 //   spectre_v1         Mitigation: __user pointer sanitization (aios はユーザーのポインタをじかにたどらない:
 //                      ユーザーのページ表を引いてから、カーネルの写しで読み書きする。vm.rs の copy_in / copy_out)
 //   spectre_v2         CSV2 か安全な表のものは Not affected (BHB に当たれば CSV2)。ほかはファームウェアの手当て
@@ -234,6 +234,22 @@ pub fn init() {
     }
     // この CPU のベクタを選びなおす (ほかの CPU は起きるときに trap::init で)
     crate::trap::init();
+    // KPTI (Linux の unmap_kernel_at_el0): Meltdown に当たれば、ユーザーのあいだカーネルを写さない。kpti=0 / 1 で
+    // 決める (Linux と同じ引数。当たらない CPU でも 1 なら入れる: たしかめるため)。BHB の手当てを選んだあとに
+    // (トランポリンのベクタもそれに合わせる)
+    let forced = match crate::dtb::arg("kpti") {
+        Some("1" | "y" | "Y" | "on") => Some(true),
+        Some("0" | "n" | "N" | "off") => Some(false),
+        _ => None,
+    };
+    if let Some(f) = forced {
+        crate::println!("CPU features: kernel page table isolation forced {} by command line option", if f { "ON" } else { "OFF" });
+    }
+    let kpti = forced.unwrap_or(meltdown == State::Vulnerable) && crate::trap::kpti_enable();
+    if kpti {
+        crate::println!("CPU features: detected: Kernel page table isolation (KPTI)");
+    }
+    let meltdown = if meltdown == State::Vulnerable && kpti { State::Mitigated } else { meltdown };
     let v4 = if is(&V4_SAFE) {
         State::Unaffected
     } else if ssbs {

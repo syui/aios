@@ -120,7 +120,16 @@ trap_common:
     mrs     x2, spsr_el1
     mrs     x3, sp_el0
     stp     x2, x3, [sp, #256]
-
+    // KPTI: ユーザーから来たとき、トランポリンが x30 を tpidrro_el0 に置いた (ユーザーが読めるので消す)
+    cmp     x1, #8
+    b.lo    1f
+    adrp    x2, {kpti}
+    ldrb    w2, [x2, :lo12:{kpti}]
+    cbz     w2, 1f
+    mrs     x2, tpidrro_el0
+    str     x2, [sp, #240]
+    msr     tpidrro_el0, xzr
+1:
     mov     x0, sp
     bl      trap_handler
 
@@ -129,6 +138,13 @@ trap_ret:
     ldp     x2, x3, [sp, #256]
     msr     spsr_el1, x2
     msr     sp_el0, x3
+    // KPTI でユーザー (SPSR の M[3:0] が 0) へ帰るときは、トランポリンをとおって
+    tst     x2, #0xf
+    b.ne    1f
+    adrp    x3, {kpti}
+    ldrb    w3, [x3, :lo12:{kpti}]
+    cbnz    w3, trap_ret_kpti
+1:
     ldp     x30, x2, [sp, #240]
     msr     elr_el1, x2
     ldp     x2, x3, [sp, #16]
@@ -148,9 +164,164 @@ trap_ret:
     ldp     x0, x1, [sp, #0]
     add     sp, sp, #272
     eret
+
+// KPTI のユーザーへの帰り道: x29 は far_el1 に置いて、トランポリン (tramp_exit) で使う
+trap_ret_kpti:
+    ldp     x30, x2, [sp, #240]
+    msr     elr_el1, x2
+    ldp     x2, x3, [sp, #16]
+    ldp     x4, x5, [sp, #32]
+    ldp     x6, x7, [sp, #48]
+    ldp     x8, x9, [sp, #64]
+    ldp     x10, x11, [sp, #80]
+    ldp     x12, x13, [sp, #96]
+    ldp     x14, x15, [sp, #112]
+    ldp     x16, x17, [sp, #128]
+    ldp     x18, x19, [sp, #144]
+    ldp     x20, x21, [sp, #160]
+    ldp     x22, x23, [sp, #176]
+    ldp     x24, x25, [sp, #192]
+    ldp     x26, x27, [sp, #208]
+    ldp     x28, x29, [sp, #224]
+    msr     far_el1, x29
+    ldp     x0, x1, [sp, #0]
+    add     sp, sp, #272
+    b       tramp_exit
+
+// ---- KPTI のトランポリン (Linux の tramp_vectors と tramp_exit): ユーザーが動いているあいだの TTBR1 の表
+// (memlayout::kpti_tables) はここだけを写す。ベクタは 5 とおり (カーネルのベクタの 5 とおりに 1 つずつ)。
+// ユーザーから入ると、x30 を tpidrro_el0 に置き、TTBR1 をカーネルの表 (トランポリンの表の 4096 前、ASID 0) に
+// して、VBAR をカーネルのベクタにし、そのベクタの同じ入口へまっすぐ (間接でない分岐で) 跳ぶ。
+// Spectre-BHB の手当てはカーネルのベクタの入口で (その前に間接分岐はない)
+.macro TRAMP_ENT kvec, off
+    .balign 0x80
+    msr     tpidrro_el0, x30
+    mrs     x30, ttbr1_el1
+    sub     x30, x30, #4096
+    bic     x30, x30, #(1 << 48)
+    msr     ttbr1_el1, x30
+    isb
+    adrp    x30, \kvec
+    add     x30, x30, :lo12:\kvec
+    msr     vbar_el1, x30
+    isb
+    b       \kvec + \off
+.endm
+
+.macro TRAMP_TABLE name, kvec
+.balign 0x800
+.global \name
+\name:
+    // EL1 から来ることはない (ユーザーのあいだだけ使う)
+    .rept 8
+    .balign 0x80
+    b       .
+    .endr
+    TRAMP_ENT \kvec, 0x400
+    TRAMP_ENT \kvec, 0x480
+    TRAMP_ENT \kvec, 0x500
+    TRAMP_ENT \kvec, 0x580
+    TRAMP_ENT \kvec, 0x600
+    TRAMP_ENT \kvec, 0x680
+    TRAMP_ENT \kvec, 0x700
+    TRAMP_ENT \kvec, 0x780
+.endm
+
+.section .text.tramp, "ax"
+.balign 0x4000
+.global tramp_start
+tramp_start:
+    TRAMP_TABLE tramp_vectors, vectors
+    TRAMP_TABLE tramp_vectors_bhb_loop, vectors_bhb_loop
+    TRAMP_TABLE tramp_vectors_bhb_insn, vectors_bhb_insn
+    TRAMP_TABLE tramp_vectors_bhb_hvc, vectors_bhb_hvc
+    TRAMP_TABLE tramp_vectors_bhb_smc, vectors_bhb_smc
+
+// ユーザーへ帰る: VBAR をトランポリンのベクタに、TTBR1 をトランポリンの表 (ASID 1) にして eret。
+// x0〜x28 と x30 はユーザーのもの、x29 は far_el1 に。TTBR1 を変えたあとの命令はここ (どちらの表にも同じ所に写る)
+tramp_exit:
+    adrp    x29, {tramp_vbar}
+    ldr     x29, [x29, :lo12:{tramp_vbar}]
+    msr     vbar_el1, x29
+    mrs     x29, ttbr1_el1
+    add     x29, x29, #4096
+    orr     x29, x29, #(1 << 48)
+    msr     ttbr1_el1, x29
+    mrs     x29, far_el1
+    eret
+    dsb     nsh
+    isb
+
+// KPTI のたしかめ (起動のときに 1 度、割り込みを止めて): トランポリンの表 (ASID 1) に切りかえて x0 の仮想アドレスを
+// AT S1E1R で引き、PAR_EL1 を返す (カーネルの表にもどしてから)
+.global tramp_probe
+tramp_probe:
+    mrs     x2, ttbr1_el1
+    add     x1, x2, #4096
+    orr     x1, x1, #(1 << 48)
+    msr     ttbr1_el1, x1
+    isb
+    at      s1e1r, x0
+    isb
+    mrs     x0, par_el1
+    msr     ttbr1_el1, x2
+    isb
+    ret
+.balign 0x4000
+.global tramp_end
+tramp_end:
+.section .text
 "#,
     bhb_k = sym crate::cpuvuln::BHB_K,
+    kpti = sym KPTI,
+    tramp_vbar = sym TRAMP_VBAR,
 );
+
+/// KPTI をしているか (trap_common と trap_ret の asm が読む: 0 か 1)
+static KPTI: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// ユーザーのあいだの VBAR (トランポリンのベクタ: カーネルのものと同じ Spectre-BHB の手当て)
+static TRAMP_VBAR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// KPTI を始める (Linux の kpti_install_ng_mappings と tramp_map_kernel / tramp_unmap_kernel。cpuvuln.rs が、Meltdown に
+/// 当たる CPU か kpti=1 のとき、ほかの CPU を起こす前に呼ぶ)。カーネルの写像を nG にし、トランポリンだけの表を作る。
+/// これからユーザーへ帰るたびに TTBR1 をその表 (ASID 1) にし、入るたびにカーネルの表 (ASID 0) にもどす。
+/// 表をたしかめ (トランポリンは引け、カーネルは引けない)、まちがっていれば入れずに false
+pub fn kpti_enable() -> bool {
+    unsafe extern "C" {
+        static tramp_start: u8;
+        static tramp_end: u8;
+        static tramp_vectors: u8;
+        static tramp_vectors_bhb_loop: u8;
+        static tramp_vectors_bhb_insn: u8;
+        static tramp_vectors_bhb_hvc: u8;
+        static tramp_vectors_bhb_smc: u8;
+        fn tramp_probe(va: usize) -> u64;
+    }
+    let (start, end) = (&raw const tramp_start as usize, &raw const tramp_end as usize);
+    crate::memlayout::kpti_tables(start, end - start);
+    // PAR_EL1: 0 ビットめが 1 なら引けなかった、12..47 が物理アドレス
+    let (tramp, kernel) = unsafe {
+        let daif: u64;
+        core::arch::asm!("mrs {}, daif", "msr daifset, #0xf", out(reg) daif);
+        let r = (tramp_probe(start), tramp_probe(&raw const KPTI as usize));
+        core::arch::asm!("msr daif, {}", in(reg) daif);
+        r
+    };
+    if tramp & 1 != 0 || (tramp & 0x0000_ffff_ffff_f000) as usize != crate::memlayout::v2p(start) || kernel & 1 == 0 {
+        crate::println!("kpti: the trampoline page table is wrong (PAR {:#x} {:#x}); KPTI is off", tramp, kernel);
+        return false;
+    }
+    let v = match crate::cpuvuln::bhb_how() {
+        crate::cpuvuln::BHB_LOOP => &raw const tramp_vectors_bhb_loop,
+        crate::cpuvuln::BHB_INSN => &raw const tramp_vectors_bhb_insn,
+        crate::cpuvuln::BHB_FW_HVC => &raw const tramp_vectors_bhb_hvc,
+        crate::cpuvuln::BHB_FW_SMC => &raw const tramp_vectors_bhb_smc,
+        _ => &raw const tramp_vectors,
+    };
+    TRAMP_VBAR.store(v as usize, core::sync::atomic::Ordering::Relaxed);
+    KPTI.store(1, core::sync::atomic::Ordering::Release);
+    true
+}
 
 // ベクタの並び: [EL1t, EL1h, EL0 64bit, EL0 32bit] x [sync, irq, fiq, serror]
 const EL1H_SYNC: u64 = 4;

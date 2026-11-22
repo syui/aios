@@ -20,7 +20,8 @@
 core::arch::global_asm!(
     r#"
 .equ MAIR_VALUE, 0xff00
-.equ TCR_VALUE, (25 | (1 << 8) | (1 << 10) | (3 << 12) | (25 << 16) | (1 << 24) | (1 << 26) | (3 << 28) | (2 << 30) | (2 << 32))
+// A1 (22): ASID は TTBR1 のもの (KPTI でカーネル 0 とユーザー 1 を切りかえる。KPTI でなければいつも 0)
+.equ TCR_VALUE, (25 | (1 << 8) | (1 << 10) | (3 << 12) | (25 << 16) | (1 << 22) | (1 << 24) | (1 << 26) | (3 << 28) | (2 << 30) | (2 << 32))
 // ブロック記述子の属性 (アドレスは別に足す)。L1 (1 GiB) と L2 (2 MiB) で同じ形
 .equ ATTR_DEVICE, ((1 << 54) | (1 << 53) | (1 << 10) | (0 << 2) | 1)
 .equ ATTR_NORMAL, ((1 << 54) | (1 << 10) | (3 << 8) | (1 << 2) | 1)
@@ -259,6 +260,17 @@ boot_l1_lo:
     .fill   512, 8, 0
 .global boot_l1_hi
 boot_l1_hi:
+    .fill   512, 8, 0
+// KPTI: ユーザーのあいだの TTBR1 の表 (トランポリンだけを写す)。boot_l1_hi のすぐ後ろ (+4096) に置くこと
+// (trap.rs のトランポリンが TTBR1 から 4096 を足し引きして切りかえる)
+.global tramp_l1
+tramp_l1:
+    .fill   512, 8, 0
+.global tramp_l2
+tramp_l2:
+    .fill   512, 8, 0
+.global tramp_l3
+tramp_l3:
     .fill   512, 8, 0
 boot_l2_hi:
     .fill   512, 8, 0
