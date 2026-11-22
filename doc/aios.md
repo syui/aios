@@ -2423,6 +2423,15 @@ DTB がなくても ACPI の表で起きる (Linux の drivers/acpi/tables.c と
   RAM の大きさと使えないところは、ExitBootServices のときの EFI のメモリマップから (Linux の efi_init と
   reserve_regions): RAM の範囲と、そのうちのすき間、Reserved、ACPI Reclaim と NVS、MMIO、ランタイムを kalloc がよける
   (ACPI の表はあとも読めるように残る)
+- EFI スタブは Image を RAM の先頭 + 0x80000 へ (bss まで、いまは 63.5 MiB) 写す。そこを AllocatePages でとれない
+  とき (QEMU の AAVMF は RAM の先頭から 64 MiB のあたりをブートサービスのあいだ使う: カーネルが 64 MiB をこえたら
+  起きなくなった。2026-11-22) は、メモリマップでそこがみな ExitBootServices のあとに使ってよいもの (Loader、
+  BootServices の Code と Data、空き) で、読み込まれた Image と DTB に重ならなければ、そのまま上書きする
+  (`aios: RAM base + 0x80000 is boot services memory; taking it after ExitBootServices`。Linux の EFI スタブも
+  ブートサービスのメモリは空いたとみる。写す efi_enter はスタックを使わない)
+- 時刻: ACPI は RTC (PL031) を表に書かないので、読めなければ EFI の GetTime から (Linux の rtc-efi:
+  `efi: the time is from GetTime`)。QEMU の表 (BOCHS) なら PL031 も読めるので、ちがいを出す (`efi: GetTime T
+  (the RTC says T, 0s apart)`)
 - kernel/src/acpi.rs (core) が、UART より先に RSDP → XSDT → MADT (GICD と版、GICv2 の CPU インターフェイス、GICv3 の
   再配布器、使える CPU の MPIDR)、SPCR (PL011 か SBSA の generic UART の番地と割り込み)、FADT (ARM_BOOT_ARCH: PSCI と
   hvc / smc、DSDT)、DSDT と SSDT の AML のうち Device の Name(_HID)、_UID、Name(_CRS) (Memory32Fixed、DWord / QWord の
@@ -2444,8 +2453,26 @@ DTB がなくても ACPI の表で起きる (Linux の drivers/acpi/tables.c と
   aios は test/acpi-boot.sh、手本の Linux は `LINUX_EFI=1 LINUX_ACPI=1 test/linux-vm.sh rootexec`。test/linux.config に
   CONFIG_ACPI と、QEMU の DSDT の PCIe のホストブリッジの領域を読むための CONFIG_PCI)。QEMU の GICv2 と GICv3、
   CPU 2 と 4 で、プロンプト、ext4 のルート、DHCP、swap まで
-- まだ: ほんものの UEFI の機械 (RTC を EFI の GetTime で、PCIe (MCFG)、virtio でない機器、Method の _CRS)。
-  virtio-blk は 1 台だけ見る (はじめのもの)
+- PCI と PCIe (kernel/src/pci.rs、extra。aios.off=pci で切れる): ECAM の場所は ACPI なら MCFG (区分 0)、DTB なら
+  pci-host-ecam-generic の reg と bus-range (Linux の pci-host-generic)。QEMU virt の ECAM (0x40_1000_0000) は
+  起動のときの装置の窓 (RAM の前の 1 GiB) の外なので、memlayout::map_device が TTBR1 の L1 のあき (RAM の後ろ) に
+  1 GiB ずつ写す (Linux の ioremap)。バスをたどる順は Linux の pci_scan_child_bus と同じ (装置 0..31、多機能なら
+  機能 0..7、そのあとブリッジの下。PCIe のルートポートと下りのポートの下は装置 0 だけ)。ブリッジのバスの番号は、DTB
+  ではいつもつけなおし (Linux の PCI_REASSIGN_ALL_BUS)、ACPI はファームウェアのもの。設定空間の大きさ (256 か 4096)
+  は Linux の pci_cfg_space_size と同じ。見つけたものを `pci 0000:00:00.0: [1b36:0008] type 00 class 0x060000
+  conventional PCI endpoint` と kmsg に
+- /sys/bus/pci (devices/NAME のリンク、drivers/ と slots/ (空)、drivers_autoprobe など) と装置のディレクトリは Linux
+  7.4 と同じ形: ACPI は /sys/devices/pci0000:00、DTB はホストブリッジの platform の装置の下
+  (/sys/devices/platform/4010000000.pcie/pci0000:00。その uevent と modalias は DTB のノードから)。装置ごとに vendor、
+  device、class、revision、subsystem_*、config (root は全部、ほかは頭の 64 バイト。root は書ける)、uevent、modalias、
+  irq、resource、PCIe ならリンクの速さと幅、ブリッジなら secondary / subordinate_bus_number と下の装置 (入れ子)、
+  pci_bus/0000:BB と /sys/class/pci_bus。test/pci.c は、QEMU の virt (ホストブリッジだけ) で DTB と ACPI の両方で
+  手本の Linux と同じ (CPU の数と、aios が見せていない of_node・driver・firmware_node のリンクのほか。2026-11-22)。
+  手本の Linux に CONFIG_PCI_HOST_GENERIC を足し、-netdev がないときに QEMU が足す virtio-net-pci を `-nic none` で
+  消した (aios の VM にはない)。QEMU に装置を足すのは AIOS_QEMU_ARGS と LINUX_QEMU_ARGS (ldiff の答えの鍵にも入る)
+- まだ: ほんものの UEFI の機械、PCI の BAR の割り当て (DTB のとき Linux は pci_assign_unassigned_bus_resources で
+  割り当てる。ACPI はファームウェアのものをそのまま。resource と resourceN、reset_method、link/ の ASPM)、
+  virtio でない機器のドライバ、Method の _CRS。virtio-blk は 1 台だけ見る (はじめのもの)
 
 ### CPU のぜい弱性 (/sys/devices/system/cpu/vulnerabilities、SSBS)
 

@@ -84,6 +84,45 @@ pub fn set_ram(base: usize, size: usize) {
     PHYSTOP.set(base + size);
 }
 
+/// boot.rs と同じ、装置の 1 GiB ブロックの属性 (MAIR の 0 番: Device-nGnRnE、実行しない)
+const ATTR_DEVICE: u64 = (1 << 54) | (1 << 53) | (1 << 10) | 1;
+/// 装置のための L1 の置き場: RAM の後ろに 1 つあけて、そこから (Linux の ioremap の vmalloc の場所にあたる)
+const DEV_SLOT: usize = 2 + MAX_RAM / GIB;
+const DEV_SLOTS: usize = 64;
+/// TCR の IPS (40 ビット) で写せる物理アドレスの上限
+const PA_LIMIT: usize = 1 << 40;
+
+/// 装置の [pa, pa + len) を写して、その仮想アドレスを返す (Linux の ioremap)。RAM の前の 1 GiB (起動のときに
+/// 写した窓) ならそのまま、外 (QEMU virt の上のほうの PCIe の ECAM 0x40_1000_0000 など) は L1 のあきに 1 GiB ずつ。
+/// 同じ 1 GiB はいちど写したものを使いまわす。起動のとき (ほかの CPU の前) に呼ぶ
+pub fn map_device(pa: usize, len: usize) -> Option<usize> {
+    let end = pa.checked_add(len)?;
+    let base = ram_base();
+    if base >= GIB && pa >= base - GIB && end <= base {
+        return Some(p2v(pa));
+    }
+    if base == 0 || len == 0 || end > PA_LIMIT {
+        return None;
+    }
+    let first = pa & !(GIB - 1);
+    let n = (end - first).div_ceil(GIB);
+    unsafe {
+        let l1 = &mut *(&raw mut boot_l1_hi);
+        let want = |k: usize| (first + k * GIB) as u64 | ATTR_DEVICE;
+        // 写してあるものか、n こ続いたあき
+        let slot = (DEV_SLOT..DEV_SLOT + DEV_SLOTS - n + 1)
+            .find(|&s| (0..n).all(|k| l1[s + k] == want(k)))
+            .or_else(|| (DEV_SLOT..DEV_SLOT + DEV_SLOTS - n + 1).find(|&s| (0..n).all(|k| l1[s + k] == 0)))?;
+        if l1[slot] == 0 {
+            for k in 0..n {
+                l1[slot + k] = want(k);
+            }
+            core::arch::asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb");
+        }
+        Some(KBASE + slot * GIB + (pa - first))
+    }
+}
+
 /// [pa, pa + len) が通常のメモリとして写像してある範囲か
 pub fn is_mapped_ram(pa: usize, len: usize) -> bool {
     // RAM の大きさがまだわからなければ、起動のときに写した分

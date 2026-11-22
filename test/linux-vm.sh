@@ -23,6 +23,7 @@
 # 127.0.0.1:P1 を中の TCP 7001 へ、P2 を UDP 7002 へ (aios の bin/run.sh の AIOS_FWD と同じ。test/nfteval.c)
 # QEMU の CPU は LINUX_CPU (既定 max)、数は LINUX_SMP (既定 1)。速さをくらべるとき (aish の bench) は aios の VM と同じ
 # cortex-a72 にする
+# LINUX_QEMU_ARGS は QEMU にそのまま足す (aios の bin/run.sh の AIOS_QEMU_ARGS と同じ。PCI の装置: test/pci.c)
 # 置き場は build/linux/ (VERSION/Image と、作るときのソースと tarball。作ったらソースは消す)。
 # 作るのに要るもの: aarch64-linux-gnu-gcc、make、flex、bison、bc、curl、xz。動かすのに qemu-system-aarch64、mkfs.ext4、debugfs
 set -e
@@ -198,8 +199,11 @@ boot() {
     set -- "$@" -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$p1-:7001,hostfwd=udp:127.0.0.1:$p2-:7002" \
       -device virtio-net-device,netdev=n0 -global virtio-mmio.force-legacy=false
     append="$append ip=dhcp"
+  else
+    # -netdev がないと QEMU は PCIe に virtio-net-pci を足す (aios の VM にはない: test/pci.c の /sys/bus/pci)
+    set -- "$@" -nic none
   fi
-  timeout 1800 qemu-system-aarch64 -M "$machine" -cpu "${LINUX_CPU:-max}" -m 2G -smp "${LINUX_SMP:-1}" -nographic -no-reboot "$@" \
+  timeout 1800 qemu-system-aarch64 -M "$machine" -cpu "${LINUX_CPU:-max}" -m 2G -smp "${LINUX_SMP:-1}" -nographic -no-reboot "$@" ${LINUX_QEMU_ARGS:-} \
     -kernel "$image" -initrd "$tmp/initrd" -append "$append" \
     -drive file="$tmp/work.img",if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0 \
     > "$tmp/serial" 2>&1 || true

@@ -70,6 +70,7 @@ mod nfhook;
 mod conntrack;
 mod ctnetlink;
 mod parts;
+mod pci;
 mod pidfd;
 mod posix_timers;
 mod proc;
@@ -250,6 +251,10 @@ pub extern "C" fn kmain() -> ! {
     }
     rand::summary();
     audit::init();
+    // PCI のバスをたどる (Linux の pci_host_probe と MCFG: 見つけたものを /sys/bus/pci に。ドライバはまだない)
+    if !parts::off(parts::Part::Pci) {
+        pci::init();
+    }
     // 装置のないファイルシステム (Linux の register_filesystem: mount(2) と、起動のときの /proc や /sys が引く)
     vfs::register_filesystem("proc", || Ok(procfs::new_root()));
     vfs::register_filesystem("sysfs", || Ok(sysfs::new_root()));

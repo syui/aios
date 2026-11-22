@@ -19,6 +19,7 @@ pub enum Part {
     Module,
     Net,
     Ns,
+    Pci,
     Seccomp,
     Swap,
     Timerfd,
@@ -30,7 +31,7 @@ pub enum Part {
 }
 
 /// Part と同じ順の名前 (kernel.json の name)
-const NAMES: [&str; 17] = [
+const NAMES: [&str; 18] = [
     "aiproc",
     "apparmor",
     "bcm2835_rng",
@@ -40,6 +41,7 @@ const NAMES: [&str; 17] = [
     "module",
     "net",
     "ns",
+    "pci",
     "seccomp",
     "swap",
     "timerfd",

@@ -441,6 +441,26 @@ type Fn2 = extern "efiapi" fn(usize, usize) -> Status;
 type Fn4 = extern "efiapi" fn(usize, usize, usize, usize) -> Status;
 type Fn5 = extern "efiapi" fn(usize, usize, usize, usize, usize) -> Status;
 
+/// [dest, dest + size) が、メモリマップでみな ExitBootServices のあとに使ってよいもの (LoaderCode/Data、
+/// BootServicesCode/Data、Conventional) でおおわれているか (ACPI の表、ランタイムサービス、MMIO、穴があればだめ)
+unsafe fn reusable(buf: usize, map_size: usize, desc_size: usize, dest: usize, size: usize) -> bool {
+    let mut covered = 0;
+    for i in 0..map_size / desc_size {
+        let d = buf + i * desc_size;
+        let ty = unsafe { read_volatile(d as *const u32) };
+        let (a, n) = unsafe { (rd64(d + 8), rd64(d + 24) * 4096) };
+        let (lo, hi) = (a.max(dest), (a + n).min(dest + size));
+        if lo >= hi {
+            continue;
+        }
+        if !matches!(ty, 1..=4 | 7) {
+            return false;
+        }
+        covered += hi - lo;
+    }
+    covered == size
+}
+
 /// ConOut に ASCII を出す (UTF-16 に直して)
 unsafe fn say(st: usize, msg: &[u8]) {
     unsafe {
@@ -541,9 +561,17 @@ unsafe extern "C" fn efi_main(image: usize, st: usize, base: usize) -> Status {
             let alloc: Fn4 = core::mem::transmute(rd64(bs + BS_ALLOCATE_PAGES));
             let mut addr = dest;
             let st2 = alloc(ALLOCATE_ADDRESS, LOADER_DATA, size.div_ceil(4096), &mut addr as *mut usize as usize);
-            if st2 != EFI_SUCCESS {
+            // とれなければ (ファームウェアがブートサービスのあいだ使っている。QEMU の AAVMF は RAM の頭から 64 MiB の
+            // あたり)、ExitBootServices のあとに上書きしてよいところ (ブートサービスとローダーのもの、空き) とだけ
+            // 重なるなら、そのまま使う (Linux の EFI スタブも、ブートサービスのメモリは ExitBootServices で空いたとみる)。
+            // 写す efi_enter はスタックを使わない。読み込まれた Image と DTB とは重ならないこと
+            let ovl = |a: usize, n: usize| a < dest + size && dest < a + n;
+            if st2 != EFI_SUCCESS && (!reusable(buf, map_size, desc_size, dest, size) || ovl(base, size) || (dtb != 0 && ovl(dtb, dtb_size))) {
                 say(st, b"aios: cannot reserve RAM base + 0x80000\n");
                 return EFI_LOAD_ERROR;
+            }
+            if st2 != EFI_SUCCESS {
+                say(st, b"aios: RAM base + 0x80000 is boot services memory; taking it after ExitBootServices\n");
             }
         }
 

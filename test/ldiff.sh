@@ -62,7 +62,7 @@ fi
 
 # Linux の答え: とっておいたものか、動かす (うしろで)
 v=$(sh test/linux-vm.sh version "$ver")
-key=$(cat "$bin" test/linux.config | sha256sum | cut -c1-16)-$(printf '%s %s %s%s' "$v" "$root" "${net:+net }" "$*" | sha256sum | cut -c1-8)
+key=$(cat "$bin" test/linux.config | sha256sum | cut -c1-16)-$(printf '%s %s %s%s%s' "$v" "$root" "${net:+net }" "${LINUX_QEMU_ARGS:+$LINUX_QEMU_ARGS }" "$*" | sha256sum | cut -c1-8)
 ans=build/linux-answers/$name-$key
 lout=build/ldiff/$name.linux aout=build/ldiff/$name.aios
 lpid=

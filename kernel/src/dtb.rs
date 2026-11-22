@@ -129,6 +129,19 @@ impl Node<'_> {
         core::str::from_utf8(self.me().name).unwrap_or("")
     }
 
+    /// ルートからの道 (Linux の %pOF: /pcie@10000000)
+    pub fn full_name(&self) -> alloc::string::String {
+        let mut s = alloc::string::String::new();
+        for l in &self.levels[1..] {
+            s.push('/');
+            s.push_str(core::str::from_utf8(l.name).unwrap_or(""));
+        }
+        if s.is_empty() {
+            s.push('/');
+        }
+        s
+    }
+
     /// 深さ (ルートが 0)
     pub fn depth(&self) -> usize {
         self.levels.len() - 1

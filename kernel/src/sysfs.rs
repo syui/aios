@@ -18,6 +18,10 @@
 //   /sys/devices/platform/PARENT/{uevent,subsystem}  それをつなぐ装置 (a003e00.virtio_mmio: DTB の名前と、Linux と同じ uevent)
 //   /sys/devices/platform/PARENT/CLASS/NAME/{uevent,dev,device,subsystem}
 //   /sys/bus/platform                                subsystem のリンクの先 (中は空)
+//   /sys/bus/pci/{devices/NAME,drivers,slots,...}    PCI の装置 (pci.rs が見つけたもの。Linux の pci-sysfs.c)。装置は
+//   /sys/devices/pci0000:00/0000:00:00.0/...         ACPI ならここ、DTB はホストブリッジの platform の装置の下
+//                                                    (/sys/devices/platform/4010000000.pcie/pci0000:00)。ブリッジの下は
+//                                                    その中に入れ子。pci_bus/0000:BB と /sys/class/pci_bus も
 // 大きさはセクタ (512 バイト)、stat は /proc/diskstats の 4 列目からの 11 列と同じ
 use crate::vfs::*;
 use alloc::format;
@@ -27,6 +31,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 
 const EACCES: i64 = 13;
+const EOPNOTSUPP: i64 = 95;
 const SYSFS_MAGIC: u64 = 0x6265_6572;
 
 const DISK_FILES: [&str; 5] = ["size", "stat", "dev", "ro", "removable"];
@@ -115,6 +120,96 @@ enum Node {
     /// /sys/class/CLASS (その CLASS のはじめの番号) と、その中のリンク
     ClassOf(u8),
     ClassLink(u8),
+    /// /sys/bus/pci と devices、drivers と slots (0、1: 空)、ファイル (pci::BUS_FILES)、devices の中のリンク (pci::devs の番号)
+    BusPci,
+    BusPciDevs,
+    BusPciSub(u8),
+    BusPciFile(u8),
+    BusPciLink(u8),
+    /// DTB のホストブリッジの platform の装置 (4010000000.pcie) と、そのファイル (HOST_FILES) と subsystem
+    PciHost,
+    PciHostFile(u8),
+    PciHostSubsys,
+    /// pci0000:00 と、そのファイル (uevent と、ACPI なら waiting_for_supplier)
+    PciRoot,
+    PciRootFile(u8),
+    /// 装置 (pci::devs の番号)、そのファイル (pci::DEV_FILES)、subsystem、link (ASPM。空のディレクトリ)
+    PciDev(u8),
+    PciFile(u8, u8),
+    PciSubsys(u8),
+    PciLinkDir(u8),
+    /// pci_bus (ルートのバスは ROOT_BUS、ほかはブリッジの装置の番号) と、その中の 0000:BB、ファイル (PCI_BUS_FILES)、
+    /// リンク (0 device、1 subsystem)
+    PciBusDir(u8),
+    PciBus(u8),
+    PciBusFile(u8, u8),
+    PciBusLink(u8, u8),
+    /// /sys/class/pci_bus と、その中のリンク
+    ClassPciBus,
+    ClassPciBusLink(u8),
+}
+
+/// pci_bus の番号でルートのバスを表すもの (装置は 255 より少ない: pci.rs)
+const ROOT_BUS: u8 = 255;
+/// DTB のホストブリッジの platform の装置のファイル (Linux の driver と of_node のリンクはない: その先を見せていない)
+const HOST_FILES: [(&str, u32); 3] = [("driver_override", 0o644), ("modalias", 0o444), ("uevent", 0o644)];
+/// pci_bus/0000:BB のファイル (waiting_for_supplier は DTB のルートのバスだけ)
+const PCI_BUS_FILES: [(&str, u32); 5] = [("cpuaffinity", 0o444), ("cpulistaffinity", 0o444), ("rescan", 0o200), ("uevent", 0o644), ("waiting_for_supplier", 0o444)];
+
+fn pci_dev(i: u8) -> Result<&'static crate::pci::Dev, i64> {
+    crate::pci::devs().get(i as usize).ok_or(-ENOENT)
+}
+
+/// /sys/devices から pci0000:00 までの道と、その段の数
+fn pci_root_path() -> (String, usize) {
+    match crate::pci::host() {
+        Some(h) => (format!("platform/{}/pci0000:00", h.dir), 3),
+        None => ("pci0000:00".into(), 1),
+    }
+}
+
+/// pci_bus/0000:BB の道 (/sys/devices から) と、/sys からの段の数
+fn pci_bus_path(b: u8) -> Option<(String, usize)> {
+    let (root, n) = pci_root_path();
+    if b == ROOT_BUS {
+        return Some((format!("{}/pci_bus/0000:{:02x}", root, crate::pci::root_bus()?), 1 + n + 2));
+    }
+    let d = pci_dev(b).ok()?;
+    let p = crate::pci::path(b as usize);
+    Some((format!("{}/pci_bus/0000:{:02x}", p, d.below?.0), 1 + n + crate::pci::depth(b as usize) + 1 + 2))
+}
+
+/// その pci_bus にある、または上がその装置の装置 (None はルートのバス)
+fn pci_children(up: Option<usize>) -> impl Iterator<Item = usize> {
+    crate::pci::devs().iter().enumerate().filter(move |(_, d)| d.up == up).map(|(i, _)| i)
+}
+
+fn pci_bus_files(b: u8) -> impl Iterator<Item = usize> {
+    (0..PCI_BUS_FILES.len()).filter(move |&k| k != 4 || (b == ROOT_BUS && crate::pci::host().is_some()))
+}
+
+fn pci_root_files() -> impl Iterator<Item = (usize, &'static str)> {
+    [(0, "uevent"), (1, "waiting_for_supplier")].into_iter().filter(|&(k, _)| k == 0 || crate::pci::host().is_none())
+}
+
+/// DTB のノードの uevent の行 (Linux の of_device_uevent)
+fn of_uevent(h: &crate::pci::Host) -> String {
+    let mut s = format!("OF_NAME={}\nOF_FULLNAME={}\nOF_TYPE={}\n", h.of_name, h.of_full, h.of_type);
+    for (i, c) in h.compat.iter().enumerate() {
+        s.push_str(&format!("OF_COMPATIBLE_{}={}\n", i, c));
+    }
+    s.push_str(&format!("OF_COMPATIBLE_N={}\n", h.compat.len()));
+    s
+}
+
+/// of:NnameTtypeCcompat... (Linux の of_modalias)
+fn of_modalias(h: &crate::pci::Host) -> String {
+    let mut s = format!("of:N{}T{}", h.of_name, h.of_type);
+    for c in &h.compat {
+        s.push('C');
+        s.push_str(&c.replace(' ', "_"));
+    }
+    s
 }
 
 /// ドライバが置く文字デバイス (Linux の device_create のうち、プログラムが読むところ)
@@ -262,6 +357,26 @@ impl SysInode {
             Node::ChrSubsys(i) => 0x6_0000 + ((i as u64) << 5) + 9,
             Node::ClassOf(i) => 0x6_0000 + ((i as u64) << 5) + 10,
             Node::ClassLink(i) => 0x6_0000 + ((i as u64) << 5) + 11,
+            Node::BusPci => 0x8_0000,
+            Node::BusPciDevs => 0x8_0001,
+            Node::BusPciSub(k) => 0x8_0002 + k as u64,
+            Node::BusPciFile(k) => 0x8_0004 + k as u64,
+            Node::PciHost => 0x8_0010,
+            Node::PciHostFile(k) => 0x8_0011 + k as u64,
+            Node::PciHostSubsys => 0x8_001a,
+            Node::PciRoot => 0x8_0020,
+            Node::PciRootFile(k) => 0x8_0021 + k as u64,
+            Node::ClassPciBus => 0x8_0030,
+            Node::PciDev(i) => 0x9_0000 + ((i as u64) << 8),
+            Node::PciSubsys(i) => 0x9_0000 + ((i as u64) << 8) + 1,
+            Node::PciLinkDir(i) => 0x9_0000 + ((i as u64) << 8) + 2,
+            Node::BusPciLink(i) => 0x9_0000 + ((i as u64) << 8) + 3,
+            Node::PciBusDir(i) => 0x9_0000 + ((i as u64) << 8) + 4,
+            Node::PciBus(i) => 0x9_0000 + ((i as u64) << 8) + 5,
+            Node::ClassPciBusLink(i) => 0x9_0000 + ((i as u64) << 8) + 6,
+            Node::PciBusLink(i, k) => 0x9_0000 + ((i as u64) << 8) + 8 + k as u64,
+            Node::PciBusFile(i, k) => 0x9_0000 + ((i as u64) << 8) + 0x10 + k as u64,
+            Node::PciFile(i, k) => 0x9_0000 + ((i as u64) << 8) + 0x40 + k as u64,
         }
     }
 
@@ -270,6 +385,7 @@ impl SysInode {
             self.node,
             Node::Root | Node::Block | Node::Disk | Node::Queue | Node::Part(_) | Node::Class | Node::ClassNet | Node::Net(_) | Node::NetStats(_) | Node::Devices | Node::System | Node::Cpu | Node::Vulns | Node::CpuN(_) | Node::Kernel | Node::Security | Node::Module | Node::ModAa | Node::ModAaParams | Node::Firmware | Node::Efi | Node::EfiVars | Node::Acpi | Node::AcpiTables | Node::AcpiSub(_) | Node::AcpiHotplug | Node::AcpiHp(_)
                 | Node::Dev | Node::DevChar | Node::Bus | Node::BusPlatform | Node::Platform | Node::PlatDev(_) | Node::PlatClass(_) | Node::Chr(_) | Node::ClassOf(_)
+                | Node::BusPci | Node::BusPciDevs | Node::BusPciSub(_) | Node::PciHost | Node::PciRoot | Node::PciDev(_) | Node::PciLinkDir(_) | Node::PciBusDir(_) | Node::PciBus(_) | Node::ClassPciBus
         )
     }
 
@@ -317,6 +433,23 @@ impl SysInode {
                 Node::PlatClass((0..l.len()).find(|&j| first_class_in(&l, j) && Some((l[j].parent.clone(), l[j].class)) == c).unwrap_or(0) as u8)
             }
             Node::ChrUevent(i) | Node::ChrDev(i) | Node::ChrDevice(i) | Node::ChrSubsys(i) => Node::Chr(i),
+            Node::BusPci => Node::Bus,
+            Node::BusPciDevs | Node::BusPciSub(_) | Node::BusPciFile(_) => Node::BusPci,
+            Node::BusPciLink(_) => Node::BusPciDevs,
+            Node::PciHost => Node::Platform,
+            Node::PciHostFile(_) | Node::PciHostSubsys => Node::PciHost,
+            Node::PciRoot => if crate::pci::host().is_some() { Node::PciHost } else { Node::Devices },
+            Node::PciRootFile(_) => Node::PciRoot,
+            Node::PciDev(i) => match pci_dev(i).ok().and_then(|d| d.up) {
+                Some(u) => Node::PciDev(u as u8),
+                None => Node::PciRoot,
+            },
+            Node::PciFile(i, _) | Node::PciSubsys(i) | Node::PciLinkDir(i) => Node::PciDev(i),
+            Node::PciBusDir(b) => if b == ROOT_BUS { Node::PciRoot } else { Node::PciDev(b) },
+            Node::PciBus(b) => Node::PciBusDir(b),
+            Node::PciBusFile(b, _) | Node::PciBusLink(b, _) => Node::PciBus(b),
+            Node::ClassPciBus => Node::Class,
+            Node::ClassPciBusLink(_) => Node::ClassPciBus,
             Node::ClassLink(i) => {
                 let l = l();
                 let c = l.get(i as usize).map(|d| d.class);
@@ -327,6 +460,19 @@ impl SysInode {
 
     /// シンボリックリンクの先 (リンクでなければ None)
     fn link(&self) -> Option<String> {
+        let up = |n: usize| "../".repeat(n);
+        match self.node {
+            Node::BusPciLink(i) => return Some(format!("../../../devices/{}", crate::pci::path(i as usize))),
+            Node::PciHostSubsys => return Some("../../../bus/platform".into()),
+            // /sys/devices/ROOT/装置.../subsystem
+            Node::PciSubsys(i) => return Some(format!("{}bus/pci", up(1 + pci_root_path().1 + crate::pci::depth(i as usize) + 1))),
+            Node::PciBusLink(b, 0) => {
+                return Some(if b == ROOT_BUS { format!("../../../pci0000:{:02x}", crate::pci::root_bus()?) } else { format!("../../../{}", pci_dev(b).ok()?.name()) });
+            }
+            Node::PciBusLink(b, _) => return Some(format!("{}class/pci_bus", up(pci_bus_path(b)?.1))),
+            Node::ClassPciBusLink(b) => return Some(format!("../../devices/{}", pci_bus_path(b)?.0)),
+            _ => {}
+        }
         let d = match self.node {
             Node::DevCharLink(i) | Node::PlatSubsys(i) | Node::ChrDevice(i) | Node::ChrSubsys(i) | Node::ClassLink(i) => chrdev(i).ok()?,
             _ => return None,
@@ -407,6 +553,28 @@ impl SysInode {
             }
             Node::CpuFile(_) => if ncpu == 1 { "0\n".into() } else { format!("0-{}\n", ncpu - 1) },
             Node::CpuOnline(_) => "1\n".into(),
+            Node::BusPciFile(k) => crate::pci::bus_file(k as usize),
+            Node::PciFile(i, f) => pci_dev(i)?.file(f as usize),
+            Node::PciRootFile(k) => if k == 0 { String::new() } else { "0\n".into() },
+            Node::PciBusFile(b, k) => match PCI_BUS_FILES[k as usize].0 {
+                "cpuaffinity" => crate::pci::cpus(false),
+                "cpulistaffinity" => crate::pci::cpus(true),
+                "waiting_for_supplier" => "0\n".into(),
+                // DTB のルートのバスは、ホストブリッジのノード (Linux の of_device_uevent)
+                "uevent" => match crate::pci::host().filter(|_| b == ROOT_BUS) {
+                    Some(h) => of_uevent(h),
+                    None => String::new(),
+                },
+                _ => String::new(),
+            },
+            Node::PciHostFile(k) => {
+                let h = crate::pci::host().ok_or(-ENOENT)?;
+                match HOST_FILES[k as usize].0 {
+                    "driver_override" => "(null)\n".into(),
+                    "modalias" => format!("{}\n", of_modalias(h)),
+                    _ => format!("DRIVER=pci-host-generic\n{}MODALIAS={}\n", of_uevent(h), of_modalias(h)),
+                }
+            }
             Node::Vuln(i) => crate::cpuvuln::show(VULN_FILES[i as usize]),
             Node::ModAaEnabled => if crate::parts::off(crate::parts::Part::Apparmor) { "N\n".into() } else { "Y\n".into() },
             Node::EfiFile(0) => "64\n".into(),
@@ -450,12 +618,21 @@ impl Inode for SysInode {
             _ if link.is_some() => S_IFLNK | 0o777,
             Node::EfiFile(1) | Node::AcpiTable(_) => S_IFREG | 0o400,
             // uevent は root が書ける (Linux と同じ形。書いても何もしない)
-            Node::PlatUevent(_) | Node::ChrUevent(_) | Node::AcpiForceRemove | Node::AcpiHpEnabled(_) => S_IFREG | 0o644,
+            Node::PlatUevent(_) | Node::ChrUevent(_) | Node::AcpiForceRemove | Node::AcpiHpEnabled(_) | Node::PciRootFile(0) => S_IFREG | 0o644,
+            Node::BusPciFile(k) => S_IFREG | crate::pci::BUS_FILES[k as usize].1,
+            Node::PciFile(_, f) => S_IFREG | crate::pci::DEV_FILES[f as usize].1,
+            Node::PciHostFile(k) => S_IFREG | HOST_FILES[k as usize].1,
+            Node::PciBusFile(_, k) => S_IFREG | PCI_BUS_FILES[k as usize].1,
             _ => S_IFREG | 0o444,
         };
         let size = match &link {
             _ if self.is_dir() => 0,
             Some(l) => l.len() as u64,
+            // config は設定空間の大きさ (Linux の pci_dev_config_attr_bin_size)
+            None if matches!(self.node, Node::PciFile(_, f) if crate::pci::DEV_FILES[f as usize].0 == "config") => {
+                let Node::PciFile(i, _) = self.node else { unreachable!() };
+                pci_dev(i).map_or(0, |d| d.cfg_size as u64)
+            }
             None if matches!(self.node, Node::AcpiTable(_)) => {
                 let Node::AcpiTable(i) = self.node else { unreachable!() };
                 crate::acpi::sysfs_tables().get(i as usize).map_or(0, |t| t.1.len() as u64)
@@ -467,6 +644,24 @@ impl Inode for SysInode {
     }
 
     fn read_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, i64> {
+        // PCI の設定空間 (Linux の pci_read_config: CAP_SYS_ADMIN がなければ頭の 64 バイト、CardBus は 128)
+        if let Node::PciFile(i, f) = self.node
+            && crate::pci::DEV_FILES[f as usize].0 == "config"
+        {
+            let d = pci_dev(i)?;
+            let size = if crate::cred::current().capable(crate::cred::CAP_SYS_ADMIN) {
+                d.cfg_size
+            } else if d.hdr == 2 {
+                128
+            } else {
+                64
+            };
+            if off >= size {
+                return Ok(0);
+            }
+            let n = buf.len().min(size - off);
+            return Ok(d.read_config(off, &mut buf[..n]));
+        }
         // ACPI の表はそのままのバイト (Linux の acpi_table_show。root だけ)
         let s;
         let b = if let Node::AcpiTable(i) = self.node {
@@ -486,10 +681,23 @@ impl Inode for SysInode {
         Ok(n)
     }
 
-    fn write_at(&self, _: usize, b: &[u8]) -> Result<usize, i64> {
+    fn write_at(&self, off: usize, b: &[u8]) -> Result<usize, i64> {
         match self.node {
             // uevent に書くと Linux はその装置のできごとをもう一度出す (udev の trigger)。aios には udev がないので受けとるだけ
-            Node::PlatUevent(_) | Node::ChrUevent(_) => Ok(b.len()),
+            Node::PlatUevent(_) | Node::ChrUevent(_) | Node::PciRootFile(0) | Node::PciHostFile(2) | Node::PciBusFile(_, 3) => Ok(b.len()),
+            // /sys/bus/pci の uevent と rescan、pci_bus と装置の rescan (たどりなおしても同じものしかない: 受けとるだけ)
+            Node::BusPciFile(2 | 4) | Node::PciBusFile(_, 2) => Ok(b.len()),
+            Node::PciFile(i, f) => match crate::pci::DEV_FILES[f as usize].0 {
+                "uevent" | "rescan" => Ok(b.len()),
+                // 設定空間に書く (Linux の pci_write_config: CAP_SYS_ADMIN。mode 0644 で root だけが開ける)
+                "config" => {
+                    if !crate::cred::current().capable(crate::cred::CAP_SYS_ADMIN) {
+                        return Err(-EPERM);
+                    }
+                    Ok(pci_dev(i)?.write_config(off, b))
+                }
+                _ => Err(-EOPNOTSUPP),
+            },
             // Linux の force_remove_store: 0 (false) だけ受けとる
             // Linux の hotplug_enabled_store: kstrtouint (10 進。終わりの改行はよい)、0 でなければ有効
             Node::AcpiHpEnabled(i) => match core::str::from_utf8(b).ok().map(|s| s.strip_suffix('\n').unwrap_or(s)).map(|s| s.strip_prefix('+').unwrap_or(s)).and_then(|s| s.parse::<u32>().ok()) {
@@ -539,7 +747,57 @@ impl Inode for SysInode {
                 Node::DevCharLink(i as u8)
             }
             Node::Bus if name == "platform" => Node::BusPlatform,
-            Node::Devices if name == "platform" && !chrdevs().is_empty() => Node::Platform,
+            Node::Bus if name == "pci" => Node::BusPci,
+            Node::BusPci => match name {
+                "devices" => Node::BusPciDevs,
+                "drivers" => Node::BusPciSub(0),
+                "slots" => Node::BusPciSub(1),
+                _ => Node::BusPciFile(crate::pci::BUS_FILES.iter().position(|f| f.0 == name).ok_or(-ENOENT)? as u8),
+            },
+            Node::BusPciDevs => Node::BusPciLink(crate::pci::devs().iter().position(|d| d.name() == name).ok_or(-ENOENT)? as u8),
+            Node::Devices if name == "platform" && (!chrdevs().is_empty() || crate::pci::host().is_some()) => Node::Platform,
+            Node::Devices if crate::pci::host().is_none() && crate::pci::root_bus().is_some_and(|b| name == format!("pci0000:{:02x}", b)) => Node::PciRoot,
+            Node::Platform if crate::pci::host().is_some_and(|h| h.dir == name) => Node::PciHost,
+            Node::PciHost => match name {
+                "subsystem" => Node::PciHostSubsys,
+                _ if crate::pci::root_bus().is_some_and(|b| name == format!("pci0000:{:02x}", b)) => Node::PciRoot,
+                _ => Node::PciHostFile(HOST_FILES.iter().position(|f| f.0 == name).ok_or(-ENOENT)? as u8),
+            },
+            Node::PciRoot | Node::PciDev(_) => {
+                let (up, bus) = match self.node {
+                    Node::PciDev(i) => (Some(i as usize), i),
+                    _ => (None, ROOT_BUS),
+                };
+                if let Some(j) = pci_children(up).find(|&j| crate::pci::devs()[j].name() == name) {
+                    Node::PciDev(j as u8)
+                } else if name == "pci_bus" && (up.is_none() || pci_dev(bus)?.below.is_some()) {
+                    Node::PciBusDir(bus)
+                } else if let Node::PciDev(i) = self.node {
+                    let d = pci_dev(i)?;
+                    match name {
+                        "subsystem" => Node::PciSubsys(i),
+                        "link" => Node::PciLinkDir(i),
+                        _ => Node::PciFile(i, (0..crate::pci::DEV_FILES.len()).find(|&f| crate::pci::DEV_FILES[f].0 == name && crate::pci::visible(d, f)).ok_or(-ENOENT)? as u8),
+                    }
+                } else {
+                    Node::PciRootFile(pci_root_files().find(|f| f.1 == name).ok_or(-ENOENT)?.0 as u8)
+                }
+            }
+            Node::PciBusDir(b) if pci_bus_path(b).is_some_and(|p| p.0.ends_with(&format!("/{}", name))) => Node::PciBus(b),
+            Node::PciBus(b) => match name {
+                "device" => Node::PciBusLink(b, 0),
+                "subsystem" => Node::PciBusLink(b, 1),
+                _ => Node::PciBusFile(b, pci_bus_files(b).find(|&k| PCI_BUS_FILES[k].0 == name).ok_or(-ENOENT)? as u8),
+            },
+            Node::Class if name == "pci_bus" && crate::pci::root_bus().is_some() => Node::ClassPciBus,
+            Node::ClassPciBus => {
+                let b = if crate::pci::root_bus().is_some_and(|r| name == format!("0000:{:02x}", r)) {
+                    ROOT_BUS
+                } else {
+                    crate::pci::devs().iter().position(|d| d.below.is_some_and(|(sec, _)| name == format!("0000:{:02x}", sec))).ok_or(-ENOENT)? as u8
+                };
+                Node::ClassPciBusLink(b)
+            }
             Node::Platform => {
                 let l = chrdevs();
                 let i = (0..l.len()).find(|&i| first_parent(&l, i) && l[i].parent == name).ok_or(-ENOENT)?;
@@ -720,6 +978,9 @@ impl Inode for SysInode {
                     add(l[i].class.into(), Node::ClassOf(i as u8));
                 }
                 add("net".into(), Node::ClassNet);
+                if crate::pci::root_bus().is_some() {
+                    add("pci_bus".into(), Node::ClassPciBus);
+                }
             }
             Node::ClassOf(i) => {
                 let l = chrdevs();
@@ -734,12 +995,90 @@ impl Inode for SysInode {
                     add(format!("{}:{}", d.major, d.minor), Node::DevCharLink(i as u8));
                 }
             }
-            Node::Bus => add("platform".into(), Node::BusPlatform),
-            Node::BusPlatform => {}
+            Node::Bus => {
+                add("pci".into(), Node::BusPci);
+                add("platform".into(), Node::BusPlatform);
+            }
+            Node::BusPlatform | Node::BusPciSub(_) | Node::PciLinkDir(_) => {}
+            Node::BusPci => {
+                add("devices".into(), Node::BusPciDevs);
+                add("drivers".into(), Node::BusPciSub(0));
+                add("slots".into(), Node::BusPciSub(1));
+                for (k, f) in crate::pci::BUS_FILES.iter().enumerate() {
+                    add(f.0.into(), Node::BusPciFile(k as u8));
+                }
+            }
+            Node::BusPciDevs => {
+                for (i, d) in crate::pci::devs().iter().enumerate() {
+                    add(d.name(), Node::BusPciLink(i as u8));
+                }
+            }
+            Node::PciHost => {
+                for (k, f) in HOST_FILES.iter().enumerate() {
+                    add(f.0.into(), Node::PciHostFile(k as u8));
+                }
+                add("subsystem".into(), Node::PciHostSubsys);
+                if let Some(b) = crate::pci::root_bus() {
+                    add(format!("pci0000:{:02x}", b), Node::PciRoot);
+                }
+            }
+            Node::PciRoot | Node::PciDev(_) => {
+                let up = match self.node {
+                    Node::PciDev(i) => Some(i as usize),
+                    _ => None,
+                };
+                for j in pci_children(up) {
+                    add(crate::pci::devs()[j].name(), Node::PciDev(j as u8));
+                }
+                match self.node {
+                    Node::PciDev(i) => {
+                        let d = pci_dev(i)?;
+                        for f in (0..crate::pci::DEV_FILES.len()).filter(|&f| crate::pci::visible(d, f)) {
+                            add(crate::pci::DEV_FILES[f].0.into(), Node::PciFile(i, f as u8));
+                        }
+                        add("subsystem".into(), Node::PciSubsys(i));
+                        add("link".into(), Node::PciLinkDir(i));
+                        if d.below.is_some() {
+                            add("pci_bus".into(), Node::PciBusDir(i));
+                        }
+                    }
+                    _ => {
+                        for (k, f) in pci_root_files() {
+                            add(f.into(), Node::PciRootFile(k as u8));
+                        }
+                        add("pci_bus".into(), Node::PciBusDir(ROOT_BUS));
+                    }
+                }
+            }
+            Node::PciBusDir(b) => {
+                if let Some((p, _)) = pci_bus_path(b) {
+                    add(p.rsplit('/').next().unwrap_or("").into(), Node::PciBus(b));
+                }
+            }
+            Node::PciBus(b) => {
+                for k in pci_bus_files(b) {
+                    add(PCI_BUS_FILES[k].0.into(), Node::PciBusFile(b, k as u8));
+                }
+                add("device".into(), Node::PciBusLink(b, 0));
+                add("subsystem".into(), Node::PciBusLink(b, 1));
+            }
+            Node::ClassPciBus => {
+                if let Some(r) = crate::pci::root_bus() {
+                    add(format!("0000:{:02x}", r), Node::ClassPciBusLink(ROOT_BUS));
+                }
+                for (i, d) in crate::pci::devs().iter().enumerate() {
+                    if let Some((sec, _)) = d.below {
+                        add(format!("0000:{:02x}", sec), Node::ClassPciBusLink(i as u8));
+                    }
+                }
+            }
             Node::Platform => {
                 let l = chrdevs();
                 for i in (0..l.len()).filter(|&i| first_parent(&l, i)) {
                     add(l[i].parent.clone(), Node::PlatDev(i as u8));
+                }
+                if let Some(h) = crate::pci::host() {
+                    add(h.dir.clone(), Node::PciHost);
                 }
             }
             Node::PlatDev(i) => {
@@ -783,8 +1122,12 @@ impl Inode for SysInode {
                 }
             }
             Node::Devices => {
-                if !chrdevs().is_empty() {
+                if !chrdevs().is_empty() || crate::pci::host().is_some() {
                     add("platform".into(), Node::Platform);
+                }
+                // ACPI: ルートのバスは /sys/devices のすぐ下
+                if let Some(b) = crate::pci::root_bus().filter(|_| crate::pci::host().is_none()) {
+                    add(format!("pci0000:{:02x}", b), Node::PciRoot);
                 }
                 add("system".into(), Node::System);
             }
