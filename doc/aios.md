@@ -812,6 +812,12 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   / で始まるリンクを通った答えを、根のちがう人が使っていた。chroot の外の人が先に /R/a (→ /tmp/x) をたどると、R に
   chroot した人の /a が外の /tmp/x になった (chroot の外が見える。逆に、中の人が先なら外の人に R/tmp/x)。いまは、
   / で始まるリンクを通った覚えに印 (abs) をつけ、chroot の中では使わず、chroot の中でたどったものは覚えない
+- cwd からの相対パスの許可 (test/cwdperm.c、root で ext4 と tmpfs で Linux と同じ): Linux は cwd (と開いているディレクトリ)
+  から先だけを通れればよい (0700 のディレクトリの中に cd してから setuid した人も、cwd の中は使える)。aios のパスの覚えと
+  ロックなしの stat の表は根からのパスで引くので、上のディレクトリが通れないと EACCES だった。いまは、根からたどって
+  EACCES になったときだけ、cwd の inode (許可を見ずに: vfs::cwd_inode) から 1 つずつたどりなおす (lookup_resolve: ..
+  も Linux と同じく、通るディレクトリごとに x を見る)。通れる人の道 (覚えから答える) は変わらない。unlink と rmdir は、
+  親に書けなくても、ないものは ENOENT (Linux は名前を引いてから may_delete)
 - chattr の印と file_getattr / file_setattr (Linux 6.17。test/chattr.c、root で ext4 と tmpfs で Linux と 40 行同じ): ext4 の
   inode の印 (i_flags) を Linux の fs/ext4 と同じに: FS_IOC_GETFLAGS は見える印 (ふつうのファイルは PROJINHERIT を落とす)、
   SETFLAGS は見えない印 EOPNOTSUPP、変えられない印は落とし、種類に合わない印 (ファイルの DIRSYNC など) は EOPNOTSUPP、

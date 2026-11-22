@@ -1,6 +1,6 @@
 // cwd からの相対パスは、cwd から先だけを通れればよい (上のディレクトリが通れなくても): Linux は cwd の dentry から
 // たどる。root で、0700 のディレクトリの中の 0755 のディレクトリに入ってから nobody になり、相対パスで stat、open、
-// 作る、消す、..、getcwd。引数のディレクトリごとに (ext4 と tmpfs)
+// 作る、消す、..、getcwd。引数のディレクトリごとに (ext4 と tmpfs)。cwd の中が見えなければ 1 で終わる
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -39,6 +39,8 @@ static int one(const char *base) {
     if (chdir(in) || setresgid(65534, 65534, 65534) || setresuid(65534, 65534, 65534))
       _exit(1);
     printf("%s", base[1] == 't' ? "tmpfs" : "ext4");
+    // cwd の中のものが見えなければ 1 (CI の ctests は終わりの番号だけ見る)
+    int bad = st("f") != 0 || st("..") != 0;
     say("stat f", st("f"));
     say("./f", st("./f"));
     say("sub/../f", st("sub/../f"));
@@ -56,7 +58,7 @@ static int one(const char *base) {
     say("chdir sub", E(chdir("sub")));
     say("stat ../f", st("../f"));
     printf("\n");
-    _exit(0);
+    _exit(bad);
   }
   int s;
   waitpid(c, &s, 0);

@@ -1663,8 +1663,39 @@ pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<(String, InodeRef),
     lookup_by(cwd, path, follow, |w, i| (w.to_string(), i.clone()))
 }
 
-/// lookup の答えを f (たどったパス, inode) で。パスのいらないもの (resolve) は、覚えのパスを写さない
+/// lookup の答えを f (たどったパス, inode) で。パスのいらないもの (resolve) は、覚えのパスを写さない。
+/// 相対のパスは Linux と同じく cwd (基準のディレクトリ) から先だけを通れればよい: 根からたどって (覚えも根からの
+/// もの) cwd より上で EACCES になったときだけ、cwd の inode (許可を見ずに) から 1 つずつたどりなおす (lookup_resolve)
 fn lookup_by<T>(cwd: &str, path: &str, follow: bool, f: impl Fn(&str, &InodeRef) -> T) -> Result<T, i64> {
+    match lookup_by_root(cwd, path, follow, &f) {
+        Err(e) if e == -crate::cred::EACCES && !cwd.is_empty() && !path.starts_with('/') => {
+            let start = (inode_noperm(cwd)?, cwd.to_string());
+            let (w, i) = found(lookup_resolve(start, path, follow, 0, false)?)?;
+            Ok(f(&w, &i))
+        }
+        r => r,
+    }
+}
+
+/// path (先頭 / なし、たどったあとのもの: cwd や開いているディレクトリのパス) の inode を、通れるかを見ずに (Linux の cwd
+/// と開いているディレクトリは、上のディレクトリを通れなくても使える)
+fn inode_noperm(path: &str) -> Result<InodeRef, i64> {
+    let mut cur = cross(root());
+    for c in path.split('/').filter(|c| !c.is_empty()) {
+        cur = cross(cur.lookup(c)?);
+    }
+    Ok(cur)
+}
+
+/// いまのディレクトリ (パス cwd) の inode。上のディレクトリを通れなくても (Linux の cwd の dentry)
+pub fn cwd_inode(cwd: &str) -> Result<InodeRef, i64> {
+    match resolve("", cwd, true) {
+        Err(e) if e == -crate::cred::EACCES => inode_noperm(cwd),
+        r => r,
+    }
+}
+
+fn lookup_by_root<T>(cwd: &str, path: &str, follow: bool, f: &impl Fn(&str, &InodeRef) -> T) -> Result<T, i64> {
     let _p = crate::debug::span("vfs:lookup");
     if path.is_empty() {
         return Err(-ENOENT);
@@ -1683,7 +1714,7 @@ fn lookup_by<T>(cwd: &str, path: &str, follow: bool, f: impl Fn(&str, &InodeRef)
     }
     let norm = NORM.get();
     if !normal_into(norm, cwd, path, true) {
-        let start = (resolve("", cwd, true)?, cwd.to_string());
+        let start = (cwd_inode(cwd)?, cwd.to_string());
         let (w, i) = found(lookup_resolve(start, path, follow, 0, false)?)?;
         return Ok(f(&w, &i));
     }
@@ -2547,7 +2578,7 @@ pub fn parent_last(start: Option<(InodeRef, String)>, cwd: &str, path: &str) -> 
     };
     let (dw, dir) = match (dpart.is_empty(), start) {
         (true, Some((i, p))) => (p.trim_matches('/').to_string(), i),
-        (true, None) => (cwd.trim_matches('/').to_string(), resolve("", cwd, true)?),
+        (true, None) => (cwd.trim_matches('/').to_string(), cwd_inode(cwd)?),
         (false, Some((i, p))) => lookup_at(&i, &p, dpart, true)?,
         (false, None) => lookup(cwd, dpart, true)?,
     };

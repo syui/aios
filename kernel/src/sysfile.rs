@@ -119,7 +119,7 @@ fn at_path(dirfd: i64, path: &str, flags: u64) -> Result<InodeRef, i64> {
         }
         // AT_FDCWD なら、いまのディレクトリ
         if dirfd == AT_FDCWD {
-            return vfs::resolve("", &proc::current().files().cwd.clone(), true);
+            return vfs::cwd_inode(&proc::current().files().cwd.clone());
         }
         return inode_of(dirfd as u64);
     }
@@ -1341,7 +1341,7 @@ pub(crate) fn file_flags(flags: u64) -> u32 {
 fn start_dir(dirfd: i64) -> Result<(InodeRef, String), i64> {
     if dirfd == AT_FDCWD {
         let cwd = proc::current().files().cwd.clone();
-        return Ok((vfs::resolve("", &cwd, true)?, cwd));
+        return Ok((vfs::cwd_inode(&cwd)?, cwd));
     }
     let f = file_of(dirfd as u64)?;
     let f = f.borrow();
@@ -1665,7 +1665,7 @@ pub fn readlinkat(dirfd: i64, pathp: usize, buf: usize, len: usize) -> R {
     // 空のパスは dirfd そのもの (O_PATH|O_NOFOLLOW で開いたリンク)。リンクでなければ ENOENT (Linux の do_readlinkat)
     let ino = if path.is_empty() {
         let i = if dirfd == AT_FDCWD {
-            vfs::resolve("", &proc::current().files().cwd.clone(), true)?
+            vfs::cwd_inode(&proc::current().files().cwd.clone())?
         } else {
             match inode_of(dirfd as u64) {
                 Err(e) if e == -EINVAL => return Err(-ENOENT),
@@ -1820,7 +1820,13 @@ pub fn unlinkat(dirfd: i64, pathp: usize, flags: u64) -> R {
     // LSM: landlock の REMOVE_DIR か REMOVE_FILE、AppArmor は消すものの持ち主で (要る LSM だけが引く: common_perm_rm)
     crate::security::path_unlink(&full, &parent, &name, flags & AT_REMOVEDIR != 0)?;
     let c = cred::current();
-    parent_writable(&c, &parent)?;
+    // 消せなくても、ないものは ENOENT (Linux は名前を引いてから may_delete。引くのは許可がないときだけ)
+    if let Err(e) = parent_writable(&c, &parent) {
+        return Err(match parent.lookup(&name) {
+            Err(le) if le == -ENOENT => le,
+            _ => e,
+        });
+    }
     sticky_ok(&c, &parent, &name)?;
     // 消えたものへの inotify のため。見張っている人がいるときだけ持っておく (持っていると ext4 は、
     // 消したファイルをまだ使われているものとして orphan のリストに入れ、手を放したときに片づけることになる)
@@ -2395,7 +2401,7 @@ pub fn fchownat(dirfd: i64, pathp: usize, uid: u64, gid: u64, flags: u64) -> R {
         }
         let cwd = proc::current().files().cwd.clone();
         vfs::check_writable(cwd.trim_start_matches('/'))?;
-        return chown(&vfs::resolve("", &cwd, true)?, uid, gid);
+        return chown(&vfs::cwd_inode(&cwd)?, uid, gid);
     }
     writable_at(dirfd, pathp, flags)?;
     lsm_at(PathOp::Chown, dirfd, pathp, flags)?;
@@ -3766,7 +3772,7 @@ pub fn exec_open(dirfd: i64, path: &str, follow: bool) -> Result<(String, InodeR
     let (p, i) = if path.is_empty() {
         if dirfd == AT_FDCWD {
             let cwd = proc::current().files().cwd.clone();
-            (cwd.clone(), vfs::resolve("", &cwd, true)?)
+            (cwd.clone(), vfs::cwd_inode(&cwd)?)
         } else {
             let f = file_of(dirfd as u64)?;
             let b = f.borrow();
