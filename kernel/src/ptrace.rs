@@ -2,6 +2,7 @@
 // 出口、PTRACE_INTERRUPT) と tracee が眠るところは core (signal::ptrace_stop、proc::ptrace_sleep) にあり、ここは tracer の
 // たのみ (つなぐ・離す・続けさせる・メモリとレジスタを読み書き) だけ。main.rs が syscall::register でつなぐ
 use crate::cred;
+use crate::hwdebug::{self, Attr, Ctrl, Ev};
 use crate::proc::{self, Proc};
 use crate::signal::{self, SigInfo, SIGKILL, SIGSTOP};
 use crate::trap::TrapFrame;
@@ -20,6 +21,7 @@ const PTRACE_POKETEXT: u64 = 4;
 const PTRACE_POKEDATA: u64 = 5;
 const PTRACE_CONT: u64 = 7;
 const PTRACE_KILL: u64 = 8;
+const PTRACE_SINGLESTEP: u64 = 9;
 const PTRACE_ATTACH: u64 = 16;
 const PTRACE_DETACH: u64 = 17;
 const PTRACE_SYSCALL: u64 = 24;
@@ -48,6 +50,18 @@ const NT_PRFPREG: u64 = 2;
 const FPREG_SIZE: usize = 32 * 16 + 16;
 /// NT_ARM_SYSTEM_CALL (いまのシステムコールの番号: 4 バイト)
 const NT_ARM_SYSTEM_CALL: u64 = 0x404;
+/// NT_ARM_HW_BREAK と NT_ARM_HW_WATCH (struct user_hwdebug_state: dbg_info、pad、16 の (addr、ctrl、pad): 264 バイト)
+const NT_ARM_HW_BREAK: u64 = 0x402;
+const NT_ARM_HW_WATCH: u64 = 0x403;
+const HW_SIZE: usize = 8 + 16 * hwdebug::MAX;
+const ENOSPC: i64 = 28;
+/// perf の bp_type (HW_BREAKPOINT_R、W、RW、X)
+const HW_R: u8 = 1;
+const HW_W: u8 = 2;
+const HW_RW: u8 = 3;
+const HW_X: u8 = 4;
+/// ユーザーの番地の上 (Linux の TASK_SIZE: VA_BITS 48)
+const TASK_SIZE: u64 = 1 << 48;
 /// AUDIT_ARCH_AARCH64 (PTRACE_GET_SYSCALL_INFO の arch)
 const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
 
@@ -77,17 +91,24 @@ fn may_attach(t: &Proc) -> bool {
 
 /// 自分が tracer で、(state なら) 止まっている tracee (Linux の ptrace_check_attach)。でなければ ESRCH
 fn traced(t: &'static mut Proc, stopped: bool) -> Result<&'static mut Proc, i64> {
-    if t.ptracer != proc::current().tgid || (stopped && (t.pt_status == 0 || t.pt_tf.is_null())) {
+    // 続けさせたら (pt_resume)、tracee がまだ起きていなくてももう止まっていない (Linux の wake_up_state で TASK_TRACED
+    // でなくなる)
+    if t.ptracer != proc::current().tgid || (stopped && (t.pt_status == 0 || t.pt_tf.is_null() || t.pt_resume.is_some())) {
         return Err(-ESRCH);
     }
     Ok(t)
 }
 
-/// 続けさせる (CONT、SYSCALL、DETACH): シグナルは 0〜64 (でなければ EIO)
-fn resume(t: &mut Proc, sig: usize, syscall: bool) -> R {
+/// 続けさせる (CONT、SYSCALL、SINGLESTEP、DETACH): シグナルは 0〜64 (でなければ EIO)。SINGLESTEP は 1 命令ずつに
+/// (はじめてなら SPSR.SS を 1 に: Linux の user_enable_single_step。もう 1 命令ずつなら SS はそのまま)、ほかはやめる
+fn resume(t: &mut Proc, sig: usize, syscall: bool, step: bool) -> R {
     if sig > 64 {
         return Err(-EIO);
     }
+    if step && !t.pt_step {
+        t.tf().spsr |= hwdebug::SPSR_SS;
+    }
+    t.pt_step = step;
     t.pt_syscall = syscall;
     t.pt_resume = Some(sig as i32);
     proc::wakeup(proc::pt_chan(t));
@@ -169,8 +190,9 @@ pub fn ptrace(req: u64, pid: i32, addr: usize, data: usize) -> R {
             }
             Ok(0)
         }
-        PTRACE_CONT => resume(t, data, false),
-        PTRACE_SYSCALL => resume(t, data, true),
+        PTRACE_CONT => resume(t, data, false, false),
+        PTRACE_SYSCALL => resume(t, data, true, false),
+        PTRACE_SINGLESTEP => resume(t, data, false, true),
         PTRACE_DETACH => {
             if data > 64 {
                 return Err(-EIO);
@@ -179,7 +201,7 @@ pub fn ptrace(req: u64, pid: i32, addr: usize, data: usize) -> R {
             t.pt_seized = false;
             t.pt_opts = 0;
             t.sync_cred_work();
-            resume(t, data, false)
+            resume(t, data, false, false)
         }
         PTRACE_SETOPTIONS => {
             if data as u64 & !PTRACE_O_MASK != 0 || data as u64 & PTRACE_O_SUSPEND_SECCOMP != 0 {
@@ -291,6 +313,9 @@ fn syscall_info(t: &mut Proc, size: usize, data: usize) -> R {
 
 /// GETREGSET / SETREGSET (iovec): NT_PRSTATUS だけ (ほかは EINVAL)。iov_len は写した長さに
 fn regset(t: &mut Proc, set: bool, note: u64, iov: usize) -> R {
+    if note == NT_ARM_HW_BREAK || note == NT_ARM_HW_WATCH {
+        return hw_regset(t, set, note == NT_ARM_HW_WATCH, iov);
+    }
     let size = match note {
         NT_PRSTATUS => PRSTATUS_SIZE,
         NT_PRFPREG => FPREG_SIZE,
@@ -349,8 +374,10 @@ fn regset(t: &mut Proc, set: bool, note: u64, iov: usize) -> R {
         }
         tf.sp_el0 = w(31);
         tf.elr = w(32);
-        // pstate は EL0 の印だけ (NZCV など)。モードは変えさせない (Linux の valid_user_regs)
-        tf.spsr = (tf.spsr & !0xf000_0000) | (w(33) & 0xf000_0000);
+        // pstate は EL0 の印だけ (NZCV など)。モードは変えさせない (Linux の valid_user_regs)。SS は 1 命令ずつかで決める
+        // (Linux の user_regs_reset_single_step)
+        let ss = if t.pt_step { hwdebug::SPSR_SS } else { 0 };
+        tf.spsr = (tf.spsr & !(0xf000_0000 | hwdebug::SPSR_SS)) | (w(33) & 0xf000_0000) | ss;
     } else {
         proc::put_user(base, &b[..len])?;
     }
@@ -361,4 +388,143 @@ fn regset(t: &mut Proc, set: bool, note: u64, iov: usize) -> R {
 fn iov_len_set(iov: usize, len: usize) -> R {
     proc::put_user(iov + 8, &(len as u64).to_le_bytes())?;
     Ok(0)
+}
+
+// ---- ハードウェアのブレークポイントとウォッチポイント (Linux の arch/arm64/kernel/ptrace.c の ptrace_hbp_* と
+// hw_break_get / hw_break_set、hw_breakpoint.c の hw_breakpoint_arch_parse)。CPU に載せるのと例外は hwdebug.rs ----
+
+/// attr から CPU の値に (hw_breakpoint_arch_parse): 実行は 4 バイトだけ (ほかの長さは 4 に)、番地は実行 4 バイト・
+/// 読み書き 8 バイトにそろえて長さ (BAS) をずらす。ずらして 8 ビットをはみ出す (見張るバイトが落ちる) か、カーネルの
+/// 番地 (ptrace のものは EL0 だけ) なら EINVAL
+fn hw_parse(a: &Attr) -> Result<(u64, Ctrl), i64> {
+    let ty = match a.ty {
+        HW_X => 0,
+        HW_R => 1,
+        HW_W => 2,
+        HW_RW => 3,
+        _ => return Err(-EINVAL),
+    };
+    let mut len: u8 = match a.len {
+        1..=8 => ((1u16 << a.len) - 1) as u8,
+        _ => return Err(-EINVAL),
+    };
+    if ty == 0 {
+        len = 0xf;
+    }
+    let bytes = len.count_ones() as u64;
+    if a.addr >= TASK_SIZE && a.addr.wrapping_add(bytes).wrapping_sub(1) >= TASK_SIZE {
+        return Err(-EINVAL);
+    }
+    let mask = if ty == 0 { 3 } else { 7 };
+    let off = a.addr & mask;
+    if (len as u32) << off > 0xff {
+        return Err(-EINVAL);
+    }
+    Ok((a.addr & !mask, Ctrl { len: len << off, ty, privilege: 2, enabled: !a.disabled }))
+}
+
+/// ptrace のスロット idx (なければ作る: Linux の ptrace_hbp_create。はじめは番地 0、4 バイト、実行か読み書き、無効)。
+/// 無効なものも数えて、CPU のスロットの数をこえて作ろうとすると ENOSPC (perf の reserve_bp_slot)
+fn hw_event(t: &mut Proc, watch: bool, idx: usize) -> Result<&mut Ev, i64> {
+    let st = t.hwdbg.get_or_insert_with(Default::default);
+    let arr = if watch { &mut st.wch } else { &mut st.brk };
+    if arr[idx].is_none() {
+        if arr.iter().flatten().count() >= hwdebug::slots(watch) {
+            return Err(-ENOSPC);
+        }
+        let attr = Attr { addr: 0, len: 4, ty: if watch { HW_RW } else { HW_X }, disabled: true };
+        let (addr, ctrl) = hw_parse(&attr)?;
+        arr[idx] = Some(Ev { attr, addr, ctrl });
+    }
+    Ok(arr[idx].as_mut().unwrap())
+}
+
+/// attr を入れかえる (modify_user_hw_breakpoint)。まちがっていれば、なにも変えずに
+fn hw_modify(e: &mut Ev, attr: Attr) -> Result<(), i64> {
+    let (addr, ctrl) = hw_parse(&attr)?;
+    *e = Ev { attr, addr, ctrl };
+    Ok(())
+}
+
+/// ctrl をスロットに (ptrace_hbp_set_ctrl と ptrace_hbp_fill_attr_ctrl): 無効なら無効にするだけ。有効なら BAS の
+/// 1 のならび (1〜8 バイト。下の 0 の数だけ番地を進める) と種類 (ブレークポイントは実行、ウォッチポイントは読み書き)。
+/// EL のビットは見ない
+fn hw_set_ctrl(e: &mut Ev, watch: bool, uctrl: u32) -> Result<(), i64> {
+    let mut attr = e.attr;
+    attr.disabled = uctrl & 1 == 0;
+    if !attr.disabled {
+        let bas = (uctrl >> 5) & 0xff;
+        let ty = match (uctrl >> 3) & 3 {
+            0 => HW_X,
+            1 => HW_R,
+            2 => HW_W,
+            _ => HW_RW,
+        };
+        if bas == 0 {
+            return Err(-EINVAL);
+        }
+        let off = bas.trailing_zeros();
+        let run = bas >> off;
+        if run & (run + 1) != 0 {
+            return Err(-EINVAL);
+        }
+        if (ty == HW_X) == watch {
+            return Err(-EINVAL);
+        }
+        attr.len = run.count_ones() as u8;
+        attr.ty = ty;
+        attr.addr = attr.addr.wrapping_add(off as u64);
+    }
+    hw_modify(e, attr)
+}
+
+/// GETREGSET / SETREGSET の NT_ARM_HW_BREAK と NT_ARM_HW_WATCH。iov_len は 4 の倍 (でなければ EINVAL) で 264 まで。
+/// 読みは dbg_info (デバッグの版 << 8 | スロットの数) と 16 のスロット (ないものは 0)。書きは dbg_info を飛ばし、
+/// スロットごとに番地、それから ctrl (どちらも入れたところまで。番地の途中で終われば EINVAL、まちがいのところで
+/// やめる。前のスロットは書いたまま)
+fn hw_regset(t: &mut Proc, set: bool, watch: bool, iov: usize) -> R {
+    let mut v = [0u8; 16];
+    proc::current().pt().copy_in(&mut v, iov).ok_or(-EFAULT)?;
+    let base = u64::from_le_bytes(v[..8].try_into().unwrap()) as usize;
+    let len = u64::from_le_bytes(v[8..].try_into().unwrap()) as usize;
+    if len % 4 != 0 {
+        return Err(-EINVAL);
+    }
+    let len = len.min(HW_SIZE);
+    let mut b = [0u8; HW_SIZE];
+    if !set {
+        b[0..4].copy_from_slice(&(hwdebug::arch() << 8 | hwdebug::slots(watch) as u32).to_le_bytes());
+        if let Some(st) = t.hwdbg.as_deref() {
+            for (i, e) in (if watch { &st.wch } else { &st.brk }).iter().enumerate() {
+                if let Some(e) = e {
+                    b[8 + i * 16..16 + i * 16].copy_from_slice(&e.addr.to_le_bytes());
+                    b[16 + i * 16..20 + i * 16].copy_from_slice(&e.ctrl.encode().to_le_bytes());
+                }
+            }
+        }
+        proc::put_user(base, &b[..len])?;
+        return iov_len_set(iov, len);
+    }
+    proc::current().pt().copy_in(&mut b[..len], base).ok_or(-EFAULT)?;
+    let mut off = 8;
+    let mut idx = 0;
+    while off < len {
+        if len - off < 8 {
+            return Err(-EINVAL);
+        }
+        let addr = u64::from_le_bytes(b[off..off + 8].try_into().unwrap());
+        let e = hw_event(t, watch, idx)?;
+        let mut attr = e.attr;
+        attr.addr = addr;
+        hw_modify(e, attr)?;
+        off += 8;
+        if off >= len {
+            break;
+        }
+        let ctrl = u32::from_le_bytes(b[off..off + 4].try_into().unwrap());
+        hw_set_ctrl(hw_event(t, watch, idx)?, watch, ctrl)?;
+        off += 8;
+        idx += 1;
+    }
+    iov_len_set(iov, len)
 }

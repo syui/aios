@@ -55,6 +55,7 @@ mod fs;
 mod futex;
 mod irq;
 mod heap;
+mod hwdebug;
 mod tlsf;
 mod mem;
 mod initrd;

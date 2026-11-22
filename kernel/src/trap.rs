@@ -339,8 +339,7 @@ const EC_BRK64: u64 = 0x3c;
 const EC_PC_ALIGN: u64 = 0x22;
 const EC_SP_ALIGN: u64 = 0x26;
 const EC_FP: u64 = 0x2c;
-const EC_BREAKPT_LOW: u64 = 0x30;
-const EC_SOFTSTP_LOW: u64 = 0x32;
+use crate::hwdebug::{EC_BREAKPT_LOW, EC_SOFTSTP_LOW, EC_WATCHPT_LOW};
 
 /// この CPU のベクタ (VBAR_EL1) を置く。Spectre-BHB の手当てのあるものは cpuvuln.rs が起動のときに選ぶ (選んだあとに
 /// もう 1 度呼ぶ。ほかの CPU は起きるときに)
@@ -366,6 +365,8 @@ pub fn init() {
             in(reg) v,
         );
     }
+    // デバッグの仕組み (OS lock を外す、MDSCR)
+    crate::hwdebug::init_cpu();
 }
 
 /// 例外の理由。1 つの例外で 1 度だけ読んで渡す (QEMU の TCG では ESR_EL1 / FAR_EL1 を読むたびに、HCR_EL2 の
@@ -410,6 +411,7 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
         let hit = match (kind, esr >> 26) {
             (EL0_SYNC, EC_IABT_LOW) => kernel(far()),
             (EL0_SYNC, EC_PC_ALIGN | EC_BREAKPT_LOW | EC_SOFTSTP_LOW) => kernel(tf.elr),
+            (EL0_SYNC, EC_WATCHPT_LOW) => false,
             (EL0_SYNC, _) => false,
             _ => kernel(tf.elr),
         };
@@ -574,7 +576,11 @@ fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>, esr: u64) {
                     if let Some((ev, msg)) = proc::current().pt_event.take() {
                         signal::ptrace_event(ev, msg);
                     }
-                    if proc::current().pt_syscall {
+                    // 1 命令ずつのときは、出口の止まりのかわりに疑似のステップ (Linux の report_syscall の
+                    // user_single_step_report: SI_USER の SIGTRAP。svc で SPSR.SS は 0 なので、次の SINGLESTEP は走る前に止まる)
+                    if proc::current().pt_step {
+                        signal::force(signal::SIGTRAP, signal::SigInfo::ZERO);
+                    } else if proc::current().pt_syscall {
                         signal::ptrace_syscall(tf, false);
                     }
                     // 書き出しが追いつかないほど書いた: 書き出しのスレッドを待つ
@@ -587,6 +593,14 @@ fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>, esr: u64) {
                     }
                     proc::check_killed();
                     signal::deliver(tf, intr);
+                }
+                // ブレークポイント、1 命令ずつ、ウォッチポイント (hwdebug.rs): SIGTRAP (TRAP_HWBKPT、TRAP_TRACE)
+                ec @ (EC_BREAKPT_LOW | EC_SOFTSTP_LOW | EC_WATCHPT_LOW) => {
+                    if let Some((code, addr)) = crate::hwdebug::exception(tf, ec, esr, far()) {
+                        signal::force(signal::SIGTRAP, signal::SigInfo { code, addr, ..signal::SigInfo::ZERO });
+                    }
+                    proc::check_killed();
+                    signal::deliver(tf, None);
                 }
                 ec => {
                     let far = far();

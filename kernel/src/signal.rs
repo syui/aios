@@ -649,10 +649,19 @@ fn siginfo_bytes(sig: i32, i: &SigInfo) -> [u8; FRAME_INFO] {
     let mut b = [0u8; FRAME_INFO];
     put(&mut b, 0, &sig.to_le_bytes());
     put(&mut b, 8, &i.code.to_le_bytes());
+    // 形は si_code で (Linux の siginfo_layout): カーネルの出すもの (0 < code < SI_KERNEL) はシグナルごと、kill や
+    // sigqueue で送られたものは pid と uid (と値)
+    let kernel = i.code > SI_USER && i.code < SI_KERNEL;
     match sig {
-        SIGSEGV | SIGBUS | SIGILL | SIGFPE | SIGTRAP => put(&mut b, 16, &i.addr.to_le_bytes()),
+        // フォルトの番地。Linux の siginfo は共用体で、ptrace の知らせ (si_code が SIGTRAP の 5 など) は同じところに
+        // si_pid と si_uid を書く: 番地がなくて pid があればそちら
+        SIGSEGV | SIGBUS | SIGILL | SIGFPE | SIGTRAP if kernel && (i.addr != 0 || i.pid == 0) => put(&mut b, 16, &i.addr.to_le_bytes()),
+        SIGSEGV | SIGBUS | SIGILL | SIGFPE | SIGTRAP if kernel => {
+            put(&mut b, 16, &crate::ns::local_or_0(i.pid).to_le_bytes());
+            put(&mut b, 20, &i.uid.to_le_bytes());
+        }
         // seccomp の TRAP: si_errno、si_call_addr、si_syscall、si_arch
-        SIGSYS => {
+        SIGSYS if kernel => {
             put(&mut b, 4, &i.timerid.to_le_bytes());
             put(&mut b, 16, &i.addr.to_le_bytes());
             put(&mut b, 24, &i.status.to_le_bytes());
@@ -874,6 +883,13 @@ fn deliver_now(tf: &mut TrapFrame, interrupted: Option<Restart>) {
                     proc::die(SIGSEGV);
                 }
                 handled = true;
+                // 1 命令ずつ進めているなら、ハンドラの 1 命令目で止まる (Linux の signal_setup_done の ptrace_notify(SIGTRAP):
+                // si_code は SIGTRAP)
+                if p.pt_step && p.ptracer != 0 {
+                    let info = SigInfo { code: SIGTRAP, pid: p.pid, uid: crate::ns::show_uid(p.cred.uid), ..SigInfo::ZERO };
+                    ptrace_stop(tf, SIGTRAP << 8 | 0x7f, SIGTRAP, info);
+                    proc::check_killed();
+                }
                 break;
             }
         }
@@ -889,6 +905,8 @@ fn deliver_now(tf: &mut TrapFrame, interrupted: Option<Restart>) {
         if let Some(r) = interrupted {
             if r.restartable {
                 restart(p, tf);
+                // svc をもう一度: 1 命令ずつなら SPSR.SS を 1 に (Linux の do_signal の user_rewind_single_step)
+                crate::hwdebug::rewind(p, tf);
             }
         }
     }
@@ -943,7 +961,7 @@ fn traced_stop(tf: &mut TrapFrame, sig: i32) {
         let stopped = proc::find_leader(p.tgid).is_some_and(|l| l.stopped);
         let s = if p.pt_seized && !stopped { SIGTRAP } else { sig };
         let code = if p.pt_seized { s | PTRACE_EVENT_STOP << 8 } else { s };
-        let info = SigInfo { code, pid: crate::ns::local_or_0(p.tgid), uid: crate::ns::show_uid(p.cred.uid), ..SigInfo::ZERO };
+        let info = SigInfo { code, pid: p.pid, uid: crate::ns::show_uid(p.cred.uid), ..SigInfo::ZERO };
         p.pt_listen = false;
         ptrace_stop(tf, code << 8 | 0x7f, s, info);
         proc::check_killed();
@@ -959,15 +977,17 @@ pub fn siginfo_from(b: &[u8; 128]) -> (i32, SigInfo) {
     let u64_at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
     let sig = i32_at(0);
     let mut i = SigInfo { code: i32_at(8), ..SigInfo::ZERO };
+    let kernel = i.code > SI_USER && i.code < SI_KERNEL;
+    let pid = |o: usize| crate::ns::to_global(i32_at(o) as u32).unwrap_or(0);
     match sig {
-        SIGSEGV | SIGBUS | SIGILL | SIGFPE | SIGTRAP => i.addr = u64_at(16),
-        SIGSYS => {
+        SIGSEGV | SIGBUS | SIGILL | SIGFPE | SIGTRAP if kernel => i.addr = u64_at(16),
+        SIGSYS if kernel => {
             i.timerid = i32_at(4);
             i.addr = u64_at(16);
             i.status = i32_at(24);
         }
         SIGCHLD => {
-            i.pid = i32_at(16) as u32;
+            i.pid = pid(16);
             i.uid = i32_at(20) as u32;
             i.status = i32_at(24);
         }
@@ -976,7 +996,7 @@ pub fn siginfo_from(b: &[u8; 128]) -> (i32, SigInfo) {
             i.value = u64_at(24);
         }
         _ => {
-            i.pid = i32_at(16) as u32;
+            i.pid = pid(16);
             i.uid = i32_at(20) as u32;
             i.value = u64_at(24);
         }
@@ -993,7 +1013,8 @@ pub fn ptrace_syscall(tf: &mut TrapFrame, entry: bool) {
         return;
     }
     let sig = SIGTRAP | if p.pt_opts & PTRACE_O_TRACESYSGOOD != 0 { 0x80 } else { 0 };
-    let ns = ptrace_stop_kind(tf, sig << 8 | 0x7f, SIGTRAP, SigInfo { code: sig, ..SigInfo::ZERO }, if entry { 1 } else { 2 });
+    let info = SigInfo { code: sig, pid: p.pid, uid: crate::ns::show_uid(p.cred.uid), ..SigInfo::ZERO };
+    let ns = ptrace_stop_kind(tf, sig << 8 | 0x7f, SIGTRAP, info, if entry { 1 } else { 2 });
     proc::check_killed();
     if ns != 0 {
         let p = proc::current();
@@ -1011,7 +1032,9 @@ pub fn ptrace_event(event: i32, msg: u64) {
     p.pt_msg = msg;
     let code = event << 8 | SIGTRAP;
     let tf = p.tf() as *mut TrapFrame;
-    ptrace_stop(unsafe { &mut *tf }, code << 8 | 0x7f, SIGTRAP, SigInfo { code, ..SigInfo::ZERO });
+    // si_pid と si_uid は止まったスレッドの (Linux の ptrace_do_notify)
+    let info = SigInfo { code, pid: p.pid, uid: crate::ns::show_uid(p.cred.uid), ..SigInfo::ZERO };
+    ptrace_stop(unsafe { &mut *tf }, code << 8 | 0x7f, SIGTRAP, info);
 }
 
 /// siginfo_t (128 バイト) を、ptrace の PTRACE_GETSIGINFO に

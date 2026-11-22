@@ -865,7 +865,31 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   do_jobctl_trap: SEIZE なら PTRACE_EVENT_STOP で、グループがもう動いていれば SIGTRAP。でなければシグナルの番号で) し、
   tracer が続けさせたら走る。LISTEN (SEIZE したものの PTRACE_EVENT_STOP の止まりだけ、でなければ EIO) は止まったまま
   SIGCONT を待ち、来たらまた PTRACE_EVENT_STOP で知らせる。PTRACE_O_SUSPEND_SECCOMP は CHECKPOINT_RESTORE のない
-  Linux (手本) と同じ EINVAL。のこりは todo.json の syscall-gaps
+  Linux (手本) と同じ EINVAL。
+  test/ptrace4.c (Linux 7.4-rc3 と 10 行同じ。手本の Linux に PERF_EVENTS を足した: HAVE_HW_BREAKPOINT はそれが選ぶ):
+  ハードウェアのもの。arm64 のデバッグの仕組みは core の hwdebug.rs (Linux の debug-monitors.c と hw_breakpoint.c の
+  レジスタと例外: 起動で OS lock を外す、スレッドの切りかえで MDSCR_EL1 の SS と MDE と、有効なブレークポイント /
+  ウォッチポイントを前から詰めて CPU に載せ、前のスレッドの残りは消す)、tracer の口と検査は ptrace.rs。
+  PTRACE_SINGLESTEP (pt_step: はじめてなら SPSR.SS を 1 に。1 命令ごとに SIGTRAP の TRAP_TRACE、si_addr は次の pc、
+  また SS を 1 に戻す)。svc を 1 命令進めると、システムコールの出口で疑似のステップ (SI_USER の SIGTRAP、pid 0: Linux の
+  report_syscall の user_single_step_report) で、svc で SPSR.SS は 0 なので次の SINGLESTEP は走る前に同じ pc で止まる
+  (Linux と同じく +28 で 2 回)。シグナルをつけて SINGLESTEP すると、ハンドラの 1 命令目で止まる (si_code は SIGTRAP、
+  si_pid はそのスレッド: Linux の signal_setup_done の ptrace_notify)。CONT ほかで 1 命令ずつをやめ、SETREGSET の
+  pstate の SS は 1 命令ずつかで決める。NT_ARM_HW_BREAK と NT_ARM_HW_WATCH (GETREGSET / SETREGSET: dbg_info は
+  ID_AA64DFR0_EL1 の DebugVer << 8 | スロットの数 (cortex-a72 は 6 と 4)、16 のスロットの番地と ctrl)。Linux の
+  perf のふるまいのとおり: 書きは番地、それから ctrl の順で、はじめて書くスロットは無効のまま作り (4 バイト、実行か
+  読み書き)、無効なものも数えてスロットの数をこえると ENOSPC。ctrl は BAS の 1 のならび (1〜8 バイト。下の 0 の数だけ
+  番地を進める) と種類 (ブレークポイントは実行だけ、ウォッチポイントは読み書きだけ、でなければ EINVAL。EL のビットは
+  見ない)。番地は実行は 4、読み書きは 8 バイトにそろえて BAS をずらし (読みかえすとそろえた番地とずらした BAS)、
+  ずらして 8 ビットをはみ出すと EINVAL (Linux 7.4 で入った検査: 前の長さのまま番地を変えても)、カーネルの番地は
+  EINVAL。iov_len は 4 の倍 (でなければ EINVAL)。当たると SIGTRAP の TRAP_HWBKPT (si_addr はブレークポイントなら pc、
+  ウォッチポイントなら FAR。ウォッチポイントは読み書きの種類が合って見張るバイトにかかるもの、なければいちばん近い
+  もの)。ウォッチポイントは書く前に止まる。ptrace のものは自分で越えない (消して 1 命令進めるのは tracer)。fork した
+  子にはわたさず、exec で消える。あわせて: CONT などで続けさせたら、tracee がまだ起きていなくても止まっていないものと
+  して ESRCH (Linux の wake_up_state)。siginfo の形を si_code で決める (Linux の siginfo_layout: kill で送った
+  SIGSEGV などは si_addr でなく si_pid と si_uid。カーネルの SIGTRAP でも番地がなく pid があればそちら: 共用体)、
+  ptrace の知らせの止まり (PTRACE_EVENT_*、システムコールの入口と出口、グループの止まり) の si_pid と si_uid も
+  Linux の ptrace_do_notify と同じく入れる。のこりは todo.json の syscall-gaps
 - atime (test/atime.c、root で ext4 と tmpfs とマウントの印で Linux と 5 行同じ): 前は持たなかった (stat の atime は mtime、
   utimensat の atime は捨てていた)。いまは ext4 は inode の i_atime (秒)、tmpfs は自分の属性に持ち、stat と statx に出す。
   utimensat は atime も決め、ctime をいまに (Linux の notify_change。前は ctime を変えなかった)。読んだら (read、pread、

@@ -631,6 +631,10 @@ pub struct Proc {
     /// PTRACE_LISTEN: グループの止まりのまま SIGCONT を待っている。来たら pt_retrap を立てて起こす (また知らせる)
     pub pt_listen: bool,
     pub pt_retrap: bool,
+    /// PTRACE_SINGLESTEP: 1 命令ずつ (Linux の TIF_SINGLESTEP。hwdebug.rs が MDSCR_EL1.SS を立てる)
+    pub pt_step: bool,
+    /// ハードウェアのブレークポイントとウォッチポイント (ptrace の NT_ARM_HW_BREAK / WATCH。fork でわたさず exec で消す)
+    pub hwdbg: Option<alloc::boxed::Box<crate::hwdebug::State>>,
     /// ptrace で止まっている: wait に知らせる status (0 は止まっていない)、もう知らせたか、そのときの siginfo (番号と中身)、
     /// ユーザーのレジスタ (止まっているあいだだけ: tracee のカーネルのスタックの上)、tracer が続けさせたとき入れるシグナル
     pub pt_status: i32,
@@ -824,6 +828,8 @@ impl Proc {
         pt_scno: None,
         pt_listen: false,
         pt_retrap: false,
+        pt_step: false,
+        hwdbg: None,
         execed: false,
         utime: 0,
         cpu_ns: 0,
@@ -1944,6 +1950,10 @@ pub fn scheduler() -> ! {
                     crate::cpuvuln::task_spsr(&mut p.tf().spsr, ssb);
                 }
                 core::arch::asm!("msr tpidr_el0, {}", in(reg) p.tpidr);
+                // 1 命令ずつとハードウェアのブレークポイント (Linux の hw_breakpoint_thread_switch)
+                if !p.kthread {
+                    crate::hwdebug::switch_in(p);
+                }
                 crate::smp::dev_wait(2, t0);
                 // 切りかえはいつもカーネルの中なので、走りはじめはカーネルの時間から
                 let t = crate::timer::uptime_ns().max(1);
@@ -2745,6 +2755,8 @@ fn finish_exec(p: &mut Proc, img: Image, comm: &str) {
     crate::futex::exit_robust_list();
     let old = p.mm.take();
     p.load_image(img);
+    // ハードウェアのブレークポイントとウォッチポイントは消える (Linux の flush_thread の flush_ptrace_hw_breakpoint)
+    p.hwdbg = None;
     // 前のアドレス空間から受けつぐ印: PR_SET_THP_DISABLE (MMF_DISABLE_THP) と coredump_filter (Linux の mmf_init_flags。
     // 前は load_image が外したあとの self.mm を見ていて、どちらも exec で既定にもどっていた)
     if let Some(o) = old.as_ref() {
@@ -3118,6 +3130,7 @@ fn ptrace_exit(tgid: u32) {
         t.pt_seized = false;
         t.pt_syscall = false;
         t.pt_interrupt = false;
+        t.pt_step = false;
         t.sync_cred_work();
         wakeup(pt_chan(t));
     }
