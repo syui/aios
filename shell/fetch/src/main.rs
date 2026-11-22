@@ -2,19 +2,21 @@
 //   fetch  url (か file) の中身。path で一部、fields で配列の 1 つずつを 1 行 (name=x  status=y) に
 // curl | python3 -c 'import json ...' のかわり (aish --mcp で Claude が使う。GitHub の API、PDS のレコードなど)。
 // 取ってくるのは curl (aios にも開発のマシンにもある。プロキシの設定も curl のもの)
-use aish_plugin::{Spec, Tool, Value, error, json, s};
+use aish_plugin::Ty::*;
+use aish_plugin::{Arg, Spec, Tool, Value, arg, error, json, s};
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-const FETCH: &str = r#"{"type":"object","properties":{
-"url":{"type":"string","description":"取ってくるもの (https://... file://... など curl が読めるもの)"},
-"file":{"type":"string","description":"url のかわりに、手元のファイル (JSON なら path と fields も効く)"},
-"path":{"type":"string","description":"JSON の取り出し (jq に似た形): .a.b[0].c、.items[].name (配列のみな)、.a[-1] (うしろから)。なければ全部"},
-"fields":{"type":"array","items":{"type":"string"},"description":"path の答え (配列ならその 1 つずつ) を 1 行に: [\"name\",\"status\",\"head_commit.message\"] → name=x  status=y  head_commit.message=z"},
-"method":{"type":"string","description":"GET (既定)、POST、PUT、DELETE など"},
-"body":{"type":"string","description":"送るもの (POST など。JSON なら Content-Type も JSON に)"},
-"headers":{"type":"object","description":"足すヘッダー ({\"Accept\": \"application/json\"})"},
-"timeout_ms":{"type":"integer","description":"これを過ぎたらやめる (既定 30000、50000 まで)"}}}"#;
+const FETCH: &[Arg] = &[
+    arg("url", Str, "取ってくるもの (https://... file://... など curl が読めるもの)"),
+    arg("file", Str, "url のかわりに、手元のファイル (JSON なら path と fields も効く)"),
+    arg("path", Str, "JSON の取り出し (jq に似た形): .a.b[0].c、.items[].name (配列のみな)、.a[-1] (うしろから)。なければ全部"),
+    arg("fields", Strs, r#"path の答え (配列ならその 1 つずつ) を 1 行に: ["name","status","head_commit.message"] → name=x  status=y  head_commit.message=z"#),
+    arg("method", Str, "GET (既定)、POST、PUT、DELETE など"),
+    arg("body", Str, "送るもの (POST など。JSON なら Content-Type も JSON に)"),
+    arg("headers", Obj, r#"足すヘッダー ({"Accept": "application/json"})"#),
+    arg("timeout_ms", Int, "これを過ぎたらやめる (既定 30000、50000 まで)"),
+];
 
 /// 答えの text はここまで (長ければ切って、path や fields でしぼるように言う)
 const MAX_TEXT: usize = 16_000;
@@ -27,7 +29,7 @@ fn main() {
         tools: &[Tool {
             name: "fetch",
             desc: "url (か file) の中身を取ってくる (curl)。JSON なら path (.a.b[0].c、.items[].name) で取り出し、fields で配列の 1 つずつを 1 行 (name=x  status=y) に。{status, type, text}。curl | python3 -c json のかわり",
-            input: FETCH,
+            args: FETCH,
         }],
     };
     aish_plugin::run(spec, |ev, v| match ev {

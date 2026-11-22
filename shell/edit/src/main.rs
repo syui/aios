@@ -11,19 +11,88 @@
 // grep の答えは、よく使うファイル (aish-pick の paths) のものが先で、見つけた行に番号 n がつく
 // aish --mcp で Claude が使う。取り消すための写しはこのプログラムのメモリーにだけ持つ
 // (ディスクに書かないので、リポジトリやイメージに入ることはない。aish が終わると消える)
-use aish_plugin::{Spec, Tool, Value, error, json, s};
+use aish_plugin::Ty::*;
+use aish_plugin::{Arg, Spec, Tool, Value, arg, error, json, s};
 use std::path::{Path, PathBuf};
 
-const READ: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"ファイル (ディレクトリなら中の名前の一覧)"},"paths":{"type":"array","items":{"type":"string"},"description":"いくつものファイルをまとめて (path のかわりに)。\"a.rs\" \"b.rs:10-40\" \"c.rs:100-\" のように行の範囲も。{files: [...]}"},"offset":{"type":"integer","description":"何行目から (1 から。既定 1)"},"limit":{"type":"integer","description":"何行 (既定 2000)"}}}"#;
-const EDIT: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"書きかえるファイル (edits の中の path で、いくつものファイルを 1 回で)"},"old":{"type":"string","description":"置きかえるもの (ファイルにぴったり 1 つあること)"},"new":{"type":"string","description":"かわりに入れるもの (空なら消す)"},"all":{"type":"boolean","description":"いくつもあれば全部 (既定 false)"},"edits":{"type":"array","items":{"type":"object","properties":{"old":{"type":"string"},"new":{"type":"string"},"all":{"type":"boolean"},"path":{"type":"string","description":"このファイルに (既定: 外の path)"}},"required":["old","new"]},"description":"いくつも置きかえるとき (old new のかわりに)。順にあて、どれかがしくじれば何も書かない。path でいくつものファイルをいっしょに (これもぜんぶか、なにもしないか)"}}}"#;
-const WRITE: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"書くファイル (なければ作る。上のディレクトリも。あれば中身をみな入れかえる)"},"content":{"type":"string","description":"中身 (みな)"}},"required":["path","content"]}"#;
-const GREP: &str = r#"{"type":"object","properties":{"pattern":{"type":"string","description":"探す文字 (そのまま。何もなく、正規表現の形なら正規表現として探しなおし、as_regex に書く)"},"path":{"type":"string","description":"ファイルかディレクトリ (既定 .。ディレクトリなら下をぜんぶ。rg があれば .gitignore と隠しファイルとバイナリをのぞく。なければ . で始まるもの、target、node_modules、バイナリをのぞく)"},"glob":{"type":"array","items":{"type":"string"},"description":"rg の -g (例: [\"*.rs\", \"!target\"])。rg が要る"},"hidden":{"type":"boolean","description":"隠しファイルも (rg の --hidden)"},"regex":{"type":"boolean","description":"pattern を正規表現として (既定 false: そのままの文字)"},"i":{"type":"boolean","description":"大文字小文字を区別しない"},"word":{"type":"boolean","description":"単語ぴったり (tool で tools や tool_once を拾わない)"},"context":{"type":"integer","description":"前後の行もいくつ (ctx: true で入る)"},"limit":{"type":"integer","description":"見つけるのはいくつまで (既定 200)"}},"required":["pattern"]}"#;
-const SED: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"書きかえるファイル (いくつも書くなら subs で組を)"},"pattern":{"type":"string","description":"置きかえるもの (regex でなければそのままの文字)"},"replace":{"type":"string","description":"正規表現なら $1 ${name} が使える"},"regex":{"type":"boolean","description":"既定 false: そのままの文字"},"i":{"type":"boolean","description":"大文字と小文字を分けない"},"word":{"type":"boolean","description":"単語ぴったり (tool で tools や tool_once を拾わない)"},"lines":{"type":"string","description":"行の範囲: \"12\" \"10-20\" \"10-\" (なければ全部)"},"count":{"type":"integer","description":"置きかえる数がこれでなければ、何もせずにしくじる (思ったところだけ変えるために)"},"subs":{"type":"array","items":{"type":"object","properties":{"pattern":{"type":"string"},"replace":{"type":"string"},"regex":{"type":"boolean"},"i":{"type":"boolean"}},"required":["pattern","replace"]},"description":"いくつも置きかえるとき (pattern replace のかわりに)。行ごとに順にあてる"}},"required":["path"]}"#;
-const LINES: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"書きかえるファイル"},"from":{"type":"integer","description":"何行目から (1 から)"},"to":{"type":"integer","description":"何行目まで (既定 from)"},"text":{"type":"string","description":"かわりに入れる行 (なければ消す)"},"insert":{"type":"boolean","description":"消さずに from の前に入れる (from が 行の数 + 1 なら終わりに足す)"},"old":{"type":"string","description":"from から to までのいまの中身 (改行でつなぐ)。違えば何もせずにしくじる"}},"required":["path","from"]}"#;
-const UNDO: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"このファイルの最後の変更を戻す (なければ、いちばん新しい変更)"}}}"#;
+const READ: &[Arg] = &[
+    arg("path", Str, "ファイル (ディレクトリなら中の名前の一覧)"),
+    arg("paths", Strs, r#"いくつものファイルをまとめて (path のかわりに)。"a.rs" "b.rs:10-40" "c.rs:100-" のように行の範囲も。{files: [...]}"#),
+    arg("offset", Int, "何行目から (1 から。既定 1)"),
+    arg("limit", Int, "何行 (既定 2000)"),
+];
+/// edits の 1 つ
+const EDIT_ONE: &[Arg] = &[
+    arg("old", Str, "置きかえるもの (ファイルにぴったり 1 つあること)").req(),
+    arg("new", Str, "かわりに入れるもの (空なら消す)").req(),
+    arg("all", Bool, "いくつもあれば全部 (既定 false)"),
+    arg("path", Str, "このファイルに (既定: 外の path)"),
+];
+/// subs の 1 組 (sed と each)
+const SUB: &[Arg] = &[
+    arg("pattern", Str, "置きかえるもの (regex でなければそのままの文字)").req(),
+    arg("replace", Str, "かわりに入れるもの (正規表現なら $1 ${name} が使える)").req(),
+    arg("regex", Bool, "pattern を正規表現として (既定 false)"),
+    arg("i", Bool, "大文字と小文字を分けない"),
+];
+const EDIT: &[Arg] = &[
+    arg("path", Str, "書きかえるファイル (edits の中の path で、いくつものファイルを 1 回で)"),
+    arg("old", Str, "置きかえるもの (ファイルにぴったり 1 つあること)"),
+    arg("new", Str, "かわりに入れるもの (空なら消す)"),
+    arg("all", Bool, "いくつもあれば全部 (既定 false)"),
+    arg("edits", Objs(EDIT_ONE), "いくつも置きかえるとき (old new のかわりに)。順にあて、どれかがしくじれば何も書かない。path でいくつものファイルをいっしょに (これもぜんぶか、なにもしないか)"),
+];
+const WRITE: &[Arg] = &[
+    arg("path", Str, "書くファイル (なければ作る。上のディレクトリも。あれば中身をみな入れかえる)").req(),
+    arg("content", Str, "中身 (みな)").req(),
+];
+const GREP: &[Arg] = &[
+    arg("pattern", Str, "探す文字 (そのまま。何もなく、正規表現の形なら正規表現として探しなおし、as_regex に書く)").req(),
+    arg("path", Str, "ファイルかディレクトリ (既定 .。ディレクトリなら下をぜんぶ。rg があれば .gitignore と隠しファイルとバイナリをのぞく。なければ . で始まるもの、target、node_modules、バイナリをのぞく)"),
+    arg("glob", Strs, r#"rg の -g (例: ["*.rs", "!target"])。rg が要る"#),
+    arg("hidden", Bool, "隠しファイルも (rg の --hidden)"),
+    arg("regex", Bool, "pattern を正規表現として (既定 false: そのままの文字)"),
+    arg("i", Bool, "大文字小文字を区別しない"),
+    arg("word", Bool, "単語ぴったり (tool で tools や tool_once を拾わない)"),
+    arg("context", Int, "前後の行もいくつ (ctx: true で入る)"),
+    arg("limit", Int, "見つけるのはいくつまで (既定 200)"),
+];
+const SED: &[Arg] = &[
+    arg("path", Str, "書きかえるファイル (いくつも書くなら subs で組を)").req(),
+    arg("pattern", Str, "置きかえるもの (regex でなければそのままの文字)"),
+    arg("replace", Str, "正規表現なら $1 ${name} が使える"),
+    arg("regex", Bool, "既定 false: そのままの文字"),
+    arg("i", Bool, "大文字と小文字を分けない"),
+    arg("word", Bool, "単語ぴったり (tool で tools や tool_once を拾わない)"),
+    arg("lines", Str, r#"行の範囲: "12" "10-20" "10-" (なければ全部)"#),
+    arg("count", Int, "置きかえる数がこれでなければ、何もせずにしくじる (思ったところだけ変えるために)"),
+    arg("subs", Objs(SUB), "いくつも置きかえるとき (pattern replace のかわりに)。行ごとに順にあてる"),
+];
+const LINES: &[Arg] = &[
+    arg("path", Str, "書きかえるファイル").req(),
+    arg("from", Int, "何行目から (1 から)").req(),
+    arg("to", Int, "何行目まで (既定 from)"),
+    arg("text", Str, "かわりに入れる行 (なければ消す)"),
+    arg("insert", Bool, "消さずに from の前に入れる (from が 行の数 + 1 なら終わりに足す)"),
+    arg("old", Str, "from から to までのいまの中身 (改行でつなぐ)。違えば何もせずにしくじる"),
+];
+const UNDO: &[Arg] = &[
+    arg("path", Str, "このファイルの最後の変更を戻す (なければ、いちばん新しい変更)"),
+];
 
-const HIT: &str = r#"{"type":"object","properties":{"n":{"type":"integer","description":"grep の答えの n"},"context":{"type":"integer","description":"前後の行 (既定 5)"}},"required":["n"]}"#;
-const EACH: &str = r#"{"type":"object","properties":{"pattern":{"type":"string","description":"置きかえるもの (前の grep で見つけた行の中で。regex でなければそのままの文字)"},"replace":{"type":"string","description":"正規表現なら $1 が使える"},"regex":{"type":"boolean","description":"pattern を正規表現として (既定 false)"},"i":{"type":"boolean","description":"大文字と小文字を分けない"},"word":{"type":"boolean","description":"単語ぴったり (tool で tools や tool_once を拾わない)"},"only":{"type":"array","items":{"type":"integer"},"description":"この番号 (grep の n) だけ (なければ全部)"},"subs":{"type":"array","items":{"type":"object","properties":{"pattern":{"type":"string"},"replace":{"type":"string"},"regex":{"type":"boolean"},"i":{"type":"boolean"}},"required":["pattern","replace"]},"description":"いくつも置きかえるとき (pattern replace のかわりに)。行ごとに順にあてる"}}}"#;
+const HIT: &[Arg] = &[
+    arg("n", Int, "grep の答えの n").req(),
+    arg("context", Int, "前後の行 (既定 5)"),
+];
+const EACH: &[Arg] = &[
+    arg("pattern", Str, "置きかえるもの (前の grep で見つけた行の中で。regex でなければそのままの文字)"),
+    arg("replace", Str, "正規表現なら $1 が使える"),
+    arg("regex", Bool, "pattern を正規表現として (既定 false)"),
+    arg("i", Bool, "大文字と小文字を分けない"),
+    arg("word", Bool, "単語ぴったり (tool で tools や tool_once を拾わない)"),
+    arg("only", Ints, "この番号 (grep の n) だけ (なければ全部)"),
+    arg("subs", Objs(SUB), "いくつも置きかえるとき (pattern replace のかわりに)。行ごとに順にあてる"),
+];
 
 /// 取り消すための写しの数
 const KEEP: usize = 100;
@@ -57,15 +126,15 @@ fn main() {
         hooks: &[],
         keys: &[],
         tools: &[
-            Tool { name: "read", desc: "ファイルを行の番号つきで読む。{path, lines (全部の行数), text}。paths でいくつもまとめて ({files: [...]}、\"a.rs:10-40\" で行の範囲)。ディレクトリなら {dir: true, entries}", input: READ },
-            Tool { name: "edit", desc: "ファイルの old をぴったり new に置きかえる。old が見つからないか、いくつもある (all でない) ならしくじる。edits に path をつけるといくつものファイルを 1 回で ({files: [...]})。undo で戻せる (1 回でみな)", input: EDIT },
-            Tool { name: "write", desc: "ファイルをまるごと書く (なければディレクトリごと作る)。undo で戻せる", input: WRITE },
-            Tool { name: "grep", desc: "ファイルかディレクトリの下から行の番号つきで探す (ripgrep があればそれで)。{matches: [{path, line, text, ctx?}], count, truncated, engine}。見つけた行には番号 n (行の前の 1 2 3。- は ctx の前後の行) がつき、hit でそのまわりを読める", input: GREP },
-            Tool { name: "sed", desc: "文字か正規表現で置きかえる (lines で行の範囲、count で数を確かめる)。{path, replaced, lines}。undo で戻せる", input: SED },
-            Tool { name: "lines", desc: "行の番号で置きかえる / 入れる (insert) / 消す (text なし)。old でいまの中身を確かめる。undo で戻せる", input: LINES },
-            Tool { name: "hit", desc: "grep の n 番のまわりを行の番号つきで読む。{n, path, line, text}", input: HIT },
-            Tool { name: "each", desc: "grep で見つけた行だけを置きかえる (only で番号をしぼる)。grep のあとで変わった行は飛ばす。undo 1 回で全部戻る。{changed: [{n, path, line, text}], skipped: [{n, why}]}", input: EACH },
-            Tool { name: "undo", desc: "edit / write / sed / lines / each のまえに戻す (each は 1 回で全部。aish が動いているあいだの 100 回まで)", input: UNDO },
+            Tool { name: "read", desc: "ファイルを行の番号つきで読む。{path, lines (全部の行数), text}。paths でいくつもまとめて ({files: [...]}、\"a.rs:10-40\" で行の範囲)。ディレクトリなら {dir: true, entries}", args: READ },
+            Tool { name: "edit", desc: "ファイルの old をぴったり new に置きかえる。old が見つからないか、いくつもある (all でない) ならしくじる。edits に path をつけるといくつものファイルを 1 回で ({files: [...]})。undo で戻せる (1 回でみな)", args: EDIT },
+            Tool { name: "write", desc: "ファイルをまるごと書く (なければディレクトリごと作る)。undo で戻せる", args: WRITE },
+            Tool { name: "grep", desc: "ファイルかディレクトリの下から行の番号つきで探す (ripgrep があればそれで)。{matches: [{path, line, text, ctx?}], count, truncated, engine}。見つけた行には番号 n (行の前の 1 2 3。- は ctx の前後の行) がつき、hit でそのまわりを読める", args: GREP },
+            Tool { name: "sed", desc: "文字か正規表現で置きかえる (lines で行の範囲、count で数を確かめる)。{path, replaced, lines}。undo で戻せる", args: SED },
+            Tool { name: "lines", desc: "行の番号で置きかえる / 入れる (insert) / 消す (text なし)。old でいまの中身を確かめる。undo で戻せる", args: LINES },
+            Tool { name: "hit", desc: "grep の n 番のまわりを行の番号つきで読む。{n, path, line, text}", args: HIT },
+            Tool { name: "each", desc: "grep で見つけた行だけを置きかえる (only で番号をしぼる)。grep のあとで変わった行は飛ばす。undo 1 回で全部戻る。{changed: [{n, path, line, text}], skipped: [{n, why}]}", args: EACH },
+            Tool { name: "undo", desc: "edit / write / sed / lines / each のまえに戻す (each は 1 回で全部。aish が動いているあいだの 100 回まで)", args: UNDO },
         ],
     };
     let mut snaps: Vec<Snap> = Vec::new();

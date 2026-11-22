@@ -1,18 +1,20 @@
 // aish-wait: 何かが起きるまで待つ (aish の基本のプラグイン。端末なしの tools だけ)
 //   wait  プロセスが終わる / ファイルに文字が出る / ポートが開く / ファイルができる、まで
 // sleep をくりかえすループや、ログの文字を当てずっぽうに探すかわり (aish --mcp で Claude が使う)
-use aish_plugin::{Spec, Tool, Value, error, json, s};
+use aish_plugin::Ty::*;
+use aish_plugin::{Arg, Spec, Tool, Value, arg, error, json, s};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const WAIT: &str = r#"{"type":"object","properties":{
-"pid":{"type":"integer","description":"このプロセスが終わるまで"},
-"path":{"type":"string","description":"このファイルに text が出るまで (text がなければ、ファイルができるまで)"},
-"text":{"type":"string","description":"path に出るのを待つ文字 (行の中にこの文字があればよい。正規表現ではない)"},
-"new":{"type":"boolean","description":"呼んだあとに足された行だけを見る (既定 false: はじめから)"},
-"port":{"type":"integer","description":"127.0.0.1 のこの TCP のポートにつながるまで"},
-"timeout_ms":{"type":"integer","description":"これを過ぎたら ok: false, running: true で答える (既定で最大 50000。Claude Code はツールを 60 秒しか待たないので、長いものは何度か呼ぶ)"}}}"#;
+const WAIT: &[Arg] = &[
+    arg("pid", Int, "このプロセスが終わるまで"),
+    arg("path", Str, "このファイルに text が出るまで (text がなければ、ファイルができるまで)"),
+    arg("text", Str, "path に出るのを待つ文字 (行の中にこの文字があればよい。正規表現ではない)"),
+    arg("new", Bool, "呼んだあとに足された行だけを見る (既定 false: はじめから)"),
+    arg("port", Int, "127.0.0.1 のこの TCP のポートにつながるまで"),
+    arg("timeout_ms", Int, "これを過ぎたら ok: false, running: true で答える (既定で最大 50000。Claude Code はツールを 60 秒しか待たないので、長いものは何度か呼ぶ)"),
+];
 
 /// 1 回に待つのはここまで (Claude Code はツールの答えを 60 秒しか待たない)
 const MAX_MS: u64 = 50_000;
@@ -25,7 +27,7 @@ fn main() {
         tools: &[Tool {
             name: "wait",
             desc: "pid が終わる / path に text が出る (text がなければ path ができる) / port が開く、まで待つ。どれか 1 つ。{ok, ms, line?}。50 秒までに起きなければ {ok: false, running: true} なので、もう一度呼ぶ",
-            input: WAIT,
+            args: WAIT,
         }],
     };
     aish_plugin::run(spec, |ev, v| match ev {

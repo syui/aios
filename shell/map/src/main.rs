@@ -5,11 +5,20 @@
 //   M-.      where を絞りこんで選び、行を「$EDITOR +行 ファイル」にする (エディタの「定義へ」と同じキー)
 // where は rg で定義の形を探す (そのたびにいまのファイルを見るので、索引もキャッシュも持たない)。
 // 順位: 名前がぴったり → 前が同じ → 含む。同じなら、よく使うファイル (aish-pick の paths) が先
-use aish_plugin::{Spec, Tool, Value, error, json, pick_live, s};
+use aish_plugin::Ty::*;
+use aish_plugin::{Arg, Spec, Tool, Value, arg, error, json, pick_live, s};
 use std::path::{Path, PathBuf};
 
-const WHERE: &str = r#"{"type":"object","properties":{"name":{"type":"string","description":"探す名前 (大文字小文字は区別しない。ぴったり、前が同じ、含む、の順)"},"kind":{"type":"string","description":"fn struct enum trait type mod const static macro impl define class def ... のどれかだけ"},"path":{"type":"string","description":"探すところ (既定: いまのディレクトリの git のいちばん上、なければいまのディレクトリ)"},"limit":{"type":"integer","description":"いくつまで (既定 30)"},"body":{"type":"boolean","description":"いちばん上のものに、定義の中身 (body: 行の番号つき、200 行まで) もつける。read しなくてよい"}},"required":["name"]}"#;
-const OUTLINE: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"定義を見るファイル"}},"required":["path"]}"#;
+const WHERE: &[Arg] = &[
+    arg("name", Str, "探す名前 (大文字小文字は区別しない。ぴったり、前が同じ、含む、の順)").req(),
+    arg("kind", Str, "fn struct enum trait type mod const static macro impl define class def ... のどれかだけ"),
+    arg("path", Str, "探すところ (既定: いまのディレクトリの git のいちばん上、なければいまのディレクトリ)"),
+    arg("limit", Int, "いくつまで (既定 30)"),
+    arg("body", Bool, "いちばん上のものに、定義の中身 (body: 行の番号つき、200 行まで) もつける。read しなくてよい"),
+];
+const OUTLINE: &[Arg] = &[
+    arg("path", Str, "定義を見るファイル").req(),
+];
 
 /// 言語: ファイルの名前 (拡張子か、名前そのもの) と、定義の形 (種類, 正規表現)。
 /// 正規表現の NAME が名前 (where では問い、outline では何でも)、(?P<kind>...) があればそれが種類
@@ -81,8 +90,8 @@ fn main() {
         hooks: &[],
         keys: &[("M-.", "where")],
         tools: &[
-            Tool { name: "where", desc: "名前から定義の場所を返す (探さなくていい)。ぴったり → 前が同じ → 含む、同じならよく使うファイルが先。{items: [{name, kind, path, line, text, body?}]}。body: true でいちばん上の定義の中身も", input: WHERE },
-            Tool { name: "outline", desc: "ファイルの中の定義の一覧 (行の番号、種類、名前、字下げ)。ファイルをぜんぶ読まずに形がわかる。{path, items: [{line, kind, name, indent}]}", input: OUTLINE },
+            Tool { name: "where", desc: "名前から定義の場所を返す (探さなくていい)。ぴったり → 前が同じ → 含む、同じならよく使うファイルが先。{items: [{name, kind, path, line, text, body?}]}。body: true でいちばん上の定義の中身も", args: WHERE },
+            Tool { name: "outline", desc: "ファイルの中の定義の一覧 (行の番号、種類、名前、字下げ)。ファイルをぜんぶ読まずに形がわかる。{path, items: [{line, kind, name, indent}]}", args: OUTLINE },
         ],
     };
     let mut home = String::new();

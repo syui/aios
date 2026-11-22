@@ -181,13 +181,19 @@ for t in every:
         bad.append(n + ': no description')
     if sc.get('type') != 'object' or 'invalid' in sc:
         bad.append(n + ': schema ' + json.dumps(sc)[:100])
-    props = sc.get('properties', {})
-    bad += ['%s: required %s is not a property' % (n, r) for r in sc.get('required', []) if r not in props]
-    for k, v in props.items():
-        if v.get('type') not in TYPES or (v.get('type') == 'array' and 'items' not in v):
-            bad.append('%s.%s: type %s' % (n, k, v.get('type')))
-        if not v.get('description') and k != 'dir':
-            bad.append('%s.%s: no description' % (n, k))
+
+    def props_ok(where, sc):
+        props = sc.get('properties', {})
+        bad.extend('%s: required %s is not a property' % (where, r) for r in sc.get('required', []) if r not in props)
+        for k, v in props.items():
+            if v.get('type') not in TYPES or (v.get('type') == 'array' and 'items' not in v):
+                bad.append('%s.%s: type %s' % (where, k, v.get('type')))
+            if not v.get('description') and k != 'dir':
+                bad.append('%s.%s: no description' % (where, k))
+            # 配列の中のオブジェクト (edit の edits、sed の subs) の引数も
+            if v.get('type') == 'array' and v['items'].get('type') == 'object':
+                props_ok('%s.%s[]' % (where, k), v['items'])
+    props_ok(n, sc)
 check('tool schemas (%d tools from %d plugins)' % (len(every), len(names)), len(every) > 40 and not bad, '; '.join(bad))
 q.stdin.close()
 q.wait(timeout=10)

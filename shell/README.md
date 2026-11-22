@@ -58,6 +58,27 @@ fn main() {
 printf '%s\n' '{"ev":"hello","version":1}' '{"ev":"prompt","pwd":"/tmp"}' | aish-powerline
 ```
 
+端末なしで呼べる機能 (ツール。`aish --mcp` で MCP のツールになる) は `tools` に。引数は `arg(名前, 型, 説明)` の
+並びで書く (いるものは `.req()`)。型は `Str` `Int` `Num` `Bool` `Strs` (文字列の配列) `Ints` `Obj` (中を決めない
+オブジェクト) `Objs(&[...])` (オブジェクトの配列。中の引数) `OneOf(&["a", "b"])`。hello で JSON Schema にして送る。
+AI は説明を読んで引数を決めるので、どの引数にも説明を (test/aish-mcp.py が CI で見る)。呼ばれると ev が `tool`:
+
+```rust
+use aish_plugin::Ty::*;
+use aish_plugin::{Arg, Spec, Tool, arg, error, json, s};
+
+const GREET: &[Arg] = &[arg("who", Str, "だれに").req(), arg("times", Int, "何回 (既定 1)")];
+
+fn main() {
+    let spec = Spec { name: "hello", hooks: &[], keys: &[], tools: &[Tool { name: "greet", desc: "あいさつを返す。{text}", args: GREET }] };
+    aish_plugin::run(spec, |ev, v| match ev {
+        "tool" if s(v, "name") == "greet" => json!({ "text": format!("hello, {}", s(&v["args"], "who")) }),
+        "tool" => error("no such tool"),
+        _ => json!({}),
+    });
+}
+```
+
 ほかの言語でもよい (標準入力から 1 行読み、1 行の JSON を書いて flush するだけ)。
 
 ## 人はキーで、Claude は MCP で

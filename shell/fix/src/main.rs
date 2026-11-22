@@ -8,7 +8,8 @@
 // ほかのコマンド (make、cc、zig) は「path:line:col: error: ...」の行を拾う。
 // Claude Code はツールの答えを 60 秒しか待たないので、長いビルドは running で答えて errors で待つ。
 // 出力はこのプロセスのメモリーだけ (ディスクに何も残さない)
-use aish_plugin::{Key, Spec, Tool, Tty, Value, error, json, pick, s};
+use aish_plugin::Ty::*;
+use aish_plugin::{Arg, Key, Spec, Tool, Tty, Value, arg, error, json, pick, s};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -16,9 +17,23 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-const BUILD: &str = r#"{"type":"object","properties":{"cmd":{"type":"string","description":"動かすコマンド (sh -c。既定 cargo build。cargo build/check/test/clippy/run には --message-format=json を足す)"},"dir":{"type":"string","description":"動かすディレクトリ (既定 いまのディレクトリ)"},"wait_ms":{"type":"integer","description":"終わるのをこれだけ待つ (既定 45000。過ぎたら running: true で答えるので、errors で待つ)"},"warnings":{"type":"boolean","description":"警告も一覧に (既定 false: 数だけ)"}}}"#;
-const ERRORS: &str = r#"{"type":"object","properties":{"wait_ms":{"type":"integer","description":"動いているビルドをこれだけ待つ (既定 45000)"},"warnings":{"type":"boolean","description":"警告も一覧に"},"kill":{"type":"boolean","description":"動いているビルドを止める"}}}"#;
-const FIX: &str = r#"{"type":"object","properties":{"n":{"type":"integer","description":"build / errors の答えの n"},"context":{"type":"integer","description":"前後の行 (既定 5)"},"apply":{"type":"integer","description":"rustc の直し方 (答えの suggestions の番号) をファイルにあてる。ビルドのあとで変えたファイルにはあてない"},"all":{"type":"boolean","description":"n のかわりに: このビルドのすべての診断の、1 つ目の直し方をまとめてあてる (cargo clippy --fix のように)"}}}"#;
+const BUILD: &[Arg] = &[
+    arg("cmd", Str, "動かすコマンド (sh -c。既定 cargo build。cargo build/check/test/clippy/run には --message-format=json を足す)"),
+    arg("dir", Str, "動かすディレクトリ (既定 いまのディレクトリ)"),
+    arg("wait_ms", Int, "終わるのをこれだけ待つ (既定 45000。過ぎたら running: true で答えるので、errors で待つ)"),
+    arg("warnings", Bool, "警告も一覧に (既定 false: 数だけ)"),
+];
+const ERRORS: &[Arg] = &[
+    arg("wait_ms", Int, "動いているビルドをこれだけ待つ (既定 45000)"),
+    arg("warnings", Bool, "警告も一覧に"),
+    arg("kill", Bool, "動いているビルドを止める"),
+];
+const FIX: &[Arg] = &[
+    arg("n", Int, "build / errors の答えの n"),
+    arg("context", Int, "前後の行 (既定 5)"),
+    arg("apply", Int, "rustc の直し方 (答えの suggestions の番号) をファイルにあてる。ビルドのあとで変えたファイルにはあてない"),
+    arg("all", Bool, "n のかわりに: このビルドのすべての診断の、1 つ目の直し方をまとめてあてる (cargo clippy --fix のように)"),
+];
 
 /// 一覧に出す数の上限 (それより多ければ more に数だけ)
 const MAX_ITEMS: usize = 100;
@@ -72,10 +87,10 @@ fn main() {
             Tool {
                 name: "build",
                 desc: "ビルドして (既定 cargo build。うしろで動かす)、エラーを番号 n つきで返す (n path:line: error[E..]: ...)。wait_ms を過ぎたら running: true なので errors で待つ。n は fix で全文とまわりのソースに",
-                input: BUILD,
+                args: BUILD,
             },
-            Tool { name: "errors", desc: "動いているビルドを待って、エラーを n つきで (build と同じ形)。kill: true で止める", input: ERRORS },
-            Tool { name: "fix", desc: "build / errors の n 番のエラーの全文 (rustc の説明と help) と、その場所のまわりのソースを行の番号つきで。rustc の直し方があれば suggestions に番号 k つきで出し、apply: k でファイルにあてる。all: true ならすべての直し方をまとめてあてる", input: FIX },
+            Tool { name: "errors", desc: "動いているビルドを待って、エラーを n つきで (build と同じ形)。kill: true で止める", args: ERRORS },
+            Tool { name: "fix", desc: "build / errors の n 番のエラーの全文 (rustc の説明と help) と、その場所のまわりのソースを行の番号つきで。rustc の直し方があれば suggestions に番号 k つきで出し、apply: k でファイルにあてる。all: true ならすべての直し方をまとめてあてる", args: FIX },
         ],
     };
     let mut cur: Option<Build> = None;

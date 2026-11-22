@@ -12,16 +12,18 @@
 // aios では、publish は作業中の変更 (kernel/ user/ shell/) があると断り、push のあとで unix の CI が新しい push で
 // 取り消されると止まった。ここでは push の前に見て、取り消されたらそう言う (2026-11-13)
 use crate::{MAX_MS, ci, gh, git, github_repo, state};
-use aish_plugin::{Value, error, json, s};
+use aish_plugin::Ty::*;
+use aish_plugin::{Arg, Value, arg, error, json, s};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-pub const SHIP: &str = r#"{"type":"object","properties":{
-"dir":{"type":"string","description":"リポジトリ (既定: いまのディレクトリ)"},
-"check":{"type":"boolean","description":"送らずに、送れるか (署名、変えたままのファイル、publish が要るか) だけ見る"},
-"publish":{"type":"boolean","description":"publish するか (既定: aish.ship.paths の下が最後に出したものから変わっていれば)"},
-"stop":{"type":"boolean","description":"うしろで動いている publish を止める"},
-"wait_ms":{"type":"integer","description":"終わるまで待つ長さ (既定で最大 50000。まだなら running: true なので、もう一度呼ぶ)"}}}"#;
+pub const SHIP: &[Arg] = &[
+    arg("dir", Str, "リポジトリ (既定: いまのディレクトリ)"),
+    arg("check", Bool, "送らずに、送れるか (署名、変えたままのファイル、publish が要るか) だけ見る"),
+    arg("publish", Bool, "publish するか (既定: aish.ship.paths の下が最後に出したものから変わっていれば)"),
+    arg("stop", Bool, "うしろで動いている publish を止める"),
+    arg("wait_ms", Int, "終わるまで待つ長さ (既定で最大 50000。まだなら running: true なので、もう一度呼ぶ)"),
+];
 
 struct Cfg {
     push: Vec<String>,

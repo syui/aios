@@ -13,10 +13,18 @@
 //   paths    よく使うファイルとディレクトリを順位の順に (paths.rs)
 mod paths;
 
-use aish_plugin::{Spec, Tool, Tty, Value, escape, json, pick, pick_live, quote, s, tilde};
+use aish_plugin::Ty::*;
+use aish_plugin::{Arg, Spec, Tool, Tty, Value, arg, escape, json, pick, pick_live, quote, s, tilde};
 
-const QUERY: &str = r#"{"type":"object","properties":{"query":{"type":"string","description":"これを含むものだけ (大文字小文字は区別しない)"},"limit":{"type":"integer","description":"いくつまで (既定 50)"}}}"#;
-const PATHS: &str = r#"{"type":"object","properties":{"query":{"type":"string","description":"空白で区切った語がみな、この順にパスに入っているもの (z と同じ。例: \"aios kernel\")"},"kind":{"type":"string","enum":["file","dir"],"description":"ファイルだけ / ディレクトリだけ (なければどちらも)"},"limit":{"type":"integer","description":"いくつまで (既定 20)"}}}"#;
+const QUERY: &[Arg] = &[
+    arg("query", Str, "これを含むものだけ (大文字小文字は区別しない)"),
+    arg("limit", Int, "いくつまで (既定 50)"),
+];
+const PATHS: &[Arg] = &[
+    arg("query", Str, r#"空白で区切った語がみな、この順にパスに入っているもの (z と同じ。例: "aios kernel")"#),
+    arg("kind", OneOf(&["file", "dir"]), "ファイルだけ / ディレクトリだけ (なければどちらも)"),
+    arg("limit", Int, "いくつまで (既定 20)"),
+];
 
 struct State {
     home: String,
@@ -32,12 +40,12 @@ fn main() {
         hooks: &["key", "chpwd", "preexec", "precmd"],
         keys: &[("C-r", "history"), ("C-f", "file"), ("C-g", "grep"), ("C-o", "recent"), ("C-j", "dir"), ("C-k", "cdup"), ("C-p C-p", "copy")],
         tools: &[
-            Tool { name: "history", desc: "aish の履歴 (人が打ったコマンド) を新しい順に。{items: [...]}", input: QUERY },
-            Tool { name: "dirs", desc: "最近 cd したディレクトリを新しい順に。{items: [...]}", input: QUERY },
+            Tool { name: "history", desc: "aish の履歴 (人が打ったコマンド) を新しい順に。{items: [...]}", args: QUERY },
+            Tool { name: "dirs", desc: "最近 cd したディレクトリを新しい順に。{items: [...]}", args: QUERY },
             Tool {
                 name: "paths",
                 desc: "コマンドで使ったファイルとディレクトリを、使った回数 × 新しさの順に。{items: [{path, kind, score, time}]}",
-                input: PATHS,
+                args: PATHS,
             },
         ],
     };

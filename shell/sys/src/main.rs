@@ -48,7 +48,8 @@ mod threads;
 mod trace;
 mod unwind;
 
-use aish_plugin::{Spec, Tool, Value, error, json, s};
+use aish_plugin::Ty::*;
+use aish_plugin::{Arg, Spec, Tool, Value, arg, error, json, s};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -67,26 +68,110 @@ use summary::{key, summary};
 use threads::{hang, stack, threads, watch};
 use trace::trace;
 
-const GET: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"点でつなぐ: host kernel mem disk proc service pkg net user boot log の下 (kernel.cpus、service.sshd、pkg.installed.cargo、proc.123)。なければぜんぶ"}}}"#;
-const DO: &str = r#"{"type":"object","properties":{"op":{"type":"string","description":"service / pkg / power / apply (/etc/aios.json のとおりにそろえる) / rollback (ひとつ前の apply に戻す) / confirm (confirm つきで入れたファイアウォールでよいとする: しなければ前の決まりにもどる) / ping"},"confirm":{"type":"integer","description":"apply のとき: ファイアウォール (aios.json の firewall) を変えるなら、この秒 (10 から 3600) のうちに op confirm がなければ前の決まりにもどす。ssh ごしに決まりを変えるときは、つけて、つながりを確かめてから confirm"},"action":{"type":"string","description":"service: start stop restart enable disable。pkg: install remove upgrade refresh。power: reboot poweroff"},"name":{"type":"string","description":"service の名前 (sshd など)"},"names":{"type":"array","items":{"type":"string"},"description":"pkg install / remove のパッケージ"}},"required":["op"]}"#;
-const DIFF: &str = r#"{"type":"object","properties":{}}"#;
-const TUNE: &str = r#"{"type":"object","properties":{"name":{"type":"string","description":"sysctl の名前 (kernel.sched_timeslice_ms など。aios get kernel.sysctl で一覧)"},"values":{"type":"array","items":{"type":"string"},"description":"くらべる値"},"cmd":{"type":"string","description":"測る仕事 (sh -c)。値ごとに n 回動かす"},"n":{"type":"integer","description":"値ごとに動かす回数 (既定 3)"},"apply":{"type":"boolean","description":"いちばん速かった値を /etc/aios.json の sysctl に書いて aios apply する"}},"required":["name","values","cmd"]}"#;
-const NONE: &str = r#"{"type":"object","properties":{}}"#;
-const PROCS: &str = r#"{"type":"object","properties":{"sort":{"type":"string","description":"cpu (既定。使った CPU の時間) か mem (メモリ)"},"limit":{"type":"integer","description":"いくつまで (既定 20)"},"name":{"type":"string","description":"名前にこれをふくむものだけ"}}}"#;
-const KMSG: &str = r#"{"type":"object","properties":{"grep":{"type":"string","description":"この文字をふくむ行だけ"},"lines":{"type":"integer","description":"終わりから何行 (既定 50)"}}}"#;
-const LOG: &str = r#"{"type":"object","properties":{"unit":{"type":"string","description":"サービスの名前 (sshd、aiwm.service など)。なければログのある一覧"},"grep":{"type":"string","description":"この文字をふくむ行だけ"},"lines":{"type":"integer","description":"終わりから何行 (既定 50)"}}}"#;
-const RUN: &str = r#"{"type":"object","properties":{"cmd":{"type":"string","description":"動かすコマンド (sh -c)。なければ今の値を読むだけ (bkl)"},"timeout_ms":{"type":"integer","description":"これを過ぎたら止める (既定 50000)"}}}"#;
-const THREADS: &str = r#"{"type":"object","properties":{"pid":{"type":"integer","description":"このプロセスのスレッドだけ"},"name":{"type":"string","description":"名前 (スレッドかプロセスの) にこれをふくむものだけ"},"state":{"type":"string","description":"sleep / run / ready / zombie"},"min_slept_s":{"type":"number","description":"これだけ眠りつづけているものだけ"},"limit":{"type":"integer","description":"いくつまで (既定 50)"}}}"#;
-const HANG: &str = r#"{"type":"object","properties":{"pid":{"type":"integer","description":"見るプロセス (pid も name もなければ、みなからあやしいものを探す)"},"name":{"type":"string","description":"pid のかわりに名前 (プロセスの代表スレッドの名前にふくむもの。いくつもあればみな)"},"kick":{"type":"boolean","description":"futex で眠っているスレッドをみな起こして、同じところで眠りなおすかを見る (既定 true。わけもなく起こしても壊れない)"},"stack":{"type":"boolean","description":"長く (1 秒より) 眠っているスレッドの呼び出しの並び (stack ツールと同じ。長い順に 4 つまで)"}}}"#;
-const STACK: &str = r#"{"type":"object","properties":{"tid":{"type":"integer","description":"スレッドの番号"},"file":{"type":"string","description":"tid のかわりに、残しておいた /proc/ai/stack の中身 (aiwatch の stack_file)"},"pid":{"type":"integer","description":"tid のかわりに: そのプロセスのスレッドみな (眠っているものの、長く眠っている順)"},"max":{"type":"integer","description":"何段まで (既定 40)"},"limit":{"type":"integer","description":"pid のときいくつのスレッドまで (既定 8)"}}}"#;
-const WATCH: &str = r#"{"type":"object","properties":{"lines":{"type":"integer","description":"記録の終わりから何行 (既定 20)"}}}"#;
-const FAIL: &str = r#"{"type":"object","properties":{"cmd":{"type":"string","description":"動かすコマンド (sh -c)。決まりをかけて動かし、終わったらやめる。なければ決まりをかけるだけ (off: true でやめる)"},"name":{"type":"string","description":"相手: この名前で始まるプロセス (既定: cmd の最初の語)"},"pid":{"type":"integer","description":"name のかわりに、このプロセス"},"what":{"type":"string","description":"sys (システムコールを -errno に。既定) / page (物理ページを取れないことに: プロセスが out of memory で殺される) / heap (カーネルのヒープを、耐えるところで取れないことに: そのシステムコールが ENOMEM) / oom (耐えないところで: 予備から渡り、次のシステムコールで oom がいちばん大きなプロセスを殺す。-snapshot の VM で)"},"syscall":{"type":"string","description":"sys のとき: 名前 (openat、read ...) か番号か all (既定 all)"},"errno":{"type":"string","description":"sys のとき: ENOMEM、EIO、EAGAIN ... か番号 (既定 ENOMEM)"},"times":{"type":"integer","description":"何回しくじらせるか (既定 1)"},"off":{"type":"boolean","description":"決まりをやめる"},"timeout_ms":{"type":"integer","description":"待つ長さ (ms、既定 50000、50000 まで)"}}}"#;
-const DELTA: &str = r#"{"type":"object","properties":{"cmd":{"type":"string","description":"動かすコマンド (sh -c)"},"timeout_ms":{"type":"integer","description":"待つ長さ (ms、既定 50000、50000 まで)"}},"required":["cmd"]}"#;
-const PART: &str = r#"{"type":"object","properties":{"name":{"type":"string","description":"切れるところの名前 (kernel.json の off のあるもの: epoll inotify landlock module ns seccomp swap timerfd vdso tty-root-fdlink sound-min-period qemu-uart-burst。装置 (net、virtio_rng、bcm2835_rng) と aiproc は起動のときだけ: box で)"},"off":{"type":"boolean","description":"true で切る、false で入れる。なければ見るだけ"}}}"#;
-const TRACE: &str = r#"{"type":"object","properties":{"cmd":{"type":"string","description":"動かすコマンド (sh -c)。記録を空にして始め、終わったら止めて読む。なければ、いま記録にあるものを読むだけ"},"name":{"type":"string","description":"この名前で始まるプロセスのシステムコールとフォルトだけ (既定: cmd の最初の語。切りかえ・眠り・起こし・割り込み・ディスクはみな)"},"all":{"type":"boolean","description":"名前で絞らない (みなのシステムコールも)"},"limit":{"type":"integer","description":"events に返す出来事の数 (終わりから。既定 200)"},"timeout_ms":{"type":"integer","description":"cmd をこれで止める (既定 50000)"}}}"#;
-const MEM: &str = r#"{"type":"object","properties":{"files":{"type":"integer","description":"ページキャッシュを多く使っているファイルをいくつまで (既定 10)"},"procs":{"type":"integer","description":"メモリを多く使っているプロセスをいくつまで (既定 8)"}}}"#;
-const FW: &str = r#"{"type":"object","properties":{"trace":{"type":"string","description":"パケットを流さずに決まりの道を試す: 'in|out eth0|lo tcp|udp|icmp SRC[:PORT] DST[:PORT] [syn|ack|synack|fin|rst]' (in eth0: 外から来るもの、out eth0: 外へ出すもの、lo: 中どうし)。counter も conntrack も変えない"},"drops":{"type":"integer","description":"落としたものをいくつまで (新しい順。既定 20)"},"ct":{"type":"boolean","description":"conntrack のつながりも 1 つずつ (既定 false: 数だけ)"},"grep":{"type":"string","description":"この文字をふくむ決まり (表、鎖、式) だけ"},"nft":{"type":"boolean","description":"nft -a list ruleset の出力も (nft があれば。root でなければ sudo -n で)"}}}"#;
-const STRACE: &str = r#"{"type":"object","properties":{"cmd":{"type":"string","description":"動かすコマンド (sh -c)"},"name":{"type":"string","description":"見るプロセスの名前 (既定: cmd の最初の語。子のプロセスを見るときに)"},"all":{"type":"boolean","description":"うまくいったものも (既定 true。false ならしくじったものだけ)"},"limit":{"type":"integer","description":"何行まで (既定 300)"},"timeout_ms":{"type":"integer","description":"待つ長さ (ms、既定 50000、50000 まで)"}},"required":["cmd"]}"#;
+const GET: &[Arg] = &[
+    arg("path", Str, "点でつなぐ: host kernel mem disk proc service pkg net user boot log の下 (kernel.cpus、service.sshd、pkg.installed.cargo、proc.123)。なければぜんぶ"),
+];
+const DO: &[Arg] = &[
+    arg("op", Str, "service / pkg / power / apply (/etc/aios.json のとおりにそろえる) / rollback (ひとつ前の apply に戻す) / confirm (confirm つきで入れたファイアウォールでよいとする: しなければ前の決まりにもどる) / ping").req(),
+    arg("confirm", Int, "apply のとき: ファイアウォール (aios.json の firewall) を変えるなら、この秒 (10 から 3600) のうちに op confirm がなければ前の決まりにもどす。ssh ごしに決まりを変えるときは、つけて、つながりを確かめてから confirm"),
+    arg("action", Str, "service: start stop restart enable disable。pkg: install remove upgrade refresh。power: reboot poweroff"),
+    arg("name", Str, "service の名前 (sshd など)"),
+    arg("names", Strs, "pkg install / remove のパッケージ"),
+];
+const DIFF: &[Arg] = &[];
+const TUNE: &[Arg] = &[
+    arg("name", Str, "sysctl の名前 (kernel.sched_timeslice_ms など。aios get kernel.sysctl で一覧)").req(),
+    arg("values", Strs, "くらべる値").req(),
+    arg("cmd", Str, "測る仕事 (sh -c)。値ごとに n 回動かす").req(),
+    arg("n", Int, "値ごとに動かす回数 (既定 3)"),
+    arg("apply", Bool, "いちばん速かった値を /etc/aios.json の sysctl に書いて aios apply する"),
+];
+const NONE: &[Arg] = &[];
+const PROCS: &[Arg] = &[
+    arg("sort", Str, "cpu (既定。使った CPU の時間) か mem (メモリ)"),
+    arg("limit", Int, "いくつまで (既定 20)"),
+    arg("name", Str, "名前にこれをふくむものだけ"),
+];
+const KMSG: &[Arg] = &[
+    arg("grep", Str, "この文字をふくむ行だけ"),
+    arg("lines", Int, "終わりから何行 (既定 50)"),
+];
+const LOG: &[Arg] = &[
+    arg("unit", Str, "サービスの名前 (sshd、aiwm.service など)。なければログのある一覧"),
+    arg("grep", Str, "この文字をふくむ行だけ"),
+    arg("lines", Int, "終わりから何行 (既定 50)"),
+];
+const RUN: &[Arg] = &[
+    arg("cmd", Str, "動かすコマンド (sh -c)。なければ今の値を読むだけ (bkl)"),
+    arg("timeout_ms", Int, "これを過ぎたら止める (既定 50000)"),
+];
+const THREADS: &[Arg] = &[
+    arg("pid", Int, "このプロセスのスレッドだけ"),
+    arg("name", Str, "名前 (スレッドかプロセスの) にこれをふくむものだけ"),
+    arg("state", Str, "sleep / run / ready / zombie"),
+    arg("min_slept_s", Num, "これだけ眠りつづけているものだけ"),
+    arg("limit", Int, "いくつまで (既定 50)"),
+];
+const HANG: &[Arg] = &[
+    arg("pid", Int, "見るプロセス (pid も name もなければ、みなからあやしいものを探す)"),
+    arg("name", Str, "pid のかわりに名前 (プロセスの代表スレッドの名前にふくむもの。いくつもあればみな)"),
+    arg("kick", Bool, "futex で眠っているスレッドをみな起こして、同じところで眠りなおすかを見る (既定 true。わけもなく起こしても壊れない)"),
+    arg("stack", Bool, "長く (1 秒より) 眠っているスレッドの呼び出しの並び (stack ツールと同じ。長い順に 4 つまで)"),
+];
+const STACK: &[Arg] = &[
+    arg("tid", Int, "スレッドの番号"),
+    arg("file", Str, "tid のかわりに、残しておいた /proc/ai/stack の中身 (aiwatch の stack_file)"),
+    arg("pid", Int, "tid のかわりに: そのプロセスのスレッドみな (眠っているものの、長く眠っている順)"),
+    arg("max", Int, "何段まで (既定 40)"),
+    arg("limit", Int, "pid のときいくつのスレッドまで (既定 8)"),
+];
+const WATCH: &[Arg] = &[
+    arg("lines", Int, "記録の終わりから何行 (既定 20)"),
+];
+const FAIL: &[Arg] = &[
+    arg("cmd", Str, "動かすコマンド (sh -c)。決まりをかけて動かし、終わったらやめる。なければ決まりをかけるだけ (off: true でやめる)"),
+    arg("name", Str, "相手: この名前で始まるプロセス (既定: cmd の最初の語)"),
+    arg("pid", Int, "name のかわりに、このプロセス"),
+    arg("what", Str, "sys (システムコールを -errno に。既定) / page (物理ページを取れないことに: プロセスが out of memory で殺される) / heap (カーネルのヒープを、耐えるところで取れないことに: そのシステムコールが ENOMEM) / oom (耐えないところで: 予備から渡り、次のシステムコールで oom がいちばん大きなプロセスを殺す。-snapshot の VM で)"),
+    arg("syscall", Str, "sys のとき: 名前 (openat、read ...) か番号か all (既定 all)"),
+    arg("errno", Str, "sys のとき: ENOMEM、EIO、EAGAIN ... か番号 (既定 ENOMEM)"),
+    arg("times", Int, "何回しくじらせるか (既定 1)"),
+    arg("off", Bool, "決まりをやめる"),
+    arg("timeout_ms", Int, "待つ長さ (ms、既定 50000、50000 まで)"),
+];
+const DELTA: &[Arg] = &[
+    arg("cmd", Str, "動かすコマンド (sh -c)").req(),
+    arg("timeout_ms", Int, "待つ長さ (ms、既定 50000、50000 まで)"),
+];
+const PART: &[Arg] = &[
+    arg("name", Str, "切れるところの名前 (kernel.json の off のあるもの: epoll inotify landlock module ns seccomp swap timerfd vdso tty-root-fdlink sound-min-period qemu-uart-burst。装置 (net、virtio_rng、bcm2835_rng) と aiproc は起動のときだけ: box で)"),
+    arg("off", Bool, "true で切る、false で入れる。なければ見るだけ"),
+];
+const TRACE: &[Arg] = &[
+    arg("cmd", Str, "動かすコマンド (sh -c)。記録を空にして始め、終わったら止めて読む。なければ、いま記録にあるものを読むだけ"),
+    arg("name", Str, "この名前で始まるプロセスのシステムコールとフォルトだけ (既定: cmd の最初の語。切りかえ・眠り・起こし・割り込み・ディスクはみな)"),
+    arg("all", Bool, "名前で絞らない (みなのシステムコールも)"),
+    arg("limit", Int, "events に返す出来事の数 (終わりから。既定 200)"),
+    arg("timeout_ms", Int, "cmd をこれで止める (既定 50000)"),
+];
+const MEM: &[Arg] = &[
+    arg("files", Int, "ページキャッシュを多く使っているファイルをいくつまで (既定 10)"),
+    arg("procs", Int, "メモリを多く使っているプロセスをいくつまで (既定 8)"),
+];
+const FW: &[Arg] = &[
+    arg("trace", Str, "パケットを流さずに決まりの道を試す: 'in|out eth0|lo tcp|udp|icmp SRC[:PORT] DST[:PORT] [syn|ack|synack|fin|rst]' (in eth0: 外から来るもの、out eth0: 外へ出すもの、lo: 中どうし)。counter も conntrack も変えない"),
+    arg("drops", Int, "落としたものをいくつまで (新しい順。既定 20)"),
+    arg("ct", Bool, "conntrack のつながりも 1 つずつ (既定 false: 数だけ)"),
+    arg("grep", Str, "この文字をふくむ決まり (表、鎖、式) だけ"),
+    arg("nft", Bool, "nft -a list ruleset の出力も (nft があれば。root でなければ sudo -n で)"),
+];
+const STRACE: &[Arg] = &[
+    arg("cmd", Str, "動かすコマンド (sh -c)").req(),
+    arg("name", Str, "見るプロセスの名前 (既定: cmd の最初の語。子のプロセスを見るときに)"),
+    arg("all", Bool, "うまくいったものも (既定 true。false ならしくじったものだけ)"),
+    arg("limit", Int, "何行まで (既定 300)"),
+    arg("timeout_ms", Int, "待つ長さ (ms、既定 50000、50000 まで)"),
+];
 
 fn main() {
     let spec = Spec {
@@ -94,28 +179,28 @@ fn main() {
         hooks: &["key"],
         keys: &[("M-s", "sys")],
         tools: &[
-            Tool { name: "health", desc: "いまの見たて (aios health --json): サービスのしくじり、ディスクとメモリの足りなさ、BKL の取りわすれ、カーネルのヒープと oom、ディスクを待って固まったスレッド、試している新しいカーネル、ファイアウォールの確かめ待ち、apply のしくじり、新しい版のあるパッケージ。1 つずつ status (ok / info / warn / crit)、what、hint (次に使う道具)。まずここを見る", input: NONE },
-            Tool { name: "get", desc: "aios の状態の木 (aios get --json と同じ)。health host kernel mem disk proc service pkg net user boot log。path で一部だけ", input: GET },
-            Tool { name: "do", desc: "aiosd (root) に頼んで aios を変える: サービスの start/stop/restart/enable/disable、パッケージの install/remove/upgrade/refresh、reboot/poweroff、apply / rollback (/etc/aios.json)、confirm (confirm つきの apply で入れたファイアウォールを残す)。root と wheel の人だけ。したことは /var/log/aiosd.log に残る", input: DO },
-            Tool { name: "diff", desc: "/etc/aios.json (望む状態) といまのちがいと、そろえる手順 (aios diff。動かさない)。そろえるのは do の apply", input: DIFF },
-            Tool { name: "tune", desc: "sysctl の値を順に変えて cmd を n 回ずつ動かし、かかった時間のまんなか (ms) でくらべる (aios tune。root で。終わったら元の値に戻す)。apply でいちばん速かった値を /etc/aios.json に書いて apply。50 秒をこえそうなら run の bg で sudo aios tune NAME=V1,V2 -- CMD", input: TUNE },
-            Tool { name: "sys", desc: "aios のまとめ: カーネル、起きてからの時間、CPU、メモリ、スワップ、ディスク、CPU を使っているプロセス、BKL、カーネルの新しいメッセージ", input: NONE },
-            Tool { name: "procs", desc: "プロセスの一覧 (pid ppid 状態 スレッド CPU 秒 メモリ 名前)。sort: cpu / mem", input: PROCS },
-            Tool { name: "kmsg", desc: "カーネルのメッセージ (dmesg。[起動からの秒] つき)。grep で絞れる", input: KMSG },
-            Tool { name: "log", desc: "サービスのログ (/var/log/UNIT.log)。unit がなければログのある一覧", input: LOG },
-            Tool { name: "bkl", desc: "cmd を動かして、そのあいだの大きなロック (BKL) の統計 (CPU ごとの待ち・持ち、長く持ったシステムコール)。cmd がなければ今の値", input: RUN },
-            Tool { name: "threads", desc: "スレッドの一覧 (/proc/ai/threads): tid pid 名前 状態 最後のシステムコール 走った回数。眠っていれば slept_s (眠りつづけている秒) と wait: futex (アドレス、待つ値、いまの値) / poll (見張っている fd と、それが何か・読めるか・残っているバイト) / chan", input: THREADS },
-            Tool { name: "hang", desc: "プロセスがなぜ止まっているかを調べる: 長く眠っているスレッドと待っているもの、読まれずに残っているデータのある fd、futex をみな起こしても同じところで眠りなおすか (起こしが消えたのか、だれも起こしていないのか)、見立て (hints)。pid も name もなければ、みなを起こさずに見てあやしいものだけ ({checked, suspects: [{pid, name, hints}]})", input: HANG },
-            Tool { name: "stack", desc: "スレッドの呼び出しの並び (いちばん上から)。ファイルの .eh_frame でたどり、CFI のないところ (musl の libc) はスタックから戻り先を探す (how: pc / cfi / lr / scan)。名前は .symtab か .dynsym、名前のないもの (strip した libxul など) は、その関数のあたりで使っている文字列 (strings_near) を手がかりに", input: STACK },
-            Tool { name: "watch", desc: "aiwatch (カーネルの見張りのサービス) がいま見つけているもの (active) と最近の記録 (log)。kind: lost_wakeup_poll / lost_wakeup_futex (起こしが消えた: カーネルのまちがいかも) / wake_storm (起こしすぎ) / bkl_busy (大きなロックの混雑) / resolved。stack_file はそのときのスタック (stack ツールの file で)", input: WATCH },
-            Tool { name: "strace", desc: "cmd を動かして、そのプロセス (name) のシステムコールを返す (名前(引数 3 つ) = 答え)", input: STRACE },
-            Tool { name: "mem", desc: "メモリの中 (/proc/ai/mem): RAM の空き、カーネルのヒープ (使っている、いちばん多かった、空きのかたまり、取れなかった回数)、ページキャッシュ (ページの数、ファイルごと、読みそこねた数、捨てた数)、MAP_SHARED のページ、tmpfs、スワップ、ページフォルト、メモリを多く使っているプロセス。text はまとめ、ほかはそのままの数 (ページは 4 KiB)。root か wheel の人だけ", input: MEM },
-            Tool { name: "fail", desc: "わざとしくじらせる (フォルト注入。/proc/ai/ctl の fail): cmd のプロセス (name か pid) のシステムコール (syscall か all) を、動かさずに -errno (ENOMEM など) にする、またはカーネルの物理ページ (page: そのプロセスが out of memory で殺される) やヒープ (heap: 耐えるところで、そのシステムコールが ENOMEM。oom: 耐えないところで、予備から渡って次のシステムコールで oom がいちばん大きなプロセスを殺す。-snapshot の VM で) を取れないことにして、プログラムとカーネルがどう耐えるかを見る。times 回しくじらせたら効かなくなる。hits は効いた数。root か wheel の人だけ", input: FAIL },
-            Tool { name: "delta", desc: "cmd を動かした前と後の、カーネルの中の数のちがい (/proc/ai/mem、/proc/ai/fs、/proc/bkl): ページキャッシュ (ページ、読みそこね、捨てた)、ヒープ (使っている、いちばん多かった、取れなかった)、tmpfs、スワップ、ページフォルト、ext4 のブロックキャッシュ (当たり、外れ、まとめ読み、捨てた、書き出し)、パスの覚え (当たり、外れ)、開いているファイル、区画ごとのディスクの読み書き、大きなロック。そのコマンドがカーネルに何をさせたかがわかる。root か wheel の人だけ", input: DELTA },
-            Tool { name: "part", desc: "カーネルの切れるところ (kernel.json の off のあるもの: extra、quirk と core の ns・vdso) のいまの様子 (/proc/ai/parts: 切ってあるか、動かしたまま変えられるか)。name と off で、動かしたまま切る (システムコールは ENOSYS、quirk は手当てをしない) か入れる: 入れずに作った Linux のようにしてプログラムを動かし、戻せる。装置と aiproc は起動のときだけ (vm start の off か box)。root か wheel の人だけ", input: PART },
-            Tool { name: "trace", desc: "カーネルの中の出来事 (/proc/ai/trace): cmd を動かしているあいだの、システムコールの入りと出 (かかった時間)、スレッドの切りかえ、眠りと起こし (待った時間、起こされてから走るまで)、割り込み、ディスクの読み書き、ページフォルトを記録して、スレッドごと、システムコールごと (回数、合計、最大)、遅かった順、ディスク、割り込みにまとめる (text)。events は終わりの limit こ (t は起動からの ns、c は CPU、p は tid、k は sys/ret/switch/sleep/wake/irq/blk/blkdone/fault/exec/exit)。cmd がなければ、いま記録にあるもの (ctl の trace on で始めたもの)。root か wheel の人だけ", input: TRACE },
-            Tool { name: "fw", desc: "ファイアウォール (nftables) のいまの様子 (/proc/ai/fw): 基の鎖 (フック、priority、policy、通った数、policy まで来た数) と決まり (handle、当たった数 (counter がなくても)、さいごに当たってからの ms、短い式)、集まりの要素の数、落としたもの (新しい順: いつ、フック、口、proto、送り元とあて先、TCP のフラグ、どの決まりか (handle か policy)、reject、出したソケットの uid)、conntrack (数、状態ごと、ct: true でつながり)。trace: パケットを流さずに、いまの決まりでどこを通ってどうなるかを決まりごとに (つながらない・届かないわけを探すとき)。root か wheel の人だけ", input: FW },
-            Tool { name: "fs", desc: "ファイルシステムの中 (/proc/ai/fs): マウントごとの様子 (ext4 はブロックキャッシュの数と当たり・外れ・捨てた数、まだ書いていないブロック、書き出した回数、ジャーナル、inode と名前の覚え、空き。tmpfs はページ)、パスの覚え (数、当たり・外れ、捨てた回数)、開いているファイルの数、区画ごとのディスクの読み書き。text はまとめ、ほかはそのままの数。root か wheel の人だけ", input: NONE },
+            Tool { name: "health", desc: "いまの見たて (aios health --json): サービスのしくじり、ディスクとメモリの足りなさ、BKL の取りわすれ、カーネルのヒープと oom、ディスクを待って固まったスレッド、試している新しいカーネル、ファイアウォールの確かめ待ち、apply のしくじり、新しい版のあるパッケージ。1 つずつ status (ok / info / warn / crit)、what、hint (次に使う道具)。まずここを見る", args: NONE },
+            Tool { name: "get", desc: "aios の状態の木 (aios get --json と同じ)。health host kernel mem disk proc service pkg net user boot log。path で一部だけ", args: GET },
+            Tool { name: "do", desc: "aiosd (root) に頼んで aios を変える: サービスの start/stop/restart/enable/disable、パッケージの install/remove/upgrade/refresh、reboot/poweroff、apply / rollback (/etc/aios.json)、confirm (confirm つきの apply で入れたファイアウォールを残す)。root と wheel の人だけ。したことは /var/log/aiosd.log に残る", args: DO },
+            Tool { name: "diff", desc: "/etc/aios.json (望む状態) といまのちがいと、そろえる手順 (aios diff。動かさない)。そろえるのは do の apply", args: DIFF },
+            Tool { name: "tune", desc: "sysctl の値を順に変えて cmd を n 回ずつ動かし、かかった時間のまんなか (ms) でくらべる (aios tune。root で。終わったら元の値に戻す)。apply でいちばん速かった値を /etc/aios.json に書いて apply。50 秒をこえそうなら run の bg で sudo aios tune NAME=V1,V2 -- CMD", args: TUNE },
+            Tool { name: "sys", desc: "aios のまとめ: カーネル、起きてからの時間、CPU、メモリ、スワップ、ディスク、CPU を使っているプロセス、BKL、カーネルの新しいメッセージ", args: NONE },
+            Tool { name: "procs", desc: "プロセスの一覧 (pid ppid 状態 スレッド CPU 秒 メモリ 名前)。sort: cpu / mem", args: PROCS },
+            Tool { name: "kmsg", desc: "カーネルのメッセージ (dmesg。[起動からの秒] つき)。grep で絞れる", args: KMSG },
+            Tool { name: "log", desc: "サービスのログ (/var/log/UNIT.log)。unit がなければログのある一覧", args: LOG },
+            Tool { name: "bkl", desc: "cmd を動かして、そのあいだの大きなロック (BKL) の統計 (CPU ごとの待ち・持ち、長く持ったシステムコール)。cmd がなければ今の値", args: RUN },
+            Tool { name: "threads", desc: "スレッドの一覧 (/proc/ai/threads): tid pid 名前 状態 最後のシステムコール 走った回数。眠っていれば slept_s (眠りつづけている秒) と wait: futex (アドレス、待つ値、いまの値) / poll (見張っている fd と、それが何か・読めるか・残っているバイト) / chan", args: THREADS },
+            Tool { name: "hang", desc: "プロセスがなぜ止まっているかを調べる: 長く眠っているスレッドと待っているもの、読まれずに残っているデータのある fd、futex をみな起こしても同じところで眠りなおすか (起こしが消えたのか、だれも起こしていないのか)、見立て (hints)。pid も name もなければ、みなを起こさずに見てあやしいものだけ ({checked, suspects: [{pid, name, hints}]})", args: HANG },
+            Tool { name: "stack", desc: "スレッドの呼び出しの並び (いちばん上から)。ファイルの .eh_frame でたどり、CFI のないところ (musl の libc) はスタックから戻り先を探す (how: pc / cfi / lr / scan)。名前は .symtab か .dynsym、名前のないもの (strip した libxul など) は、その関数のあたりで使っている文字列 (strings_near) を手がかりに", args: STACK },
+            Tool { name: "watch", desc: "aiwatch (カーネルの見張りのサービス) がいま見つけているもの (active) と最近の記録 (log)。kind: lost_wakeup_poll / lost_wakeup_futex (起こしが消えた: カーネルのまちがいかも) / wake_storm (起こしすぎ) / bkl_busy (大きなロックの混雑) / resolved。stack_file はそのときのスタック (stack ツールの file で)", args: WATCH },
+            Tool { name: "strace", desc: "cmd を動かして、そのプロセス (name) のシステムコールを返す (名前(引数 3 つ) = 答え)", args: STRACE },
+            Tool { name: "mem", desc: "メモリの中 (/proc/ai/mem): RAM の空き、カーネルのヒープ (使っている、いちばん多かった、空きのかたまり、取れなかった回数)、ページキャッシュ (ページの数、ファイルごと、読みそこねた数、捨てた数)、MAP_SHARED のページ、tmpfs、スワップ、ページフォルト、メモリを多く使っているプロセス。text はまとめ、ほかはそのままの数 (ページは 4 KiB)。root か wheel の人だけ", args: MEM },
+            Tool { name: "fail", desc: "わざとしくじらせる (フォルト注入。/proc/ai/ctl の fail): cmd のプロセス (name か pid) のシステムコール (syscall か all) を、動かさずに -errno (ENOMEM など) にする、またはカーネルの物理ページ (page: そのプロセスが out of memory で殺される) やヒープ (heap: 耐えるところで、そのシステムコールが ENOMEM。oom: 耐えないところで、予備から渡って次のシステムコールで oom がいちばん大きなプロセスを殺す。-snapshot の VM で) を取れないことにして、プログラムとカーネルがどう耐えるかを見る。times 回しくじらせたら効かなくなる。hits は効いた数。root か wheel の人だけ", args: FAIL },
+            Tool { name: "delta", desc: "cmd を動かした前と後の、カーネルの中の数のちがい (/proc/ai/mem、/proc/ai/fs、/proc/bkl): ページキャッシュ (ページ、読みそこね、捨てた)、ヒープ (使っている、いちばん多かった、取れなかった)、tmpfs、スワップ、ページフォルト、ext4 のブロックキャッシュ (当たり、外れ、まとめ読み、捨てた、書き出し)、パスの覚え (当たり、外れ)、開いているファイル、区画ごとのディスクの読み書き、大きなロック。そのコマンドがカーネルに何をさせたかがわかる。root か wheel の人だけ", args: DELTA },
+            Tool { name: "part", desc: "カーネルの切れるところ (kernel.json の off のあるもの: extra、quirk と core の ns・vdso) のいまの様子 (/proc/ai/parts: 切ってあるか、動かしたまま変えられるか)。name と off で、動かしたまま切る (システムコールは ENOSYS、quirk は手当てをしない) か入れる: 入れずに作った Linux のようにしてプログラムを動かし、戻せる。装置と aiproc は起動のときだけ (vm start の off か box)。root か wheel の人だけ", args: PART },
+            Tool { name: "trace", desc: "カーネルの中の出来事 (/proc/ai/trace): cmd を動かしているあいだの、システムコールの入りと出 (かかった時間)、スレッドの切りかえ、眠りと起こし (待った時間、起こされてから走るまで)、割り込み、ディスクの読み書き、ページフォルトを記録して、スレッドごと、システムコールごと (回数、合計、最大)、遅かった順、ディスク、割り込みにまとめる (text)。events は終わりの limit こ (t は起動からの ns、c は CPU、p は tid、k は sys/ret/switch/sleep/wake/irq/blk/blkdone/fault/exec/exit)。cmd がなければ、いま記録にあるもの (ctl の trace on で始めたもの)。root か wheel の人だけ", args: TRACE },
+            Tool { name: "fw", desc: "ファイアウォール (nftables) のいまの様子 (/proc/ai/fw): 基の鎖 (フック、priority、policy、通った数、policy まで来た数) と決まり (handle、当たった数 (counter がなくても)、さいごに当たってからの ms、短い式)、集まりの要素の数、落としたもの (新しい順: いつ、フック、口、proto、送り元とあて先、TCP のフラグ、どの決まりか (handle か policy)、reject、出したソケットの uid)、conntrack (数、状態ごと、ct: true でつながり)。trace: パケットを流さずに、いまの決まりでどこを通ってどうなるかを決まりごとに (つながらない・届かないわけを探すとき)。root か wheel の人だけ", args: FW },
+            Tool { name: "fs", desc: "ファイルシステムの中 (/proc/ai/fs): マウントごとの様子 (ext4 はブロックキャッシュの数と当たり・外れ・捨てた数、まだ書いていないブロック、書き出した回数、ジャーナル、inode と名前の覚え、空き。tmpfs はページ)、パスの覚え (数、当たり・外れ、捨てた回数)、開いているファイルの数、区画ごとのディスクの読み書き。text はまとめ、ほかはそのままの数。root か wheel の人だけ", args: NONE },
         ],
     };
     aish_plugin::run(spec, |ev, v| match ev {

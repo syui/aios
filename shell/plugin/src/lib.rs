@@ -34,8 +34,81 @@ pub struct Tool {
     pub name: &'static str,
     /// 何をするか (Claude が読む)
     pub desc: &'static str,
-    /// 引数の JSON Schema (JSON の文字列)
-    pub input: &'static str,
+    /// 引数 (hello で JSON Schema にして送る: [`schema`])
+    pub args: &'static [Arg],
+}
+
+/// 引数の型 (JSON Schema の type。配列なら items も)
+#[derive(Clone, Copy)]
+pub enum Ty {
+    Str,
+    Int,
+    Num,
+    Bool,
+    /// 文字列の配列
+    Strs,
+    /// 整数の配列
+    Ints,
+    /// オブジェクト (中の形は決めない: 名前 → 値)
+    Obj,
+    /// オブジェクトの配列 (中の引数)
+    Objs(&'static [Arg]),
+    /// 決まった文字列のどれか
+    OneOf(&'static [&'static str]),
+}
+
+/// ツールの引数 1 つ。const で書く:
+/// `const VM: &[Arg] = &[arg("op", Str, "start / stop").req(), arg("bg", Bool, "うしろで")];`
+#[derive(Clone, Copy)]
+pub struct Arg {
+    pub name: &'static str,
+    pub ty: Ty,
+    /// 何か (Claude が読む。dir のような、みなが同じ意味のものは空でもよい)
+    pub desc: &'static str,
+    pub required: bool,
+}
+
+/// 引数 (なくてもよいもの。いるものは .req())
+pub const fn arg(name: &'static str, ty: Ty, desc: &'static str) -> Arg {
+    Arg { name, ty, desc, required: false }
+}
+
+impl Arg {
+    /// いる引数に
+    pub const fn req(self) -> Arg {
+        Arg { required: true, ..self }
+    }
+}
+
+/// 引数の並びを JSON Schema (type: object) に
+pub fn schema(args: &[Arg]) -> Value {
+    let mut props = serde_json::Map::new();
+    let mut req = Vec::new();
+    for a in args {
+        let mut p = match a.ty {
+            Ty::Str => json!({ "type": "string" }),
+            Ty::Int => json!({ "type": "integer" }),
+            Ty::Num => json!({ "type": "number" }),
+            Ty::Bool => json!({ "type": "boolean" }),
+            Ty::Strs => json!({ "type": "array", "items": { "type": "string" } }),
+            Ty::Ints => json!({ "type": "array", "items": { "type": "integer" } }),
+            Ty::Obj => json!({ "type": "object" }),
+            Ty::Objs(inner) => json!({ "type": "array", "items": schema(inner) }),
+            Ty::OneOf(v) => json!({ "type": "string", "enum": v }),
+        };
+        if !a.desc.is_empty() {
+            p["description"] = json!(a.desc);
+        }
+        props.insert(a.name.to_string(), p);
+        if a.required {
+            req.push(a.name);
+        }
+    }
+    let mut s = json!({ "type": "object", "properties": props });
+    if !req.is_empty() {
+        s["required"] = json!(req);
+    }
+    s
 }
 
 /// プラグインが何をするか (hello への答え)
@@ -71,7 +144,7 @@ pub fn run(spec: Spec, mut f: impl FnMut(&str, &Value) -> Value) {
             let tools: Vec<Value> = spec
                 .tools
                 .iter()
-                .map(|t| json!({ "name": t.name, "description": t.desc, "input": serde_json::from_str::<Value>(t.input).unwrap_or_else(|e| json!({ "type": "object", "invalid": format!("the input schema is not valid JSON: {}", e) })) }))
+                .map(|t| json!({ "name": t.name, "description": t.desc, "input": schema(t.args) }))
                 .collect();
             json!({ "name": spec.name, "version": VERSION, "hooks": spec.hooks, "keys": keys, "tools": tools })
         } else {
@@ -492,4 +565,36 @@ pub fn path_scores(home: &str) -> std::collections::HashMap<String, f64> {
         .filter_map(parse)
         .filter_map(|v| Some((v["path"].as_str()?.to_string(), frecency(v["rank"].as_f64().unwrap_or(1.0), v["time"].as_u64().unwrap_or(0), t))))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Ty::*;
+    use super::*;
+
+    // const で入れ子も書ける (edit の edits のようなもの)
+    const EDIT: &[Arg] = &[
+        arg("path", Str, "ファイル").req(),
+        arg("edits", Objs(&[arg("old", Str, "").req(), arg("new", Str, "").req(), arg("all", Bool, "")]), "いくつも"),
+        arg("kind", OneOf(&["file", "dir"]), "どちら"),
+        arg("only", Ints, "番号"),
+        arg("headers", Obj, "名前 → 値"),
+        arg("dir", Str, ""),
+    ];
+
+    #[test]
+    fn schemas() {
+        let s = schema(EDIT);
+        assert_eq!(s["type"], "object");
+        assert_eq!(s["required"], json!(["path"]));
+        assert_eq!(s["properties"]["path"], json!({ "type": "string", "description": "ファイル" }));
+        assert_eq!(s["properties"]["edits"]["items"]["required"], json!(["old", "new"]));
+        assert_eq!(s["properties"]["edits"]["items"]["properties"]["all"], json!({ "type": "boolean" }));
+        assert_eq!(s["properties"]["kind"]["enum"], json!(["file", "dir"]));
+        assert_eq!(s["properties"]["only"]["items"], json!({ "type": "integer" }));
+        assert_eq!(s["properties"]["headers"], json!({ "type": "object", "description": "名前 → 値" }));
+        // 説明のないもの (dir) は description なし、いるものがなければ required なし
+        assert!(s["properties"]["dir"].get("description").is_none());
+        assert!(schema(&[]).get("required").is_none());
+    }
 }

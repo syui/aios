@@ -6,23 +6,26 @@
 //   ship git のたしかめ → push (とミラー) → publish か CI 待ち (ship.rs)
 // クラウドの環境の git は Claude の名前と SSH の鍵で署名する設定なので、気づかずに push すると署名しなおして
 // force push することになる (2026-10-30)。push の前にこれで見る
-use aish_plugin::{Spec, Tool, Value, error, json, s};
+use aish_plugin::Ty::*;
+use aish_plugin::{Arg, Spec, Tool, Value, arg, error, json, s};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 mod ship;
 
-const GIT: &str = r#"{"type":"object","properties":{
-"dir":{"type":"string","description":"リポジトリ (既定: いまのディレクトリ)"},
-"also":{"type":"array","items":{"type":"string"},"description":"remote のほかにくらべるところ (URL)。既定は git config aish.mirror (いくつでも)"},
-"remote":{"type":"boolean","description":"remote とくらべる (git ls-remote。既定 true。false ならネットワークを使わない)"}}}"#;
+const GIT: &[Arg] = &[
+    arg("dir", Str, "リポジトリ (既定: いまのディレクトリ)"),
+    arg("also", Strs, "remote のほかにくらべるところ (URL)。既定は git config aish.mirror (いくつでも)"),
+    arg("remote", Bool, "remote とくらべる (git ls-remote。既定 true。false ならネットワークを使わない)"),
+];
 
-const CI: &str = r#"{"type":"object","properties":{
-"sha":{"type":"string","description":"コミット (既定: HEAD)"},
-"repo":{"type":"string","description":"GitHub の owner/name (既定: origin の URL から)"},
-"dir":{"type":"string","description":"リポジトリ (既定: いまのディレクトリ)"},
-"workflow":{"type":"string","description":"この名前の run だけ (例: unix。何時間もかかるほかの run を待たないとき)"},
-"wait_ms":{"type":"integer","description":"終わるまで待つ長さ (既定で最大 50000。まだなら running: true なので、もう一度呼ぶ。0 なら待たずにいまの様子)"}}}"#;
+const CI: &[Arg] = &[
+    arg("sha", Str, "コミット (既定: HEAD)"),
+    arg("repo", Str, "GitHub の owner/name (既定: origin の URL から)"),
+    arg("dir", Str, "リポジトリ (既定: いまのディレクトリ)"),
+    arg("workflow", Str, "この名前の run だけ (例: unix。何時間もかかるほかの run を待たないとき)"),
+    arg("wait_ms", Int, "終わるまで待つ長さ (既定で最大 50000。まだなら running: true なので、もう一度呼ぶ。0 なら待たずにいまの様子)"),
+];
 
 /// push していないコミットを見るのはここまで
 const MAX_COMMITS: usize = 30;
@@ -40,17 +43,17 @@ fn main() {
             Tool {
                 name: "git",
                 desc: "git のリポジトリの様子を 1 回で: ブランチと HEAD、変えたファイル、remote (と git config aish.mirror のミラー) ごとの進み・おくれ (ls-remote なので fetch しない)、push していないコミットの署名 (gpg / ssh / none と鍵) とコミットした人。設定とちがう署名や人、remote のほうが進んでいるものは problems に。push の前に",
-                input: GIT,
+                args: GIT,
             },
             Tool {
                 name: "ci",
                 desc: "push したコミット (既定 HEAD) の GitHub Actions の run を、終わるまで待つ (1 回に 50 秒まで。まだなら running: true なのでもう一度)。run ごとに結果とかかった時間、落ちたものはどの job のどの step か。{done, ok}",
-                input: CI,
+                args: CI,
             },
             Tool {
                 name: "ship",
                 desc: "いまのブランチを送り出す: git のたしかめ (署名、コミットした人、remote が進んでいないか) と publish の元の変えたままのファイル → push (origin のいまのブランチと git config aish.ship.push の refspec) → aish.ship.after のコマンド (ミラーなど) → 最後の release から aish.ship.paths の下が変わっていれば aish.ship.publish をうしろで (CI もそこで待つ)、でなければ CI を待つ。1 回に 50 秒まで。まだなら running: true なのでもう一度呼ぶと続き (落ちたらどこか)。check: true なら送らずにたしかめだけ。{done, ok}",
-                input: ship::SHIP,
+                args: ship::SHIP,
             },
         ],
     };
