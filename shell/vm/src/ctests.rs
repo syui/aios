@@ -3,7 +3,10 @@
 // 起こす) の中で vm-ctests.sh run NAME... を動かし、ok の数と、FAIL したもの (終わりの番号と、そのテストの出力の
 // 終わり) だけを返す。時間切れで VM が答えないなら、中のカーネルの panic も
 // 前は vm-ctests.sh の TESTS を sed で書きかえて、外で gcc を呼んでいた (2026-11-22)
-use super::{boot, build_ctests, kernel_for, note, panic_note, secs, vmpy};
+use super::{note, secs, vmpy};
+use crate::kernel::{boot, kernel_for};
+use crate::sandbox::build_ctests;
+use crate::vmop::panic_note;
 use aish_plugin::{Value, json, s};
 use std::path::Path;
 use std::time::Duration;

@@ -6,7 +6,9 @@
 // 縮めるのは、まとめたものをみな 1 回の Linux と 1 回の VM でためす (VM は 1 回の行き来が重いので)。
 // aios がえらんだちがい (sysdiff -l の chosen) は、Linux でもそのふるまいをまねて答えにするので、ちがいには
 // ならない。それを通った op の行には [chosen NAME] がつくので、いくつの case で使ったかを chosen に出す
-use super::{boot, compiler, kernel_for, note, sh, sub, vmpy};
+use super::{note, sh, sub, vmpy};
+use crate::cc::compiler;
+use crate::kernel::{boot, kernel_for};
 use aish_plugin::{Value, json, s};
 use std::path::{Path, PathBuf};
 use std::time::Duration;

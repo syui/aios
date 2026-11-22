@@ -11,7 +11,10 @@
 //   record   結果を bench/KIND.jsonl (1 行 1 回の記録。リポジトリに入れる) に足し、bench/KIND.md (表) を作りなおす。
 //            いつも、前の記録 (同じ VM のもの) から op ごとにどれだけ変わったかも出す
 //   show     測らずに、記録のいちばん新しいものと、その前からの変わりかた
-use super::{boot_env, compiler, git, kernel_for, lockbench, note, sh, spread, strings, sub, switchable, vmpy};
+use super::{note, sh, strings, sub, vmpy};
+use crate::cc::compiler;
+use crate::kernel::{boot_env, git, kernel_for};
+use crate::sandbox::switchable;
 use aish_plugin::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -835,6 +838,38 @@ fn show(root: &Path, kind: &str) -> Result<Value, String> {
     Ok(out)
 }
 
+// ---- lockbench (カーネルの中の、ロックやメモリの小さな操作の速さ) ----
+
+/// lockbench の答え (kmsg の「lockbench: NAME 49.2 ns, NAME 260.7 ns, ...」に LB をつけた行) を、NAME ごとの
+/// まんなか、いちばん小さい、大きい (ns) に。lockbench のないカーネルなら空
+fn lockbench(out: &str) -> Value {
+    let mut vals: Vec<(String, Vec<f64>)> = Vec::new();
+    for l in out.lines().filter_map(|l| l.trim_start().strip_prefix("LB ")) {
+        let Some((_, rest)) = l.split_once("lockbench: ") else { continue };
+        for piece in rest.split(", ") {
+            let Some((name, x)) = piece.trim().strip_suffix(" ns").and_then(|p| p.rsplit_once(' ')) else { continue };
+            let Ok(x) = x.parse::<f64>() else { continue };
+            match vals.iter_mut().find(|e| e.0 == name) {
+                Some(e) => e.1.push(x),
+                None => vals.push((name.to_string(), vec![x])),
+            }
+        }
+    }
+    let mut r = json!({});
+    for (name, v) in &vals {
+        let (med, lo, hi) = spread(v);
+        r[name.as_str()] = json!({ "ns": med, "min": lo, "max": hi });
+    }
+    r
+}
+
+/// まんなか、いちばん小さい、大きい
+fn spread(v: &[f64]) -> (f64, f64, f64) {
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    (s.get(s.len() / 2).copied().unwrap_or(0.0), s.first().copied().unwrap_or(0.0), s.last().copied().unwrap_or(0.0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -875,5 +910,22 @@ mod tests {
         let md = render_smp(&[rec]);
         assert!(md.contains("| stat | 20.0 µs | 5.0 µs | 4.00 | 10.0 µs | 2.6 µs | 3.90 | 1.92 | 250% | newfstatat 3.2 µs |"), "{}", md);
         assert!(md.contains("- stat: 4 つのとき Linux の 1.92 倍の時間 (伸び 4.00 倍、Linux は 3.90 倍)"), "{}", md);
+    }
+
+    #[test]
+    fn lockbench_lines() {
+        // シリアルに出たカーネルの行 (LB がない) は数えない
+        let out = "lockbench: SpinLock lock+unlock 999.0 ns\n\
+                   LB [    9.754366] lockbench: SpinLock lock+unlock 49.2 ns, heap alloc+free 260.7 ns, BKL unlock+lock 661.0 ns, uptime_ns 175.4 ns\n\
+                   LB [   10.009001] lockbench: SpinLock lock+unlock 53.1 ns, heap alloc+free 507.1 ns, BKL unlock+lock 442.7 ns, uptime_ns 204.4 ns\n\
+                   LB [   10.349281] lockbench: SpinLock lock+unlock 46.1 ns, heap alloc+free 251.7 ns, BKL unlock+lock 438.7 ns, uptime_ns 163.7 ns\n";
+        let r = lockbench(out);
+        assert_eq!(r.as_object().map(|o| o.len()), Some(4));
+        assert_eq!(r["SpinLock lock+unlock"]["ns"].as_f64(), Some(49.2));
+        assert_eq!(r["SpinLock lock+unlock"]["max"].as_f64(), Some(53.1));
+        assert_eq!(r["BKL unlock+lock"]["min"].as_f64(), Some(438.7));
+        assert_eq!(r["uptime_ns"]["ns"].as_f64(), Some(175.4));
+        // lockbench のないカーネル
+        assert!(lockbench("sh: write error: Invalid argument\n").as_object().is_some_and(|o| o.is_empty()));
     }
 }
