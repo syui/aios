@@ -66,6 +66,7 @@ nrs! {
     OPEN_TREE_ATTR = 467,
     LISTNS = 470,
     FCHROOT = 472,
+    PTRACE = 117,
     FILE_GETATTR = 468,
     FILE_SETATTR = 469,
     MSEAL = 462,
@@ -889,7 +890,7 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
     // seccomp がかかっていれば、フィルタを通すためにふつうの道へ。PID の namespace の中も (番号を読みかえる)
     // LSM のラベルのついたもの (AppArmor のプロファイル) も (決まりを見るのはふつうの道だけ)
     // 監査のシステムコールのルールがあれば、入れもののあるスレッドも (入口と出口でルールを見る)
-    if p.has_cred_work(proc::CRED_SECCOMP) || p.pid_ns.is_some() || p.cred.ns.user.is_some() || p.cred.label.is_some() || (p.audit.is_some() && crate::security::AUDIT_N_RULES.load(core::sync::atomic::Ordering::Relaxed) != 0) {
+    if p.has_cred_work(proc::CRED_SECCOMP | proc::CRED_PTRACE) || p.pid_ns.is_some() || p.cred.ns.user.is_some() || p.cred.label.is_some() || (p.audit.is_some() && crate::security::AUDIT_N_RULES.load(core::sync::atomic::Ordering::Relaxed) != 0) {
         return false;
     }
     let r = match nr {

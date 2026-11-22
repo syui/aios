@@ -46,6 +46,14 @@ pub const CLD_EXITED: i32 = 1;
 pub const CLD_KILLED: i32 = 2;
 pub const CLD_STOPPED: i32 = 5;
 pub const CLD_CONTINUED: i32 = 6;
+/// ptrace で止まった (SIGCHLD の si_code)
+pub const CLD_TRAPPED: i32 = 4;
+/// PTRACE_SETOPTIONS の印 (Linux の include/uapi/linux/ptrace.h)
+pub const PTRACE_O_TRACESYSGOOD: u32 = 1;
+pub const PTRACE_O_TRACEEXEC: u32 = 0x10;
+pub const PTRACE_O_EXITKILL: u32 = 0x10_0000;
+/// PTRACE_INTERRUPT の止まり (status >> 16)
+pub const PTRACE_EVENT_STOP: i32 = 128;
 pub const SIGTSTP: i32 = 20;
 pub const SIGTTIN: i32 = 21;
 pub const SIGTTOU: i32 = 22;
@@ -207,7 +215,7 @@ pub fn blocked_or_ignored(p: &Proc, sig: i32) -> bool {
 
 /// いま受け取れるシグナルがあるか (sleep を中断する)
 pub fn deliverable(p: &Proc) -> bool {
-    (p.sig_pending | p.sig_shared) & !p.sig_mask != 0
+    (p.sig_pending | p.sig_shared) & !p.sig_mask != 0 || p.pt_interrupt
 }
 
 /// フォールトなど、来たら先に受けとるもの (Linux の SYNCHRONOUS_MASK)
@@ -665,7 +673,7 @@ fn setup_frame(p: &mut Proc, tf: &mut TrapFrame, sig: i32, info: &SigInfo, a: &S
 #[inline]
 pub fn deliver(tf: &mut TrapFrame, interrupted: Option<Restart>) {
     let p = proc::current();
-    if (p.sig_pending | p.sig_shared) & !p.sig_mask == 0 && interrupted.is_none() && !p.no_restart && p.saved_mask.is_none() && !proc::any_stopped() {
+    if (p.sig_pending | p.sig_shared) & !p.sig_mask == 0 && interrupted.is_none() && !p.no_restart && p.saved_mask.is_none() && !proc::any_stopped() && !p.pt_interrupt {
         return;
     }
     deliver_now(tf, interrupted);
@@ -678,9 +686,36 @@ fn deliver_now(tf: &mut TrapFrame, interrupted: Option<Restart>) {
     let p = proc::current();
     // 他のスレッドの execve を引きついだばかり: 割り込まれたのは前のプログラムのシステムコールなので、やり直さない
     let interrupted = if core::mem::take(&mut p.no_restart) { None } else { interrupted };
+    // PTRACE_INTERRUPT を受けた: PTRACE_EVENT_STOP で止まる (Linux の do_jobctl_trap)
+    if core::mem::take(&mut p.pt_interrupt) && p.ptracer != 0 {
+        let code = PTRACE_EVENT_STOP << 8 | SIGTRAP;
+        ptrace_stop(tf, code << 8 | 0x7f, SIGTRAP, SigInfo { code, ..SigInfo::ZERO });
+        proc::check_killed();
+    }
     let mut handled = false;
     loop {
         let Some((sig, info)) = dequeue(p, !p.sig_mask) else { break };
+        // ptrace されていれば、受けとる前に止まって tracer に見せる (シグナルの知らせの止まり: Linux の ptrace_signal)。
+        // tracer が続けさせたときのシグナルにする (0 なら捨てる、ちがう番号なら tracer が送ったものとして)
+        let (sig, info) = if p.ptracer != 0 && sig != SIGKILL {
+            let ns = ptrace_stop(tf, sig << 8 | 0x7f, sig, info);
+            proc::check_killed();
+            if ns == 0 {
+                continue;
+            }
+            if ns != sig {
+                let info = SigInfo { code: SI_USER, pid: crate::ns::local_or_0(p.ptracer), uid: proc::find_leader(p.ptracer).map_or(0, |t| crate::ns::show_uid(t.cred.uid)), ..SigInfo::ZERO };
+                if p.sig_mask & bit(ns) != 0 {
+                    send_thread(p, ns, info);
+                    continue;
+                }
+                (ns, info)
+            } else {
+                (sig, info)
+            }
+        } else {
+            (sig, info)
+        };
         let a = action(p, sig);
         match a.handler {
             SIG_IGN => continue,
@@ -780,6 +815,63 @@ fn deliver_now(tf: &mut TrapFrame, interrupted: Option<Restart>) {
             }
         }
     }
+}
+
+// ---- ptrace の止まり (Linux の kernel/signal.c の ptrace_stop、ptrace_signal、kernel/ptrace.c の ptrace_report_syscall) ----
+
+/// ptrace で止まる: status (wait に知らせるもの) と siginfo を置き、tracer を起こして SIGCHLD (CLD_TRAPPED) を送り、
+/// 続けさせられるまで眠る (proc::ptrace_sleep)。続けさせたときに入れるシグナル (0 はなし)。tracer がいなくなったか
+/// SIGKILL なら 0
+pub fn ptrace_stop(tf: &mut TrapFrame, status: i32, sig: i32, info: SigInfo) -> i32 {
+    let p = proc::current();
+    let tracer = p.ptracer;
+    if tracer == 0 || p.killed {
+        return 0;
+    }
+    p.pt_status = status;
+    p.pt_reported = false;
+    p.pt_info = (sig, info);
+    p.pt_resume = None;
+    p.pt_tf = tf as *mut TrapFrame;
+    let (tgid, uid) = (crate::ns::local_or_0(p.tgid), crate::ns::show_uid(p.cred.uid));
+    if let Some(t) = proc::find_leader(tracer) {
+        proc::wakeup(t as *mut Proc as usize);
+    }
+    let _ = send_group(tracer, SIGCHLD, SigInfo { code: CLD_TRAPPED, pid: tgid, uid, status: status >> 8 & 0x7f, ..SigInfo::ZERO });
+    proc::ptrace_sleep();
+    let p = proc::current();
+    p.pt_status = 0;
+    p.pt_tf = core::ptr::null_mut();
+    if p.killed {
+        return 0;
+    }
+    p.pt_resume.take().unwrap_or(0)
+}
+
+/// PTRACE_SYSCALL の止まり (システムコールの入口と出口: trap.rs)。SIGTRAP (TRACESYSGOOD なら | 0x80)。続けさせたときの
+/// シグナルは送る (Linux の ptrace_report_syscall)
+pub fn ptrace_syscall(tf: &mut TrapFrame) {
+    let p = proc::current();
+    if p.ptracer == 0 {
+        p.pt_syscall = false;
+        return;
+    }
+    let sig = SIGTRAP | if p.pt_opts & PTRACE_O_TRACESYSGOOD != 0 { 0x80 } else { 0 };
+    let ns = ptrace_stop(tf, sig << 8 | 0x7f, SIGTRAP, SigInfo { code: sig, ..SigInfo::ZERO });
+    proc::check_killed();
+    if ns != 0 {
+        let p = proc::current();
+        let info = SigInfo { code: SI_USER, pid: crate::ns::local_or_0(p.ptracer), ..SigInfo::ZERO };
+        send_thread(p, ns, info);
+    }
+}
+
+/// siginfo_t (128 バイト) を、ptrace の PTRACE_GETSIGINFO に
+pub fn siginfo_of(sig: i32, info: &SigInfo) -> [u8; 128] {
+    let b = siginfo_bytes(sig, info);
+    let mut out = [0u8; 128];
+    out.copy_from_slice(&b[..128]);
+    out
 }
 
 fn restart(p: &Proc, tf: &mut TrapFrame) {

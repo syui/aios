@@ -396,6 +396,8 @@ impl FpState {
 /// Proc::cred_work の印
 pub const CRED_SECCOMP: u8 = 1;
 pub const CRED_SANDBOX: u8 = 2;
+/// ptrace されている (システムコールの入口と出口、シグナルで止まる: 大きなロックなしの道 (syscall::fast) を通らない)
+pub const CRED_PTRACE: u8 = 4;
 
 pub struct Proc {
     pub state: State,
@@ -526,6 +528,20 @@ pub struct Proc {
     pub stopped: bool,
     pub stop_report: i32,
     pub cont_report: bool,
+    /// ptrace (signal.rs の ptrace_stop と ptrace.rs。Linux の task->ptrace、parent、jobctl): tracer のスレッドグループ
+    /// (0 は ptrace されていない)、SEIZE したか、SETOPTIONS の印、PTRACE_SYSCALL で続けている、INTERRUPT を受けた
+    pub ptracer: u32,
+    pub pt_seized: bool,
+    pub pt_opts: u32,
+    pub pt_syscall: bool,
+    pub pt_interrupt: bool,
+    /// ptrace で止まっている: wait に知らせる status (0 は止まっていない)、もう知らせたか、そのときの siginfo (番号と中身)、
+    /// ユーザーのレジスタ (止まっているあいだだけ: tracee のカーネルのスタックの上)、tracer が続けさせたとき入れるシグナル
+    pub pt_status: i32,
+    pub pt_reported: bool,
+    pub pt_info: (i32, crate::signal::SigInfo),
+    pub pt_tf: *mut crate::trap::TrapFrame,
+    pub pt_resume: Option<i32>,
     /// fork してから exec した (Linux の PF_FORKNOEXEC が消えた): 親はもう setpgid で動かせない (EACCES)
     pub execed: bool,
     /// ユーザーモードで動いた時間 (tick)。代表スレッドは終わったスレッドの分も持つ
@@ -683,6 +699,16 @@ impl Proc {
         stopped: false,
         stop_report: 0,
         cont_report: false,
+        ptracer: 0,
+        pt_seized: false,
+        pt_opts: 0,
+        pt_syscall: false,
+        pt_interrupt: false,
+        pt_status: 0,
+        pt_reported: false,
+        pt_info: (0, crate::signal::SigInfo::ZERO),
+        pt_tf: core::ptr::null_mut(),
+        pt_resume: None,
         execed: false,
         utime: 0,
         cpu_ns: 0,
@@ -819,7 +845,7 @@ impl Proc {
     /// 同じスレッドグループの他の Proc (リーダーも)
     /// cred の seccomp と sandbox を書いたあと (大きなロックの中で): cred_work をそれに合わせる
     pub fn sync_cred_work(&self) {
-        let w = if self.cred.seccomp.is_some() { CRED_SECCOMP } else { 0 } | if self.cred.sandbox.is_some() { CRED_SANDBOX } else { 0 };
+        let w = if self.cred.seccomp.is_some() { CRED_SECCOMP } else { 0 } | if self.cred.sandbox.is_some() { CRED_SANDBOX } else { 0 } | if self.ptracer != 0 { CRED_PTRACE } else { 0 };
         self.cred_work.store(w, core::sync::atomic::Ordering::Release);
     }
 
@@ -2129,6 +2155,9 @@ fn exit_status(status: i32) -> ! {
         crate::security::audit_free();
     }
     crate::ns::init_exited(p);
+    if !p.thread {
+        ptrace_exit(p.tgid);
+    }
     // 持ったまま終わる robust futex に OWNER_DIED (Linux の futex_exit_release は mm_release の clear_child_tid より先)
     crate::futex::exit_robust_list();
     clear_child_tid(p);
@@ -2485,6 +2514,12 @@ pub fn execve_target(t: exec::Target, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Res
         }
     }
     finish_exec(p, img, &comm);
+    // ptrace されていれば (SEIZE でなく、PTRACE_O_TRACEEXEC でもなければ) 自分に SIGTRAP (Linux の ptrace_event の
+    // 古い形の exec の知らせ)
+    let p = current();
+    if p.ptracer != 0 && !p.pt_seized && p.pt_opts & crate::signal::PTRACE_O_TRACEEXEC == 0 {
+        crate::signal::send_thread(p, crate::signal::SIGTRAP, crate::signal::SigInfo::from(crate::signal::SI_USER));
+    }
     Ok(())
 }
 
@@ -2611,6 +2646,13 @@ pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
             }
             have = true;
             let keep = options & WNOWAIT != 0;
+            // ptrace で止まった子 (WUNTRACED がなくても: Linux の wait_task_stopped の ptrace)
+            if c.ptracer == my_tgid && c.pt_status != 0 && !c.pt_reported {
+                if !keep {
+                    c.pt_reported = true;
+                }
+                return Ok((crate::ns::to_local(c.pid).unwrap_or(c.pid), c.pt_status));
+            }
             if c.state == State::Zombie && options & WEXITED != 0 {
                 let r = (crate::ns::to_local(c.pid).unwrap_or(c.pid), c.xstatus);
                 if !keep {
@@ -2638,6 +2680,25 @@ pub fn wait(pid: i64, options: u64) -> Result<(u32, i32), i64> {
                     c.cont_report = false;
                 }
                 return Ok((crate::ns::to_local(c.pid).unwrap_or(c.pid), 0xffff));
+            }
+        }
+        // 子でない tracee (ATTACH したもの: Linux の ptraced の並び)
+        for t in live().filter(|t| t.state != State::Unused && t.state != State::Zombie && t.ptracer == my_tgid && t.ppid != my_tgid) {
+            let wanted = match pid {
+                p if p > 0 => t.pid as i64 == p,
+                0 => t.pgid == my_pgid,
+                -1 => true,
+                p => t.pgid as i64 == -p,
+            };
+            if !wanted {
+                continue;
+            }
+            have = true;
+            if t.pt_status != 0 && !t.pt_reported {
+                if options & WNOWAIT == 0 {
+                    t.pt_reported = true;
+                }
+                return Ok((crate::ns::to_local(t.pid).unwrap_or(t.pid), t.pt_status));
             }
         }
         if !have {
@@ -2818,6 +2879,43 @@ pub fn stop_while_stopped() {
         sched();
         wq_exit();
         current().chan = 0;
+    }
+}
+
+/// ptrace で止まっているあいだ眠る (Linux の TASK_TRACED): tracer が続けさせる (pt_resume)、離す (ptracer が 0)、
+/// SIGKILL まで (signal::ptrace_stop)
+pub fn ptrace_sleep() {
+    loop {
+        let p = current();
+        if p.killed || p.ptracer == 0 || p.pt_resume.is_some() {
+            return;
+        }
+        p.chan = pt_chan(p);
+        p.state = State::Sleeping;
+        wq_enter();
+        sched();
+        wq_exit();
+        current().chan = 0;
+    }
+}
+
+/// ptrace で止まっている tracee が待つところ (tracer がここを起こす)
+pub fn pt_chan(p: &Proc) -> usize {
+    p as *const Proc as usize + 2
+}
+
+/// tracer のスレッドグループが終わる: その tracee を離す (PTRACE_O_EXITKILL なら殺す。Linux の exit_ptrace)
+fn ptrace_exit(tgid: u32) {
+    for t in live().filter(|t| t.state != State::Unused && t.state != State::Zombie && t.ptracer == tgid) {
+        if t.pt_opts & crate::signal::PTRACE_O_EXITKILL != 0 {
+            kill_proc(t);
+        }
+        t.ptracer = 0;
+        t.pt_seized = false;
+        t.pt_syscall = false;
+        t.pt_interrupt = false;
+        t.sync_cred_work();
+        wakeup(pt_chan(t));
     }
 }
 

@@ -7,6 +7,7 @@ mod aiproc;
 mod apparmor;
 mod audit;
 mod auditfilter;
+mod ptrace;
 mod securityfs;
 mod efirt;
 mod efivarfs;
@@ -201,6 +202,8 @@ pub extern "C" fn kmain() -> ! {
     // splice、tee、sendfile、copy_file_range と、大きなロックなしの splice
     syscall::register(splice::SYSCALLS, splice::sys);
     syscall::register_fast_splice(splice::fast);
+    // ptrace (止まるところは signal.rs と proc.rs)
+    syscall::register(ptrace::SYSCALLS, ptrace::sys);
     // ファイルの出来事の知らせ (Linux の fsnotify: vfs::notify) を inotify へ
     vfs::notify::register(&inotify::OPS);
     // AF_UNIX: fd を閉じたあとの gc (システムコールの終わり) と、大きなロックなしの read / write (syscall::fast)

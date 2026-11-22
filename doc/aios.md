@@ -812,6 +812,20 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   / で始まるリンクを通った答えを、根のちがう人が使っていた。chroot の外の人が先に /R/a (→ /tmp/x) をたどると、R に
   chroot した人の /a が外の /tmp/x になった (chroot の外が見える。逆に、中の人が先なら外の人に R/tmp/x)。いまは、
   / で始まるリンクを通った覚えに印 (abs) をつけ、chroot の中では使わず、chroot の中でたどったものは覚えない
+- ptrace (test/ptrace.c、root で Linux と 18 行同じ。これで Linux にあって aios で ENOSYS のシステムコールはない): tracer の
+  たのみは ptrace.rs (extra)、止まるところは core (signal::ptrace_stop と proc::ptrace_sleep)。TRACEME (親が tracer。2 度目は
+  EPERM)、ATTACH (SIGSTOP を送る) と SEIZE (止めない。PTRACE_O_* をいっしょに)、uid と gid がみな同じで dumpable か
+  CAP_SYS_PTRACE (でなければ EPERM。自分のスレッドグループ、もうつながっているもの、カーネルのスレッドも)。tracee は
+  受けとるシグナルごとに止まって tracer に見せ (wait の status は (sig << 8) | 0x7f、WUNTRACED なしで、子でない tracee も
+  wait できる。tracer に SIGCHLD の CLD_TRAPPED)、CONT の data のシグナルにする (0 なら捨てる、ちがう番号なら tracer が
+  送った SI_USER として)。exec のあとは自分に SIGTRAP (SEIZE と PTRACE_O_TRACEEXEC でなければ)。PTRACE_SYSCALL は
+  システムコールの入口と出口で SIGTRAP (TRACESYSGOOD なら | 0x80) で止まる (trap.rs。ptrace されているあいだは大きな
+  ロックなしの道を通らない: CRED_PTRACE)。INTERRUPT (SEIZE したものだけ) は PTRACE_EVENT_STOP で止める (眠っていれば
+  起こす)。KILL は Linux 7.4 と同じくいつも SIGKILL。止まっている tracee だけに (でなければ ESRCH): PEEKDATA と POKEDATA
+  (/proc/PID/mem と同じ道。読めなければ EIO)、GETREGSET と SETREGSET の NT_PRSTATUS (x0〜x30、sp、pc、pstate。
+  iov_len は写した長さに。ほかの note は EINVAL)、GETSIGINFO、SETOPTIONS (知らない印は EINVAL)、DETACH。PEEKUSR
+  ほか知らないものは EIO。tracer が終われば tracee は離れる (PTRACE_O_EXITKILL なら殺す)。/proc/PID/status の
+  TracerPid。のこりは todo.json の syscall-gaps
 - cwd からの相対パスの許可 (test/cwdperm.c、root で ext4 と tmpfs で Linux と同じ): Linux は cwd (と開いているディレクトリ)
   から先だけを通れればよい (0700 のディレクトリの中に cd してから setuid した人も、cwd の中は使える)。aios のパスの覚えと
   ロックなしの stat の表は根からのパスで引くので、上のディレクトリが通れないと EACCES だった。いまは、根からたどって

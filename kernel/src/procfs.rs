@@ -928,7 +928,7 @@ fn status_text(p: &Proc, threads: usize, sig: &str) -> String {
     if let Some(u) = umask {
         s += &format!("Umask:\t{:04o}\n", u);
     }
-    s += &format!("State:\t{}\nTgid:\t{}\nNgid:\t0\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\n", state_name(p), crate::ns::local_or_0(p.tgid), crate::ns::local_or_0(p.pid), crate::ns::local_or_0(p.ppid));
+    s += &format!("State:\t{}\nTgid:\t{}\nNgid:\t0\nPid:\t{}\nPPid:\t{}\nTracerPid:\t{}\n", state_name(p), crate::ns::local_or_0(p.tgid), crate::ns::local_or_0(p.pid), crate::ns::local_or_0(p.ppid), crate::ns::local_or_0(p.ptracer));
     s += &format!(
         "Uid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\n",
         crate::ns::show_uid(c.uid),

@@ -379,7 +379,14 @@ fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>, esr: u64) {
             crate::vm::balance();
             match esr >> 26 {
                 EC_SVC64 => {
+                    // PTRACE_SYSCALL: 入口と出口で止まる
+                    if proc::current().pt_syscall {
+                        signal::ptrace_syscall(tf);
+                    }
                     let intr = syscall::dispatch(tf);
+                    if proc::current().pt_syscall {
+                        signal::ptrace_syscall(tf);
+                    }
                     // 書き出しが追いつかないほど書いた: 書き出しのスレッドを待つ
                     if proc::current().dirtied {
                         crate::vfs::balance_dirty();
