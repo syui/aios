@@ -3119,6 +3119,38 @@ aibox はいままでどおり (ファイルの権利は TRUNCATE まで、TCP �
 landlock (CONFIG_LSM は landlock,apparmor) と、namespace の permission を見るためにユーザーと UTS の namespace を足した
 (test/sysdiff/ の手本はそれで作りなおして変わらない)。
 
+### Linux 7.4-rc4 に合わせる (2026-11-23)
+
+手本の Linux (test/linux-vm.sh の `mainline`、aish の ldiff の既定) が 7.4-rc4 (11 月 22 日) になった。rc3 から rc4 の差分
+(git.kernel.org の rawdiff、1.4 MB) のうち、aios にかかわるものと、したこと:
+
+- Landlock の erratum 5 (`_ERRATA` は 31 に): REFER (ディレクトリをまたぐ rename と link) を「あつかわなくても止める」のは、
+  ファイルシステムの権利をあつかう層だけ (Linux の landlock_upgrade_handled_layer_config)。前はどの層も止めたので、ネットワーク
+  だけの層を重ねると、ほかの層が REFER を許していても EXDEV だった。aios は restrict_self で層を足すときに、ファイルシステムの
+  権利をあつかう層だけ REFER も見張る。読んでいて、aios がそもそも「ファイルシステムの権利をあつかう層は REFER をあつかわなくても
+  止める」(ABI 2 からの決まり。ABI 1 の束はディレクトリをまたげない) をしていなかったのも見つけて直した。`test/landlockabi.c` に
+  REFER の 20 行 (147 行が 7.4-rc4 と同じ。rc3 とは ERRATA と、層を重ねた 4 行がちがう)
+- Landlock の CAPABILITY_USE に capset (継ぐ組を広げるときの CAP_SETPCAP)、mmap_addr (mmap_min_addr より下の CAP_SYS_RAWIO)、
+  vm_enough_memory のフック。aios は capability がまだ root ならみな (capset はいつも EPERM) なので、todo の caps に
+- かわりのないもの: commoncap の securebits (CAP_SETPCAP を見るのは要るときだけ: LSM の記録のため)、TCP の bind の fastreuse
+  の近道 (family、IPV6_V6ONLY、SO_BINDTODEVICE、SO_REUSEADDR もくらべる: aios は近道をもたず毎回みなくらべる)、Landlock の
+  namespace の記録 (namespace_op=create / enter: aios に記録はない)
+
+あわせて、手本の設定に CHECKPOINT_RESTORE を入れた (kcmp のため) ので、`PTRACE_O_SUSPEND_SECCOMP` が EINVAL から EPERM になった。
+aios も Linux の check_ptrace_options と同じに: CAP_SYS_ADMIN がいり、呼ぶほうに seccomp がかかっているか、呼ぶほうも
+SUSPEND_SECCOMP で ptrace されていれば EPERM。tracer がこの印をつけたあいだは seccomp を見ない (CRIU が restore するあいだ)。
+PTRACE_SEIZE の知らない印は EIO (SETOPTIONS は EINVAL。前は SEIZE も EINVAL だった: `test/ptrace3.c` に 1 行)。
+
+たしかめたこと: build/ldiff の 124 のテストを 7.4-rc4 で (ふつうの人 98、root 26)。Linux とちがったのは、aios だけの行を出すもの
+(ns、mnt、uname、userns、pathcache、dentsfast)、回数や CPU の数を出すもの (openrace、cwdrace、statc、pci、cputime)、
+引数なしでは手本の Linux でしくじるもの (clone3、futex、madvfree: 1 CPU の手本。dad6 は `--net`、cpuvuln は `LINUX_CPU`)、
+手本の設定にないもの (sysnos、features) で、rc3 の Linux でも動かした clone3、futex、madvfree、dentsfast、dad6 は rc3 と同じ答え
+(rc4 で変わったものではない)。affinity は手本の Linux を 4 CPU (`LINUX_SMP=4 test/ldiff.sh --fresh affinity`) にして同じ。
+sysdiff は CI の 800 case の答えが rc3 と版の行のほかは同じ。新しい種 (9001〜9300、op 100、ext4) では 1 つ見つかった (rc3 でも
+同じ答えで、前からのちがい): AF_UNIX の stream で MSG_OOB の 1 バイトを長さ 0 の入れ物で受けると、Linux はそのバイトを読んで
+(なくして) 1 を返す (__skb_datagram_iter の short_copy: 入れ物の残りが 0 なら写せなくてもまちがいではない)。aios は EFAULT
+だったのを同じにした。
+
 ### マウントの番号と st_dev (/proc/PID/mountinfo、statx の STATX_MNT_ID)
 
 systemd、findmnt、psutil、コンテナの道具は、マウントを /proc/self/mountinfo で知り、statx の stx_mnt_id と
@@ -3517,7 +3549,8 @@ QEMU の virt で起こして、その中で動かす (/init は test/linux-init
 
 ホームの ext4 (`fs` の既定) と /tmp の tmpfs (`fs: tmp`) の両方で、30 op と、長い並び (`ops: 80`) の種を見る。いまの aios は
 Linux 7.2.11 (最新の安定版) と、ext4 で 500 の種 (30 op) と 3000 の種 (80 op)、tmpfs で 1000 の種 (80 op) のどれもちがわない。
-CI の答え (test/sysdiff/、`test/sysdiff-ci.sh golden mainline`) は 7.4-rc1 のもの (下の「Linux 7.4 に合わせる」)。
+CI の答え (test/sysdiff/、`test/sysdiff-ci.sh golden mainline`) は 7.4-rc4 のもの (下の「Linux 7.4-rc4 に合わせる」。
+rc1 から rc4 まで、版の行のほかは同じ)。
 手本を 6.18 (このマシン) から 7.2 にしたときに出たちがいは rename の順だけ: Linux 7 は名前を引いたすぐあと (`__start_renaming`) に
 自分の上や下への rename (EINVAL、ENOTEMPTY) を見るので、`name/` の ENOTDIR より先になった。aios は新しい順に合わせた。
 えらんだちがいを 6 つにしたあとも、どれもちがわない。そのとき見つかった同じファイルの中の sendfile (Linux は読むページの
