@@ -709,8 +709,10 @@ fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>, esr: u64) {
             let raw = claimed.unwrap_or_else(irq::claim);
             let id = raw & 0x3ff;
             crate::debug::trace_irq(id);
+            // tick (perf の期限だけで鳴ったものでない)
+            let mut real_tick = false;
             match id {
-                timer::IRQ => timer::tick(),
+                timer::IRQ => real_tick = timer::tick(),
                 // ほかの CPU から: EL0 へ戻る前に、殺されたか、シグナルが来たかを見るだけ
                 irq::IPI => {}
                 id if id == crate::uart::irq() => crate::uart::intr(),
@@ -720,16 +722,16 @@ fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>, esr: u64) {
                 _ => println!("irq: unexpected {}", id),
             }
             irq::complete(raw);
-            // perf の task-clock / cpu-clock のサンプル (EL0 で鳴った tick: Linux の perf_swevent_hrtimer)
+            // perf の task-clock / cpu-clock のサンプル (EL0 で鳴ったタイマ: Linux の perf_swevent_hrtimer)
             if kind == EL0_IRQ && id == timer::IRQ && proc::PERF_SAMPLING.load(core::sync::atomic::Ordering::Relaxed) != 0 {
                 if let Some(h) = proc::perf() {
-                    h.tick(tf);
+                    h.tick(tf, real_tick);
                 }
             }
             // EL0 で走っていて、タイムスライスを使いきったなら順番をゆずる
             if kind == EL0_IRQ {
                 // 起こされたものにゆずる印がついていても (ほかの CPU からの IPI か、この CPU の割り込みで起こした)
-                if (id == timer::IRQ && proc::slice_expired()) | proc::take_resched() {
+                if (real_tick && proc::slice_expired()) | proc::take_resched() {
                     proc::yield_now();
                 }
                 proc::check_killed();

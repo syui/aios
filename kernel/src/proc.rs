@@ -2352,7 +2352,8 @@ pub trait PerfHooks: Sync {
     /// サンプリングのもの (PERF_SAMPLING が 0 でないときだけ): ページフォルト (config は PERF_COUNT_SW_PAGE_FAULTS か
     /// MIN)、EL0 で鳴った tick、perf のブレークポイントに当たった
     fn sw_event(&self, config: u64, tf: &crate::trap::TrapFrame, addr: u64);
-    fn tick(&self, tf: &crate::trap::TrapFrame);
+    /// real は tick (でなければ perf が置いた期限だけで鳴った: timer::hr_arm)
+    fn tick(&self, tf: &crate::trap::TrapFrame, real: bool);
     fn bp_hit(&self, id: u64, tf: &crate::trap::TrapFrame, addr: u64);
     /// 写した (mmap、実行できるようにした mprotect: PERF_MMAP が 0 でないときだけ)。name は装置の写しの名前
     fn mmap(&self, rec: &crate::vm::MapRec, name: Option<&str>);

@@ -1029,6 +1029,18 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   EACCES)、ない CPU と pid も cpu も -1 は EINVAL。グループのリーダーは同じ相手 (スレッドか CPU)。CPU ごとのものは相手が
   終わらない (POLLHUP にならない)。サンプリングは、その CPU で EL0 で鳴った tick とフォルトで。pid と cpu の両方なら、その
   スレッドがその CPU にいるあいだの差だけ。テストは sched_setaffinity で CPU 0 に固定して (CPU の割りあてが要った)
+- perf のサンプリングの間 (test/perf8.c、Linux 7.4-rc3 と 9 行同じ): 前は間を 1 つ持つだけで、freq のものは間 1 のまま
+  (時計のものは 1e9 / freq ns)、PERF_EVENT_IOC_PERIOD はたしかめるだけだった。いまは Linux の hw.sample_period・last_period・
+  period_left と同じ: のこりが 0 に届いたらあふれ、次の間は前の間で数える (perf_swevent_set_period)。PERIOD を読む決まった
+  間のソフトウェアのものは、間で割らずに 1 回ごとに 1 つ (PERIOD はその数: Linux の perf_swevent_event、2011 年の「don't
+  divide events if it has field period」)。freq のもの (page-faults など) ははじめ間 1 から、あふれるたび (前から 2 tick より
+  短ければ、その時間に前の間の数) と tick ごと (その tick に見た数) に、1 秒に freq 回になる間 (数 × 1e9 / (時間 × freq)) へ
+  差の 1/8 ずつなおす (perf_adjust_period)。時計のもの (task-clock、cpu-clock) は freq を 1e9 / freq ns の決まった間にして
+  freq をやめ (perf_swevent_init_hrtimer)、サンプルの PERIOD ははじめの間のまま、IOC_PERIOD は間を変える (freq の上限を
+  見ない)。ほかの IOC_PERIOD は freq か間を変えて、のこりを 0 に。時計のサンプルは前は tick (10 ms) ごとだけだったが、
+  間が tick より短ければ timer::hr_arm で CPU のタイマを期限にも鳴らす (Linux の hrtimer のかわり。timer.rs は CPU ごとに
+  次の tick と期限を持ち、期限だけで鳴ったときは tick にしない: 時間の数え、タイムスライス、時刻は tick だけ)。
+  まだないもの: 1 tick にあふれすぎたときの止め (PERF_RECORD_THROTTLE / UNTHROTTLE、max_samples_per_tick)
 - atime (test/atime.c、root で ext4 と tmpfs とマウントの印で Linux と 5 行同じ): 前は持たなかった (stat の atime は mtime、
   utimensat の atime は捨てていた)。いまは ext4 は inode の i_atime (秒)、tmpfs は自分の属性に持ち、stat と statx に出す。
   utimensat は atime も決め、ctime をいまに (Linux の notify_change。前は ctime を変えなかった)。読んだら (read、pread、

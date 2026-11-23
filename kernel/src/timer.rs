@@ -16,11 +16,44 @@ pub fn freq() -> u64 {
     if f == 0 { 19_200_000 } else { f }
 }
 
-fn rearm() {
+/// CPU ごとの次の tick (カウンタの値) と、perf の時計のサンプルの期限 (0 はなし)。Linux の perf_swevent_hrtimer の
+/// hrtimer のかわり: 期限が次の tick より前なら、そのときにも鳴らす (tick にはしない)
+static NEXT_TICK: [AtomicU64; crate::smp::MAXCPU] = [const { AtomicU64::new(0) }; crate::smp::MAXCPU];
+static HR: [AtomicU64; crate::smp::MAXCPU] = [const { AtomicU64::new(0) }; crate::smp::MAXCPU];
+
+fn counter() -> u64 {
+    let cnt: u64;
+    unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) cnt) };
+    cnt
+}
+
+/// 次の tick と perf の期限の早いほうでタイマを鳴らす
+fn program(cpu: usize) {
+    let t = NEXT_TICK[cpu].load(Ordering::Relaxed);
+    let h = HR[cpu].load(Ordering::Relaxed);
+    let at = if h != 0 && h < t { h } else { t };
     unsafe {
-        core::arch::asm!("msr cntv_tval_el0, {}", in(reg) freq() / HZ);
+        core::arch::asm!("msr cntv_cval_el0, {}", in(reg) at);
         core::arch::asm!("msr cntv_ctl_el0, {}", in(reg) 1u64);
     }
+}
+
+fn rearm() {
+    let cpu = crate::smp::id();
+    NEXT_TICK[cpu].store(counter() + freq() / HZ, Ordering::Relaxed);
+    program(cpu);
+}
+
+/// perf: ns ののちに、この CPU のタイマを鳴らす (perf の時計のサンプル。もっと早い期限があればそのまま)
+pub fn hr_arm(ns: u64) {
+    let cpu = crate::smp::id();
+    let now = counter();
+    let at = now + (ns as u128 * freq() as u128 / 1_000_000_000) as u64;
+    let cur = HR[cpu].load(Ordering::Relaxed);
+    if cur == 0 || cur <= now || at < cur {
+        HR[cpu].store(at.max(1), Ordering::Relaxed);
+    }
+    program(cpu);
 }
 
 /// 壁の時計と起動からの時計の差 (ns: CLOCK_REALTIME = これ + 起動からの時間。Linux の tk の offs_real)。はじめは起動した
@@ -240,6 +273,7 @@ pub fn idle(on: bool) {
         return;
     }
     if on {
+        HR[crate::smp::id()].store(0, Ordering::Relaxed);
         unsafe { core::arch::asm!("msr cntv_ctl_el0, {}", in(reg) 0u64) };
     } else {
         rearm();
@@ -253,14 +287,25 @@ pub fn init_cpu() {
     rearm();
 }
 
-/// タイマの割り込み (CPU ごと)。時刻を進めるなどは cpu0 だけ
-pub fn tick() {
+/// タイマの割り込み (CPU ごと)。時刻を進めるなどは cpu0 だけ。tick でなく perf の期限だけで鳴ったなら false
+pub fn tick() -> bool {
+    let cpu = crate::smp::id();
+    let now = counter();
+    let h = HR[cpu].load(Ordering::Relaxed);
+    if h != 0 && now >= h {
+        HR[cpu].store(0, Ordering::Relaxed);
+    }
+    let next = NEXT_TICK[cpu].load(Ordering::Relaxed);
+    if next != 0 && now < next {
+        program(cpu);
+        return false;
+    }
     crate::proc::account_tick();
     // 粗い時計 (どの CPU でも: cpu0 が長く割り込みを止めていても進む)
     COARSE.fetch_max(uptime_ns(), Ordering::Relaxed);
     if crate::smp::id() != 0 {
         rearm();
-        return;
+        return true;
     }
     // 前の割り込みから何 tick も進んでいることがある (期限は <= で比べるので、飛んでもよい)
     let now = ticks();
@@ -284,6 +329,7 @@ pub fn tick() {
         }
     }
     rearm();
+    true
 }
 
 /// tick ごと (cpu0) に呼ぶもの (Linux では装置やプロトコルがそれぞれ回す timer_list: itimer と POSIX タイマー、timerfd の期限、割り込みの来なかった

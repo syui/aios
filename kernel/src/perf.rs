@@ -11,9 +11,13 @@
 // 当たった数をそこから読む (当たったら hwdebug.rs が数えて 1 命令越える)。
 // サンプリング (sample_period / freq): 輪 (mmap: 頭のページと 2^n のページ、data_head と data_tail、LOST、
 // wakeup_events と watermark、poll) に PERF_RECORD_SAMPLE を書く (sample_type の順: Linux の perf_output_sample)。
-// きっかけはページフォルト (trap.rs)、EL0 で鳴った tick (task-clock と cpu-clock: Linux の hrtimer も HZ のない手本では
-// jiffies ごと)、perf のブレークポイント (hwdebug.rs)。sigtrap は SIGTRAP (TRAP_PERF)。attr.task と comm なら
-// PERF_RECORD_FORK、EXIT、COMM も。
+// きっかけはページフォルト (trap.rs)、EL0 で鳴ったタイマ (task-clock と cpu-clock: Linux の hrtimer のかわりに、間が
+// tick より短ければ timer::hr_arm で CPU のタイマをそのときにも鳴らす)、perf のブレークポイント (hwdebug.rs)。
+// 間は Linux と同じく hw.sample_period・last_period・period_left (perf_swevent_set_period): PERIOD を読む決まった間の
+// ものは間で割らずに 1 回ごとに 1 つ (perf_swevent_event)。freq のものは、はじめ間 1 から、あふれるたびと tick ごとに
+// 数と時間を見て間をなおす (perf_adjust_period: 差の 1/8 ずつ)。時計のものは freq を 1e9 / freq ns の決まった間にして
+// しまい (perf_swevent_init_hrtimer)、PERIOD ははじめの間のまま。IOC_PERIOD は freq か間を変える。
+// sigtrap は SIGTRAP (TRAP_PERF)。attr.task と comm なら PERF_RECORD_FORK、EXIT、COMM も。
 // attr.mmap (と mmap2、mmap_data) なら PERF_RECORD_MMAP / MMAP2 (mmap、実行できるようにした mprotect、exec の
 // プログラムの領域: Linux の perf_event_mmap)。
 // CPU ごとのもの (pid -1、cpu >= 0: perf stat -a、perf top。paranoid が 0 より上なら CAP_PERFMON): その CPU のみなの
@@ -232,11 +236,21 @@ pub struct Event {
     bp: Option<(bool, u8, u64, hwdebug::Ctrl)>,
     read_format: u64,
     bits: u64,
-    /// サンプリング: sample_type、間 (period。freq なら時計は 1e9 / freq ns、ほかは 1)、前のサンプルからの数と時刻、
-    /// wakeup_events、sigtrap の sig_data、レジスタとスタック、コールチェーンの深さ、ブレークポイントの番地
+    /// サンプリング: sample_type、間 (下)、時計のものの前のサンプルの時刻、wakeup_events、sigtrap の sig_data、
+    /// レジスタとスタック、コールチェーンの深さ、ブレークポイントの番地
     sample_type: u64,
-    period: u64,
-    since: Cell<u64>,
+    /// サンプリングのものか (attr の sample_period / sample_freq が 0 でない: Linux の is_sampling_event)
+    sampling: bool,
+    /// 間 (Linux の hw.sample_period: freq ならなおしていく)、前の間 (last_period: サンプルの PERIOD)、間ののこり
+    /// (period_left: 負のあいだは待つ)、freq (sample_freq。0 は決まった間)、freq をなおした時刻と数 (freq_time_stamp、
+    /// freq_count_stamp)、サンプリングで見た数
+    period: Cell<u64>,
+    last_period: Cell<u64>,
+    left: Cell<i64>,
+    freq: Cell<u64>,
+    freq_time: Cell<u64>,
+    freq_stamp: Cell<u64>,
+    hits: Cell<u64>,
     last_clock: Cell<u64>,
     wakeup_events: u32,
     watermark: u32,
@@ -390,6 +404,99 @@ impl Event {
         self.apply_hw();
         for m in &members {
             m.apply_hw();
+        }
+        if on {
+            if self.active() {
+                self.start();
+            }
+            for m in &members {
+                if m.active() {
+                    m.start();
+                }
+            }
+        }
+    }
+
+    /// task-clock か cpu-clock か (Linux では hrtimer で鳴らすもの)
+    fn is_clock(&self) -> bool {
+        self.ty == TYPE_SOFTWARE && matches!(self.config, SW_CPU_CLOCK | SW_TASK_CLOCK)
+    }
+
+    /// 動きはじめた (Linux の perf_swevent_add の set_period と、時計の hrtimer を始めるところ)
+    fn start(&self) {
+        if !self.sampling {
+            return;
+        }
+        if self.is_clock() {
+            self.restart_clock();
+            return;
+        }
+        self.last_period.set(self.period.get());
+        self.set_period();
+    }
+
+    /// 時計のものの間をいまから数えなおす (この CPU で数えているものなら、間ののちにタイマを鳴らす)
+    fn restart_clock(&self) {
+        let p = proc::current();
+        let cpu = crate::smp::id() as i32;
+        let now = if self.per_cpu() {
+            (self.cpu == cpu).then(crate::timer::uptime_ns)
+        } else {
+            (self.tracks(p.pid) && (self.cpu < 0 || self.cpu == cpu)).then(|| proc::cpu_ns(p))
+        };
+        match now {
+            Some(t) => {
+                self.last_clock.set(t);
+                crate::timer::hr_arm(self.period.get());
+            }
+            None => self.last_clock.set(0),
+        }
+    }
+
+    /// 間ののこりを次の間に (Linux の perf_swevent_set_period): のこりが負でなければ、いくつあふれたか。次の間は
+    /// 前の間 (last_period) で数え、last_period を今の間にする
+    fn set_period(&self) -> u64 {
+        let period = self.last_period.get().max(1);
+        self.last_period.set(self.period.get());
+        let val = self.left.get();
+        if val < 0 {
+            return 0;
+        }
+        let nr = (period + val as u64) / period;
+        self.left.set(val - (nr * period) as i64);
+        nr
+    }
+
+    /// freq のものの間をなおす (Linux の perf_adjust_period と perf_calculate_period: nsec に count 回なら、1 秒に freq 回に
+    /// するには count × 1e9 / (nsec × freq) 回ごと。いきなり変えずに差の 1/8 ずつ)
+    fn adjust_period(&self, nsec: u64, count: u64) {
+        let div = nsec as u128 * self.freq.get() as u128;
+        let want = count as u128 * 1_000_000_000 / div.max(1);
+        let want = want.min(i64::MAX as u128 / 2) as i64;
+        let cur = self.period.get().min(i64::MAX as u64 / 2) as i64;
+        let d = want - cur;
+        let d = if d >= 0 { d + 7 } else { d - 7 } / 8;
+        let n = match cur + d {
+            0 => 1,
+            n => n,
+        };
+        self.period.set(n as u64);
+        if self.left.get() > n.saturating_mul(8) {
+            self.left.set(0);
+        }
+    }
+
+    /// PERF_EVENT_IOC_PERIOD (Linux の __perf_event_period): freq のものは freq を、ほかは間を変え、のこりを 0 に
+    /// (時計のものは、いまから新しい間を数えなおす)
+    fn change_period(&self, v: u64) {
+        if self.freq.get() != 0 {
+            self.freq.set(v);
+        } else {
+            self.period.set(v);
+        }
+        self.left.set(0);
+        if self.is_clock() && self.active() {
+            self.restart_clock();
         }
     }
 
@@ -563,7 +670,7 @@ impl PerfFile {
             IOC_RESET => each(&|e| e.reset()),
             // サンプリングのもの (止まるまでの数を足す) だけ
             IOC_REFRESH => {
-                if ev.bit(B_INHERIT) || !(ev.period != 0) {
+                if ev.bit(B_INHERIT) || !ev.sampling {
                     return Err(-EINVAL);
                 }
                 ev.limit.set(ev.limit.get() + arg as i32 as i64);
@@ -573,9 +680,12 @@ impl PerfFile {
                 let mut b = [0u8; 8];
                 me.pt().copy_in(&mut b, arg).ok_or(-EFAULT)?;
                 let v = u64::from_le_bytes(b);
-                if !(ev.period != 0) || v == 0 || v >> 63 != 0 || (ev.bit(B_FREQ) && v > MAX_SAMPLE_RATE.load(Relaxed) as u64) {
+                // freq のもの (時計のものは freq をやめている) は freq の上限まで、ほかは間 (上のビットはだめ)
+                let freq = ev.freq.get() != 0;
+                if !ev.sampling || v == 0 || (freq && v > MAX_SAMPLE_RATE.load(Relaxed) as u64) || (!freq && v >> 63 != 0) {
                     return Err(-EINVAL);
                 }
+                ev.change_period(v);
             }
             // 輪 (mmap) はまだないので、出し先を決めるだけ (-1 か perf の fd)
             IOC_SET_OUTPUT => {
@@ -730,7 +840,7 @@ impl file::FileOps for PerfFile {
         }
         let p = Rc::as_ptr(ev);
         EVENTS.get().retain(|w| w.strong_count() > 0 && w.as_ptr() != p);
-        if ev.period != 0 {
+        if ev.sampling {
             proc::PERF_SAMPLING.fetch_sub(1, Relaxed);
         }
         if ev.wants_mmap() {
@@ -946,13 +1056,14 @@ fn open(uattr: usize, pid: i32, cpu: i32, group_fd: i32, flags: u64) -> R {
             return Err(-E2BIG);
         }
     }
-    // サンプルの間: freq なら時計は 1e9 / freq ns、ほかは 1 から (Linux は数を見てなおしていく)
+    // サンプルの間: 時計のものは freq を 1e9 / freq ns の決まった間に (Linux の perf_swevent_init_hrtimer: freq をやめる)。
+    // ほかの freq のものは 1 から、数と時間を見てなおしていく (perf_event_alloc と perf_adjust_period)
     let clock = ty == TYPE_SOFTWARE && matches!(config, SW_CPU_CLOCK | SW_TASK_CLOCK);
-    let speriod = match (b(B_FREQ), period) {
-        (_, 0) => 0,
-        (true, f) if clock => (1_000_000_000 / f).max(1),
-        (true, _) => 1,
-        (false, p) => p,
+    let (speriod, sfreq) = match (b(B_FREQ), period) {
+        (_, 0) => (0, 0),
+        (true, f) if clock => ((1_000_000_000 / f).max(1), 0),
+        (true, f) => (1, f),
+        (false, p) => (p, 0),
     };
     let bp_addr = le64(&a, 56);
     let ev = Rc::new(Event {
@@ -963,8 +1074,14 @@ fn open(uattr: usize, pid: i32, cpu: i32, group_fd: i32, flags: u64) -> R {
         read_format,
         bits,
         sample_type,
-        period: speriod,
-        since: Cell::new(0),
+        sampling: period != 0,
+        period: Cell::new(speriod),
+        last_period: Cell::new(speriod),
+        left: Cell::new(speriod as i64),
+        freq: Cell::new(sfreq),
+        freq_time: Cell::new(0),
+        freq_stamp: Cell::new(0),
+        hits: Cell::new(0),
         last_clock: Cell::new(0),
         wakeup_events: u32::from_le_bytes(a[48..52].try_into().unwrap()),
         watermark: u32::from_le_bytes(a[48..52].try_into().unwrap()),
@@ -997,6 +1114,9 @@ fn open(uattr: usize, pid: i32, cpu: i32, group_fd: i32, flags: u64) -> R {
     }
     if !b(B_DISABLED) {
         ev.st.borrow_mut().on = true;
+        if ev.active() {
+            ev.start();
+        }
     }
     ev.apply_hw();
     let fl = file::O_RDWR;
@@ -1005,7 +1125,7 @@ fn open(uattr: usize, pid: i32, cpu: i32, group_fd: i32, flags: u64) -> R {
         l.siblings.borrow_mut().push(Rc::downgrade(&ev));
     }
     EVENTS.get().push(Rc::downgrade(&ev));
-    if ev.period != 0 {
+    if ev.sampling {
         proc::PERF_SAMPLING.fetch_add(1, Relaxed);
     }
     if ev.wants_mmap() {
@@ -1398,8 +1518,19 @@ fn read_event(ev: &Event) -> Rc<Event> {
     live().into_iter().find(|e| e.id == ev.id).expect("perf: live event")
 }
 
-/// あふれた (Linux の __perf_event_overflow): sigtrap なら SIGTRAP、輪があればサンプルを書く
-fn overflow(ev: &Rc<Event>, tf: &crate::trap::TrapFrame, addr: u64) {
+/// あふれた (Linux の __perf_event_overflow): freq なら間をなおし、sigtrap なら SIGTRAP、輪があればサンプル (PERIOD は
+/// period) を書く
+fn overflow(ev: &Rc<Event>, tf: &crate::trap::TrapFrame, addr: u64, period: u64) {
+    // 前のあふれから 2 tick より短ければ、その時間に last_period 回だったとして間をなおす
+    // (Linux の __perf_event_account_interrupt)
+    if ev.freq.get() != 0 {
+        let now = crate::timer::uptime_ns();
+        let d = now.wrapping_sub(ev.freq_time.get()) as i64;
+        ev.freq_time.set(now);
+        if d > 0 && (d as u64) < 2 * crate::timer::TICK_NS {
+            ev.adjust_period(d as u64, ev.last_period.get());
+        }
+    }
     // REFRESH の残りが 0 になったら止まって POLL_HUP (Linux の __perf_event_overflow の event_limit)
     let mut band = crate::fasync::POLL_IN;
     let left = ev.limit.get();
@@ -1422,7 +1553,7 @@ fn overflow(ev: &Rc<Event>, tf: &crate::trap::TrapFrame, addr: u64) {
     }
     let rb = ev.rb.borrow().clone();
     if let Some(rb) = rb {
-        let rec = sample_record(ev, tf, addr, ev.period);
+        let rec = sample_record(ev, tf, addr, period);
         rb.output(ev, &rec, true, Rc::as_ptr(ev) as usize + 1);
     }
     // O_ASYNC の持ち主に (Linux の perf_event_wakeup の kill_fasync)
@@ -1434,14 +1565,32 @@ fn fasync_key(ev: &Event) -> usize {
     ev as *const Event as usize
 }
 
-/// ev の数があと 1 ふえた: 間に届いたらあふれる
-fn tick_count(ev: &Rc<Event>, tf: &crate::trap::TrapFrame, addr: u64) {
-    let n = ev.since.get() + 1;
-    if n >= ev.period {
-        ev.since.set(0);
-        overflow(ev, tf, addr);
-    } else {
-        ev.since.set(n);
+/// ev のできごとが nr 回 (Linux の perf_swevent_event): PERIOD を読む決まった間のものは、間で割らずに 1 つのサンプル
+/// (PERIOD は nr: 2011 年の「don't divide events if it has field period」)。間が 1 なら毎回。ほかは間ののこりが 0 に
+/// 届いたら、届いた数だけ (PERIOD は前の間)
+fn sw_hit(ev: &Rc<Event>, nr: u64, tf: &crate::trap::TrapFrame, addr: u64) {
+    ev.hits.set(ev.hits.get().wrapping_add(nr));
+    let freq = ev.freq.get() != 0;
+    if ev.sample_type & SAMPLE_PERIOD != 0 && !freq {
+        overflow(ev, tf, addr, nr);
+        return;
+    }
+    let data = ev.last_period.get();
+    if nr == 1 && ev.period.get() == 1 && !freq {
+        overflow(ev, tf, addr, data);
+        return;
+    }
+    let left = ev.left.get() + nr as i64;
+    ev.left.set(left);
+    if left < 0 {
+        return;
+    }
+    for _ in 0..ev.set_period() {
+        overflow(ev, tf, addr, data);
+        // REFRESH の残りで止まった
+        if !ev.active() {
+            break;
+        }
     }
 }
 
@@ -1570,28 +1719,54 @@ impl proc::PerfHooks for Hooks {
         let cpu = crate::smp::id() as i32;
         for ev in live() {
             let mine = if ev.per_cpu() { ev.cpu == cpu } else { ev.tracks(me) && (ev.cpu < 0 || ev.cpu == cpu) };
-            if ev.period != 0 && ev.ty == TYPE_SOFTWARE && ev.config == config && !ev.bit(B_EXCLUDE_USER) && ev.active() && mine {
-                tick_count(&ev, tf, addr);
+            if ev.sampling && ev.ty == TYPE_SOFTWARE && ev.config == config && !ev.bit(B_EXCLUDE_USER) && ev.active() && mine {
+                sw_hit(&ev, 1, tf, addr);
             }
         }
     }
 
-    /// EL0 で鳴った tick: task-clock と cpu-clock のサンプリングのものは、前のサンプルから間だけ走ったらあふれる
-    fn tick(&self, tf: &crate::trap::TrapFrame) {
+    /// EL0 で鳴ったタイマ (tick か、perf が置いた期限): task-clock と cpu-clock のサンプリングのものは、前のサンプルから
+    /// 間だけ走ったらあふれ、次の期限が tick より前ならタイマをそのときに (Linux の perf_swevent_hrtimer)。tick なら freq の
+    /// ものの間を、この tick に見た数でなおす (Linux の perf_adjust_freq_unthr_events)
+    fn tick(&self, tf: &crate::trap::TrapFrame, real: bool) {
         let p = proc::current();
         let cpu = crate::smp::id() as i32;
+        let mut next = u64::MAX;
         for ev in live() {
-            // CPU ごとのものは、その CPU で経った時間 (Linux の cpu-clock の hrtimer)
-            let (mine, now) = if ev.per_cpu() { (ev.cpu == cpu, crate::timer::uptime_ns()) } else { (ev.tracks(p.pid) && (ev.cpu < 0 || ev.cpu == cpu), proc::cpu_ns(p)) };
-            if ev.period != 0 && ev.ty == TYPE_SOFTWARE && matches!(ev.config, SW_CPU_CLOCK | SW_TASK_CLOCK) && !ev.bit(B_EXCLUDE_USER) && ev.active() && mine {
-                let last = ev.last_clock.get();
+            let mine = if ev.per_cpu() { ev.cpu == cpu } else { ev.tracks(p.pid) && (ev.cpu < 0 || ev.cpu == cpu) };
+            if !ev.sampling || ev.ty != TYPE_SOFTWARE || !ev.active() || !mine {
+                continue;
+            }
+            if ev.is_clock() {
+                if ev.bit(B_EXCLUDE_USER) {
+                    continue;
+                }
+                // CPU ごとのものは、その CPU で経った時間 (Linux の cpu-clock の hrtimer)
+                let now = if ev.per_cpu() { crate::timer::uptime_ns() } else { proc::cpu_ns(p) };
+                let (period, last) = (ev.period.get().max(1), ev.last_clock.get());
                 if last == 0 || now < last {
                     ev.last_clock.set(now);
-                } else if now - last >= ev.period {
-                    ev.last_clock.set(now);
-                    overflow(&ev, tf, 0);
+                    next = next.min(period);
+                } else if now - last >= period {
+                    // 間の倍だけ進めて 1 つ (Linux の hrtimer_forward_now)。PERIOD ははじめの間のまま
+                    let k = (now - last) / period;
+                    ev.last_clock.set(last + k * period);
+                    overflow(&ev, tf, 0, ev.last_period.get());
+                    next = next.min(period - (now - last - k * period));
+                } else {
+                    next = next.min(period - (now - last));
+                }
+            } else if real && ev.freq.get() != 0 {
+                let h = ev.hits.get();
+                let d = h.wrapping_sub(ev.freq_stamp.get());
+                ev.freq_stamp.set(h);
+                if d > 0 {
+                    ev.adjust_period(crate::timer::TICK_NS, d);
                 }
             }
+        }
+        if next < crate::timer::TICK_NS {
+            crate::timer::hr_arm(next);
         }
     }
 
@@ -1607,8 +1782,8 @@ impl proc::PerfHooks for Hooks {
 
     /// perf のブレークポイントに当たった (hwdebug.rs が数えたあと): サンプリングのものは間ごとにあふれる
     fn bp_hit(&self, id: u64, tf: &crate::trap::TrapFrame, _addr: u64) {
-        if let Some(ev) = live().into_iter().find(|e| e.id == id && e.period != 0) {
-            tick_count(&ev, tf, ev.bp_addr);
+        if let Some(ev) = live().into_iter().find(|e| e.id == id && e.sampling) {
+            sw_hit(&ev, 1, tf, ev.bp_addr);
         }
     }
 }
