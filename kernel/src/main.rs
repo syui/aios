@@ -239,6 +239,7 @@ pub extern "C" fn kmain() -> ! {
     timer::every(1, posix_timers::tick);
     timer::every(1, timerfd::tick);
     timer::hr_hook(posix_timers::hr);
+    signal::on_dequeue(posix_timers::dequeued);
     timer::hr_hook(timerfd::hr);
     vdso::init();
     // ACPI の機械は RTC を表に書かない (PL031 は DTB だけ): 読めなければ、時刻は EFI の GetTime から (Linux の rtc-efi)。

@@ -524,8 +524,9 @@ pub struct Proc {
     pub sid: u32,
     /// システムコールに入ったときの x0 (やり直し用)
     pub orig_x0: u64,
-    /// setitimer の (期限 (起動からの ns), 間隔 (ns)) と POSIX タイマー (代表スレッドに置く)
-    pub itimer: (u64, u64),
+    /// setitimer の (期限 (起動からの ns), 間隔 (ns), 鳴った時刻) と POSIX タイマー (代表スレッドに置く)。くり返しは
+    /// SIGALRM を受けとったときに、鳴った時刻からの間の目盛りで鳴らしなおす (それまで期限は 0: Linux と同じ)
+    pub itimer: (u64, u64, u64),
     /// rlimit (Linux の signal_struct の rlim: スレッドグループで 1 つ。代表スレッドに置く: rlimit / set_rlimit)。
     /// None ならはじめの値 (default_rlimits)。表 (NPROC) に 256 バイトずつ持たないように、変えたときにヒープに
     pub rlim: Option<alloc::boxed::Box<[[u64; 2]; RLIM_NLIMITS]>>,
@@ -777,7 +778,7 @@ impl Proc {
         pgid: 0,
         sid: 0,
         orig_x0: 0,
-        itimer: (0, 0),
+        itimer: (0, 0, 0),
         rlim: None,
         oom_score_adj: 0,
         oom_score_adj_min: 0,

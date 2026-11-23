@@ -1093,8 +1093,18 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   鳴らしなおす。くり返しで割り込みが続かないよう、次は少なくとも 10 us あと)。くり返しの次の期限は間の目盛りの上 (Linux の
   hrtimer_forward: 遅れても目盛りはずれない)、とばした数は timer_getoverrun に。timerfd の read も期限 (ns) まで眠る。
   getitimer ののこりは、動いていれば少なくとも 1 us (Linux の itimer_get_remtime)。CPU の時計のものは前と同じ tick ごと。
-  ちがい: Linux は itimer と POSIX タイマーのくり返しを、シグナルを受けとったときに鳴らしなおす (受けとらないあいだは
-  止まり、とばした数は si_overrun)。aios は鳴ったときに次を決め、si_overrun はいつも 0
+- POSIX タイマーのシグナルはタイマーごとに 1 つ、くり返しは受けとったときに鳴らしなおす (test/timerovr.c と test/itimerq.c、
+  Linux 7.4-rc3 と 8 行と 6 行同じ): 前は鳴るたびにシグナルを送っていて、RT シグナルを止めたまま 1 ms のタイマーを 100 ms
+  置くと 100 こたまり、si_overrun はいつも 0。itimer も SIGALRM を止めたまま鳴りつづけていた。いまは Linux と同じく、
+  POSIX タイマーはシグナルを送ったら受けとられるまで止め (PosixTimer の queued。くり返しの期限は鳴った時刻のまま)、
+  受けとるとき (signal::dequeue が posix_timers::dequeued を呼ぶ: signal::on_dequeue。Linux の posixtimer_deliver_signal)
+  に間の目盛りで鳴らしなおして、とばした数を si_overrun と timer_getoverrun (Linux の it_overrun_last) に。signalfd の
+  ssi_overrun も。送ったシグナルには印 (SigInfo の addr) をつけ、来ているあいだに timer_settime か timer_delete された
+  ものは受けとるときに捨てる (sigpending には見えている: Linux の it_signal_seq)。来ているあいだの timer_gettime は、目盛りで
+  先へ送ったのこりを見せる (Linux の common_timer_get)。itimer (ITIMER_REAL) も鳴ったら止め (getitimer ののこりは 0)、
+  SIGALRM を受けとったときに鳴った時刻からの目盛りで鳴らしなおす (Linux の dequeue_signal。無視されて捨てられれば止まった
+  まま)。ちがい: 無視されて捨てられた POSIX タイマーのシグナルは、tick (cpu0) で見つけて鳴らしなおす (Linux 6.13 からは
+  無視しているあいだ止め、無視をやめたら鳴らしなおす)
 - atime (test/atime.c、root で ext4 と tmpfs とマウントの印で Linux と 5 行同じ): 前は持たなかった (stat の atime は mtime、
   utimensat の atime は捨てていた)。いまは ext4 は inode の i_atime (秒)、tmpfs は自分の属性に持ち、stat と statx に出す。
   utimensat は atime も決め、ctime をいまに (Linux の notify_change。前は ctime を変えなかった)。読んだら (read、pread、

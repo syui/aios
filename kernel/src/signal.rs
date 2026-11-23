@@ -149,10 +149,16 @@ pub struct PosixTimer {
     pub notify: i32,
     pub tid: u32,
     pub value: u64,
-    /// 次に鳴る時刻 (起動からの ns、0 なら止まっている) と、くり返しの間隔 (ns)
+    /// 次に鳴る時刻 (起動からの ns、0 なら止まっている) と、くり返しの間隔 (ns)。シグナルが来ていてまだ受けとられて
+    /// いないあいだ (queued) は、鳴った時刻のまま止まっている
     pub deadline: u64,
     pub interval: u64,
+    /// さいごに受けとったシグナルの si_overrun (timer_getoverrun。Linux の it_overrun_last)
     pub overrun: i32,
+    /// シグナルが来ていて、まだ受けとられていない (Linux の posixtimer の sigqueue: タイマーごとに 1 つだけ。くり返しは
+    /// 受けとったときに鳴らしなおす) と、そのシグナルの印 (SigInfo の addr。settime で変わり、古いものは捨てる)
+    pub queued: bool,
+    pub sig_seq: u64,
     /// CPU の時計のタイマ (Linux の posix-cpu-timers): その時計と、鳴る CPU 時間 (ns、0 なら止まっている) と間隔 (ns)。
     /// 見るのは tick ごと (Linux も tick ごと)
     pub cpu: Option<crate::timer::Clock>,
@@ -239,6 +245,34 @@ const SYNCHRONOUS: u64 = bit(SIGSEGV) | bit(SIGBUS) | bit(SIGILL) | bit(SIGTRAP)
 /// 来たもの (sig_pending) をプロセスに来たもの (sig_shared) より先に。それぞれの中では同期のもの (フォールト) を先に、
 /// あとは番号の小さいものから
 fn dequeue(p: &mut Proc, allowed: u64) -> Option<(i32, SigInfo)> {
+    loop {
+        let (sig, mut info) = dequeue_one(p, allowed)?;
+        // タイマーのもの (posix_timers が置く: Linux の posixtimer_deliver_signal と、SIGALRM で itimer を鳴らしなおす
+        // dequeue_signal)。false なら捨てて次へ
+        if sig == SIGALRM || (info.code == SI_TIMER && info.addr != 0) {
+            let f = ON_DEQUEUE.load(core::sync::atomic::Ordering::Acquire);
+            if f != 0 {
+                // SAFETY: on_dequeue が DequeueHook だけを置く
+                let f: DequeueHook = unsafe { core::mem::transmute::<usize, DequeueHook>(f) };
+                if !f(p, sig, &mut info) {
+                    continue;
+                }
+            }
+        }
+        return Some((sig, info));
+    }
+}
+
+/// シグナルを受けとるときに呼ぶもの (タイマーのシグナル: SI_TIMER で addr が 0 でないものと SIGALRM)。false なら捨てる
+pub type DequeueHook = fn(&mut Proc, i32, &mut SigInfo) -> bool;
+static ON_DEQUEUE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// main.rs が posix_timers のものを置く
+pub fn on_dequeue(f: DequeueHook) {
+    ON_DEQUEUE.store(f as usize, core::sync::atomic::Ordering::Release);
+}
+
+fn dequeue_one(p: &mut Proc, allowed: u64) -> Option<(i32, SigInfo)> {
     for shared in [false, true] {
         let set = if shared { p.sig_shared } else { p.sig_pending } & allowed;
         if set != 0 {
@@ -478,6 +512,7 @@ pub fn signalfd_info(sig: i32, i: &SigInfo) -> [u8; 128] {
         },
         SI_TIMER => {
             put(&mut b, 24, &i.timerid.to_le_bytes());
+            put(&mut b, 32, &i.status.to_le_bytes());
             put(&mut b, 44, &(i.value as i32).to_le_bytes());
             put(&mut b, 48, &i.value.to_le_bytes());
         }
@@ -693,6 +728,7 @@ fn siginfo_bytes(sig: i32, i: &SigInfo) -> [u8; FRAME_INFO] {
         }
         _ if i.code == SI_TIMER => {
             put(&mut b, 16, &i.timerid.to_le_bytes());
+            put(&mut b, 20, &i.status.to_le_bytes());
             put(&mut b, 24, &i.value.to_le_bytes());
         }
         _ => {
@@ -1016,6 +1052,7 @@ pub fn siginfo_from(b: &[u8; 128]) -> (i32, SigInfo) {
         }
         _ if i.code == SI_TIMER => {
             i.timerid = i32_at(16);
+            i.status = i32_at(20);
             i.value = u64_at(24);
         }
         _ => {
@@ -1341,7 +1378,7 @@ pub fn rt_sigqueueinfo(tgid: i64, pid: i64, sig: i32, uinfo: usize) -> R {
     }
     let value = u64::from_le_bytes(b[24..32].try_into().unwrap());
     let info = match code {
-        SI_TIMER => SigInfo { code, timerid: w(16), value, ..SigInfo::ZERO },
+        SI_TIMER => SigInfo { code, timerid: w(16), status: w(20), value, ..SigInfo::ZERO },
         c if c > SI_USER && c < SI_KERNEL => match sig {
             SIGCHLD => SigInfo { code, pid: crate::ns::to_global(w(16) as u32).unwrap_or(0), uid: w(20) as u32, status: w(24), ..SigInfo::ZERO },
             SIGSEGV | SIGBUS | SIGILL | SIGFPE | SIGTRAP => SigInfo { code, addr: u64::from_le_bytes(b[16..24].try_into().unwrap()), ..SigInfo::ZERO },
