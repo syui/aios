@@ -90,6 +90,11 @@ fn splice(fd_in: u64, off_in: usize, fd_out: u64, off_out: usize, len: usize, fl
             if at_out.is_some() && !positional(&fo) {
                 return Err(crate::why::inval());
             }
+            // O_APPEND で開いた、ふつうのファイルでないもの (ソケットや装置) へは EINVAL (Linux の do_splice。ふつうの
+            // ファイルへは aios がえらんだちがい copy-append で書く)
+            if fo.borrow().flags & file::O_APPEND != 0 && fo.borrow().stat().mode & S_IFMT != vfs::S_IFREG {
+                return Err(crate::why::inval());
+            }
             let mut pos = at_out.unwrap_or(fo.borrow().offset as i64);
             // aios がえらんだちがい (copy-append): O_APPEND で開いたファイルへも書く。位置がなければ write と同じく
             // 終わりに足す (書きおわるまで、大きなロックなしの書きたしを止めて: file::SlowAppend)
@@ -516,6 +521,10 @@ fn do_sendfile(out_fd: u64, in_fd: u64, ppos: Option<&mut i64>, count: usize) ->
     let fo = file_of(out_fd)?;
     if !fo.borrow().writable() {
         return Err(-EBADF);
+    }
+    // O_APPEND で開いた、ふつうのファイルでもパイプでもないもの (ソケットや装置) へは EINVAL (Linux の do_splice_direct)
+    if fo.borrow().flags & file::O_APPEND != 0 && pipe_of(out_fd).is_none() && fo.borrow().stat().mode & S_IFMT != vfs::S_IFREG {
+        return Err(crate::why::inval());
     }
     // aios がえらんだちがい (copy-append): O_APPEND で開いたファイルへは、write と同じく終わりに足す (書きおわるまで、
     // 大きなロックなしの書きたしを止めて: file::SlowAppend)

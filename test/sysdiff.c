@@ -399,11 +399,43 @@ static int fresh_tcp(int fd) {
     return ti[0] == 7 /* TCP_CLOSE */ && segs_in <= 1;
 }
 
+// chosen send-notconn: 一度つないだ TCP (inetpair と accept で作ったもの。AF_UNSPEC の connect で外す)。Linux の
+// TCP_INFO の segs_out は、送らずにつながったもの (accept した側) でも 0 なので、それだけでは見分けられない (両方で)
+static ino_t tcp_was[64];
+
+static int tcp_slot(int fd, int add) {
+    struct stat st;
+    int dom = 0, typ = 0;
+    socklen_t l = sizeof dom;
+    if (fd < 0 || fstat(fd, &st) != 0 || !S_ISSOCK(st.st_mode) || getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &dom, &l) != 0 || (dom != AF_INET && dom != AF_INET6))
+        return -1;
+    l = sizeof typ;
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &typ, &l) != 0 || typ != SOCK_STREAM)
+        return -1;
+    for (int k = 0; k < 64; k++)
+        if (tcp_was[k] == st.st_ino)
+            return k;
+    for (int k = 0; add && k < 64; k++)
+        if (tcp_was[k] == 0) {
+            tcp_was[k] = st.st_ino;
+            return k;
+        }
+    return -1;
+}
+
+static void tcp_connected(int fd) { tcp_slot(fd, 1); }
+
+static void tcp_disconnected(int fd) {
+    int k = tcp_slot(fd, 0);
+    if (k >= 0)
+        tcp_was[k] = 0;
+}
+
 static void ret(long r) {
     // chosen send-notconn: 一度もつないでいない TCP へ書くと、aios は ENOTCONN。Linux は EPIPE なので ENOTCONN にしてまねる。
     // しらべる getsockopt が errno を変えないように (書く先がソケットでなければ ENOTSOCK になる)
     int e = errno;
-    if (r < 0 && wfd >= 0 && !wfd_err && e == (on_aios ? ENOTCONN : EPIPE) && fresh_tcp(wfd)) {
+    if (r < 0 && wfd >= 0 && !wfd_err && e == (on_aios ? ENOTCONN : EPIPE) && fresh_tcp(wfd) && tcp_slot(wfd, 0) < 0) {
         errno = ENOTCONN;
         say(" = ENOTCONN [chosen send-notconn]");
         return;
@@ -2855,6 +2887,8 @@ static void sockexec(int i, const struct op *o, int fd) {
                 born(i, sv[1]);
                 nodelay(sv[0]);
                 nodelay(sv[1]);
+                tcp_connected(sv[0]);
+                tcp_connected(sv[1]);
                 noteport(i, sv[0]);
                 say(" [%d,%d]", sv[0], sv[1]);
             }
@@ -2889,7 +2923,10 @@ static void sockexec(int i, const struct op *o, int fd) {
         say("%s(%d, ", o->kind == BIND ? "bind" : "connect", fd);
         sayuaddr(o->x, o->y);
         say(")");
-        ret(syscall(o->kind == BIND ? SYS_bind : SYS_connect, fd, &a, l));
+        r = syscall(o->kind == BIND ? SYS_bind : SYS_connect, fd, &a, l);
+        ret(r);
+        if (o->kind == CONNECT && r == 0 && ((struct sockaddr *)&a)->sa_family == AF_UNSPEC)
+            tcp_disconnected(fd);
         break;
     }
     case LISTEN:
@@ -2904,6 +2941,7 @@ static void sockexec(int i, const struct op *o, int fd) {
         r = syscall(SYS_accept4, fd, o->x == 2 ? NULL : &a, o->x == 2 ? NULL : &al, fl);
         ret(r);
         nodelay(r);
+        tcp_connected((int)r);
         if (r >= 0) {
             res[i][0] = (int)r;
             if (o->x != 2)
