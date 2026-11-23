@@ -21,7 +21,7 @@ const ENOTDIR: i64 = 20;
 const ENOSPC: i64 = 28;
 
 // できごとの番号と見張りの数は core の入り口 (vfs::notify。Linux の fsnotify) のもの
-pub use crate::vfs::notify::{ACCESS_WATCHED, IN_ACCESS, IN_ATTRIB, IN_CLOSE_NOWRITE, IN_CLOSE_WRITE, IN_CREATE, IN_DELETE, IN_DELETE_SELF, IN_ISDIR, IN_MODIFY, IN_OPEN, NAME_WATCHED};
+pub use crate::vfs::notify::{ACCESS_WATCHED, IN_ACCESS, IN_ATTRIB, IN_CLOSE_NOWRITE, IN_CLOSE_WRITE, IN_CREATE, IN_DELETE, IN_DELETE_SELF, IN_ISDIR, IN_MODIFY, IN_MOVED_FROM, IN_MOVED_TO, IN_OPEN, NAME_WATCHED};
 const IN_ALL_EVENTS: u32 = 0xfff;
 const IN_Q_OVERFLOW: u32 = 0x4000;
 const IN_IGNORED: u32 = 0x8000;
@@ -250,7 +250,7 @@ fn push(n: &InotifyRef, wd: i32, mask: u32, cookie: u32, name: Option<&str>) {
 
 /// 見張っている inotify があるか (なければ知らせるところは何もしない)
 pub fn active() -> bool {
-    list().iter().any(|w| w.upgrade().is_some_and(|n| !n.borrow().watches.is_empty()))
+    !dnotify().is_empty() || list().iter().any(|w| w.upgrade().is_some_and(|n| !n.borrow().watches.is_empty()))
 }
 
 /// IN_MODIFY を待っている watch があるか (ext4 が大きなロックなしの pwrite を許すまえに: vm::write_permit)
@@ -261,6 +261,11 @@ pub fn modify_watched() -> bool {
 /// ev を待っている watch があるか、と、そのうち id 以外 (親ディレクトリかもしれない) のものがあるか
 fn wanted(ev: u32, id: (usize, u64)) -> (bool, bool) {
     let (mut any, mut others) = (false, false);
+    // F_NOTIFY (ディレクトリを見張る: 中のもののできごとは親に)
+    for d in dnotify().iter().filter(|d| dn_bits(ev) & d.mask != 0) {
+        any = true;
+        others |= d.id != id;
+    }
     for w in list().iter() {
         let Some(n) = w.upgrade() else { continue };
         for w in n.borrow().watches.iter().filter(|w| w.mask & ev != 0) {
@@ -274,6 +279,7 @@ fn wanted(ev: u32, id: (usize, u64)) -> (bool, bool) {
 /// id の inode を見張るものに、できごと (mask。IN_ISDIR はついていてよい) を届ける。name はディレクトリの中のもの
 fn deliver(id: (usize, u64), mask: u32, cookie: u32, name: Option<&str>) {
     let ev = mask & IN_ALL_EVENTS;
+    dn_deliver(id, mask, name.is_some());
     for w in list().clone() {
         let Some(n) = w.upgrade() else { continue };
         let hits: Vec<(i32, bool)> = n.borrow().watches.iter().filter(|w| w.id == id && w.mask & ev != 0).map(|w| (w.wd, w.mask & IN_ONESHOT != 0)).collect();
@@ -479,4 +485,168 @@ impl crate::vfs::notify::Notify for Ops {
     fn modify_watched(&self) -> bool {
         modify_watched()
     }
+    fn dirnotify(&self, fd: i32, f: &file::FileRef, files: usize, arg: u32) -> Result<i64, i64> {
+        dirnotify(fd, f, files, arg)
+    }
+    fn closed(&self, files: usize, file: usize) {
+        dn_closed(files, file)
+    }
+}
+
+// ---- dnotify (Linux の fs/notify/dnotify: fcntl の F_NOTIFY) ----
+//
+// ディレクトリの開いたものに F_NOTIFY で DN_* を置くと、その中のもの (と、そのディレクトリ自身) にできごとがあれば、
+// ファイルの持ち主に知らせる (F_SETSIG のシグナルなら POLL_MSG と si_fd: fasync.rs)。DN_MULTISHOT がなければ 1 度で外れる。
+// 置いたプロセス (ファイルの表) がその fd を閉じると外れる (dup したものを閉じても: Linux の dnotify_flush)
+
+pub const DN_ACCESS: u32 = 0x1;
+pub const DN_MODIFY: u32 = 0x2;
+pub const DN_CREATE: u32 = 0x4;
+pub const DN_DELETE: u32 = 0x8;
+pub const DN_RENAME: u32 = 0x10;
+pub const DN_ATTRIB: u32 = 0x20;
+pub const DN_MULTISHOT: u32 = 0x8000_0000;
+
+/// dir-notify-enable (sysctl.rs)
+pub static DIR_NOTIFY_ENABLE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(1);
+
+struct Dn {
+    file: Weak<RefCell<file::OpenFile>>,
+    ptr: usize,
+    /// 置いたプロセスのファイルの表
+    files: usize,
+    fd: i32,
+    mask: u32,
+    /// 見張るディレクトリ
+    id: (usize, u64),
+}
+
+static DNOTIFY: Bkl<Vec<Dn>> = Bkl::new(Vec::new());
+
+fn dnotify() -> &'static mut Vec<Dn> {
+    DNOTIFY.get()
+}
+
+/// inotify のできごとから DN_* (Linux の convert_arg の逆)
+fn dn_bits(ev: u32) -> u32 {
+    let mut b = 0;
+    if ev & IN_ACCESS != 0 {
+        b |= DN_ACCESS;
+    }
+    if ev & IN_MODIFY != 0 {
+        b |= DN_MODIFY;
+    }
+    if ev & IN_ATTRIB != 0 {
+        b |= DN_ATTRIB;
+    }
+    if ev & (IN_CREATE | IN_MOVED_TO) != 0 {
+        b |= DN_CREATE;
+    }
+    if ev & (IN_DELETE | IN_MOVED_FROM) != 0 {
+        b |= DN_DELETE;
+    }
+    if ev & IN_MOVED_FROM != 0 {
+        b |= DN_RENAME;
+    }
+    b
+}
+
+/// DN_* を、ロックなしの道を止める数のための inotify のできごとに
+fn in_bits(dn: u32) -> u32 {
+    let mut b = 0;
+    if dn & DN_ACCESS != 0 {
+        b |= IN_ACCESS;
+    }
+    if dn & DN_MODIFY != 0 {
+        b |= IN_MODIFY;
+    }
+    if dn & DN_ATTRIB != 0 {
+        b |= IN_ATTRIB;
+    }
+    if dn & DN_CREATE != 0 {
+        b |= IN_CREATE | IN_MOVED_TO;
+    }
+    if dn & (DN_DELETE | DN_RENAME) != 0 {
+        b |= IN_DELETE | IN_MOVED_FROM;
+    }
+    b
+}
+
+fn dn_count() {
+    crate::vfs::notify::DNOTIFY.store(dnotify().len(), core::sync::atomic::Ordering::Relaxed);
+}
+
+/// 見張るディレクトリ id に届いたできごと: 中のもの (child) か、ディレクトリ自身 (IN_ISDIR) のものだけ (Linux の
+/// dnotify_handle_event)。名前を変えたもの (IN_MOVED_FROM) は、DN_RENAME と DN_DELETE の 2 つのできごと (Linux の
+/// FS_RENAME と FS_MOVED_FROM)
+fn dn_deliver(id: (usize, u64), mask: u32, child: bool) {
+    if dnotify().is_empty() || !(child || mask & IN_ISDIR != 0) {
+        return;
+    }
+    let ev = mask & IN_ALL_EVENTS;
+    let events: Vec<u32> = if ev & IN_MOVED_FROM != 0 { alloc::vec![DN_RENAME, DN_DELETE] } else { alloc::vec![dn_bits(ev)] };
+    for e in events {
+        let mut send = Vec::new();
+        dnotify().retain(|d| {
+            if d.id != id || d.mask & e == 0 {
+                return true;
+            }
+            send.push((d.file.clone(), d.fd));
+            if d.mask & DN_MULTISHOT != 0 {
+                return true;
+            }
+            count(in_bits(d.mask), false);
+            false
+        });
+        dn_count();
+        for (f, fd) in send {
+            if let Some(f) = f.upgrade() {
+                crate::fasync::send_file(&f, fd, crate::fasync::POLL_MSG);
+            }
+        }
+    }
+}
+
+/// fcntl の F_NOTIFY (Linux の fcntl_dirnotify)
+pub fn dirnotify(fd: i32, f: &file::FileRef, files: usize, arg: u32) -> Result<i64, i64> {
+    if DIR_NOTIFY_ENABLE.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+        return Err(crate::why::inval());
+    }
+    let ptr = Rc::as_ptr(f) as usize;
+    // 0 (DN_MULTISHOT だけも) は外す
+    if arg & !DN_MULTISHOT == 0 {
+        dn_closed(files, ptr);
+        return Ok(0);
+    }
+    let id = match &f.borrow().kind {
+        Kind::Inode(i, _) if i.meta().is_dir() => i.id(),
+        _ => return Err(-20), // ENOTDIR
+    };
+    // 持ち主がまだなければ自分のプロセスに (Linux の __f_setown の force 0)
+    crate::fasync::set(f, proc::current().tgid, crate::fasync::PidType::Tgid, false);
+    // 同じ表の同じファイルなら DN_* を足す (Linux の attach_dn)
+    let v = dnotify();
+    if let Some(d) = v.iter_mut().find(|d| d.files == files && d.ptr == ptr) {
+        count(in_bits(d.mask), false);
+        d.fd = fd;
+        d.mask |= arg;
+        count(in_bits(d.mask), true);
+    } else {
+        v.push(Dn { file: Rc::downgrade(f), ptr, files, fd, mask: arg, id });
+        count(in_bits(arg), true);
+    }
+    dn_count();
+    Ok(0)
+}
+
+/// fd を閉じた (file が 0 ならファイルの表がなくなった): その F_NOTIFY を外す
+fn dn_closed(files: usize, file: usize) {
+    dnotify().retain(|d| {
+        let gone = d.files == files && (file == 0 || d.ptr == file) || d.file.strong_count() == 0;
+        if gone {
+            count(in_bits(d.mask), false);
+        }
+        !gone
+    });
+    dn_count();
 }

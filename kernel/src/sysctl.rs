@@ -183,6 +183,7 @@ pub static TABLE: &[Entry] = &[
     Entry { path: "kernel/random/poolsize", get: || "256".to_string(), set: None },
     Entry { path: "kernel/random/boot_id", get: boot_id, set: None },
     Entry { path: "kernel/random/uuid", get: random_uuid, set: None },
+    Entry { path: "fs/dir-notify-enable", get: || format!("{}", crate::inotify::DIR_NOTIFY_ENABLE.load(Ordering::Relaxed)), set: Some(|s| Ok(crate::inotify::DIR_NOTIFY_ENABLE.store(num(s, 0, i32::MAX as usize)?, Ordering::Relaxed))) },
     Entry { path: "fs/inotify/max_queued_events", get: || format!("{}", INOTIFY_MAX_QUEUED.load(Ordering::Relaxed)), set: Some(|s| Ok(INOTIFY_MAX_QUEUED.store(num(s, 16, 1 << 20)?, Ordering::Relaxed))) },
     Entry { path: "fs/inotify/max_user_watches", get: || format!("{}", INOTIFY_MAX_WATCHES.load(Ordering::Relaxed)), set: Some(|s| Ok(INOTIFY_MAX_WATCHES.store(num(s, 1, 1 << 20)?, Ordering::Relaxed))) },
     Entry { path: "fs/lease-break-time", get: || format!("{}", crate::locks::LEASE_BREAK_TIME.load(Ordering::Relaxed)), set: Some(|s| Ok(crate::locks::LEASE_BREAK_TIME.store(num(s, 0, i32::MAX as usize)?, Ordering::Relaxed))) },

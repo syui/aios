@@ -359,6 +359,13 @@ pub fn send_sigio(o: &Fown, fd: i32, reason: i32) {
     });
 }
 
+/// ファイルの持ち主に知らせる (dnotify: Linux の dnotify_handle_event の send_sigio)
+pub fn send_file(f: &FileRef, fd: i32, reason: i32) {
+    if let Some(o) = fown_get(f) {
+        send_sigio(&o, fd, reason);
+    }
+}
+
 /// 帯域外のデータ (TCP の urgent、AF_UNIX の MSG_OOB): 持ち主がいれば SIGURG を送って true (Linux の send_sigurg)。
 /// true なら、呼んだ側は kill(key, SIGURG, POLL_PRI) も
 pub fn send_sigurg(f: &FileRef) -> bool {

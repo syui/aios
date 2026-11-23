@@ -3013,7 +3013,16 @@ pub mod notify {
         fn modify_watched(&self) -> bool {
             false
         }
+        /// fcntl の F_NOTIFY (dnotify)。files は呼んだプロセスのファイルの表
+        fn dirnotify(&self, _fd: i32, _f: &crate::file::FileRef, _files: usize, _arg: u32) -> Result<i64, i64> {
+            Err(-22)
+        }
+        /// fd を閉じた (Linux の dnotify_flush): その表の、そのファイル (file: 0 ならみな) の F_NOTIFY を外す
+        fn closed(&self, _files: usize, _file: usize) {}
     }
+
+    /// F_NOTIFY の数 (0 なら fd を閉じるときに見ない)
+    pub static DNOTIFY: AtomicUsize = AtomicUsize::new(0);
 
     struct NoNotify;
 
@@ -3052,5 +3061,15 @@ pub mod notify {
 
     pub fn modify_watched() -> bool {
         NOTIFY.val().modify_watched()
+    }
+
+    pub fn dirnotify(fd: i32, f: &crate::file::FileRef, files: usize, arg: u32) -> Result<i64, i64> {
+        NOTIFY.val().dirnotify(fd, f, files, arg)
+    }
+
+    pub fn closed(files: usize, file: usize) {
+        if DNOTIFY.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+            NOTIFY.val().closed(files, file);
+        }
     }
 }

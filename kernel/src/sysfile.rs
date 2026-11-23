@@ -51,6 +51,7 @@ const F_GETOWN_EX: u64 = 16;
 const F_GETOWNER_UIDS: u64 = 17;
 const F_SETLEASE: u64 = 1024;
 const F_GETLEASE: u64 = 1025;
+const F_NOTIFY: u64 = 1026;
 const F_DUPFD_QUERY: u64 = 1027;
 const F_CREATED_QUERY: u64 = 1028;
 const F_DUPFD_CLOEXEC: u64 = 1030;
@@ -2739,6 +2740,11 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
         // リース (locks.rs: Linux の fcntl_setlease、fcntl_getlease)
         F_SETLEASE => file::locks().setlease(fd as i32, &entry.file.clone(), arg as i32 as i64, false),
         F_GETLEASE => Ok(file::locks().getlease(&entry.file.clone(), false)),
+        // dnotify (inotify.rs: Linux の fcntl_dirnotify)
+        F_NOTIFY => {
+            let f = entry.file.clone();
+            crate::vfs::notify::dirnotify(fd as i32, &f, p as *const proc::Files as usize, arg as u32)
+        }
         // struct delegation { d_flags、d_type、__pad }: d_flags と __pad は 0 (Linux の fcntl_setdeleg、fcntl_getdeleg)
         F_GETDELEG | F_SETDELEG => {
             let mut b = [0u8; 8];

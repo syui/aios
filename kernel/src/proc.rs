@@ -197,6 +197,7 @@ impl Drop for Files {
     fn drop(&mut self) {
         // プロセス (スレッドの組) の終わり: その POSIX のレコードロックをみな外す
         crate::file::locks().release_owner(self as *const Files as usize);
+        crate::vfs::notify::closed(self as *const Files as usize, 0);
     }
 }
 
@@ -311,6 +312,8 @@ impl Files {
         // fd を閉じた (上書きも): そのファイルの、このプロセスの POSIX のレコードロックはみな外れる (locks.rs)
         if let Some(fd) = &old {
             crate::file::locks().release_posix(self as *const Files as usize, &fd.file.borrow());
+            // F_NOTIFY も外れる (Linux の filp_flush の dnotify_flush)
+            crate::vfs::notify::closed(self as *const Files as usize, alloc::rc::Rc::as_ptr(&fd.file) as usize);
         }
         // 閉じたあとの片づけ (AF_UNIX なら、送られている途中の輪が残ったかもしれない: file.rs から unix.rs の gc。
         // システムコールの終わりに)

@@ -986,6 +986,15 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   は外し、下げるものは下げる。leases-enable が 0 なら新しいリースは EINVAL。閉じたら (最後の参照) 外れる。リースがあるあいだ
   は、ロックなしの open (file::fast_open) をしない (file::LEASES)。aios とちがうところ: exec で開くプログラムは書くリースを
   こわさない
+- dnotify (test/dnotify.c、Linux 7.4-rc3 と 20 行同じ。手本の Linux に CONFIG_DNOTIFY を足した): inotify.rs (Linux の
+  fs/notify/dnotify)。fcntl の F_NOTIFY をディレクトリの fd に (ほかは ENOTDIR、0 か DN_MULTISHOT だけなら外す、
+  dir-notify-enable が 0 なら EINVAL)。持ち主がまだなければ自分のプロセスに。同じ表の同じファイルにもう一度なら DN_* を
+  足す (Linux の attach_dn)。inotify のできごとを届けるところ (deliver) で、中のもの (名前つき) かディレクトリ自身 (IN_ISDIR)
+  のできごとなら、DN_CREATE (作る、名前を変えて入る)、DN_DELETE (消す、名前を変えて出る)、DN_MODIFY、DN_ACCESS、
+  DN_ATTRIB、DN_RENAME (名前を変えて出るときに、DN_DELETE とは別のできごと: Linux の FS_RENAME) の持ち主に POLL_MSG
+  (fasync::send_file)。DN_MULTISHOT がなければ 1 度で外れる。置いたプロセスがそのファイルの fd を閉じると外れる (dup した
+  ほうでも: proc::Files::set から vfs::notify::closed。Linux の dnotify_flush)、ファイルの表がなくなっても。見張るあいだは、
+  ロックなしの読み書きと作る・消すをしない (inotify と同じ数: ACCESS_WATCHED ほか)
 - perf の PERF_RECORD_MMAP / MMAP2 (test/perf4.c、Linux 7.4-rc3 と 11 行同じ): perf record が新しく写したライブラリを知る。
   attr.mmap か mmap2 なら実行できる写し、mmap_data なら読み書きのものも (MISC_MMAP_DATA の印)。きっかけは mmap (Linux の
   mmap_region の perf_event_mmap)、実行できなかったところを実行できるようにした mprotect (mprotect_fixup)、exec の
