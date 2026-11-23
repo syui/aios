@@ -2439,6 +2439,10 @@ fn chown(ino: &InodeRef, uid: u64, gid: u64) -> R {
     let (uid, gid) = chown_ids(uid, gid)?;
     let mode = chown_mode(&c, (m.uid, m.gid, m.mode), uid, gid)?;
     break_deleg(ino)?;
+    // ディレクトリでなければ、ファイルの capability は消える (Linux の chown_common の ATTR_KILL_PRIV: id を変えなくても)
+    if m.mode & S_IFMT != vfs::S_IFDIR {
+        vfs::kill_fcaps(ino)?;
+    }
     if uid.is_some() || gid.is_some() {
         ino.set_owner(uid, gid)?;
     }
@@ -4140,12 +4144,9 @@ pub fn setxattr(fd: Option<u64>, dirfd: i64, pathp: usize, at_flags: u64, namep:
         proc::current().pt().copy_in(&mut v, value).ok_or(-EFAULT)?;
     }
     let ino = xattr_target(fd, dirfd, pathp, at_flags, true)?;
-    if name == "security.capability" && size != 0 {
-        // vfs_caps の形 (Linux の validheader: 版 1 は 12 バイト、版 2 は 20、版 3 は 24)
-        let rev = if size >= 4 { u32::from_le_bytes(v[..4].try_into().unwrap()) & 0xff00_0000 } else { 0 };
-        if !matches!((size, rev), (12, 0x0100_0000) | (20, 0x0200_0000) | (24, 0x0300_0000)) {
-            return Err(crate::why::inval());
-        }
+    if name == crate::cred::FCAPS && size != 0 && !crate::cred::fcaps_valid(&v) {
+        // vfs_caps の形 (Linux の validheader: 版 2 は 20 バイト、版 3 は 24。版 1 はつけられない)
+        return Err(crate::why::inval());
     }
     xattr_permission(&ino, &name, true)?;
     xattr_security(&name)?;
@@ -4160,7 +4161,11 @@ pub fn getxattr(fd: Option<u64>, dirfd: i64, pathp: usize, at_flags: u64, namep:
     let name = xattr_name(namep)?;
     let ino = xattr_target(fd, dirfd, pathp, at_flags, false)?;
     xattr_permission(&ino, &name, false)?;
-    let v = ino.getxattr(&name)?;
+    let mut v = ino.getxattr(&name)?;
+    // ファイルの capability は見せる形に (Linux の cap_inode_getsecurity)
+    if name == crate::cred::FCAPS {
+        v = crate::cred::fcaps_show(&v)?;
+    }
     if size == 0 {
         return Ok(v.len() as i64);
     }

@@ -819,7 +819,7 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
         MREMAP => sys_mremap(a[0] as usize, a[1] as usize, a[2] as usize, a[3], a[4] as usize),
         GETRANDOM => sys_getrandom(a[0] as usize, a[1] as usize, a[2] as u32),
         CAPGET => sys_capget(a[0] as usize, a[1] as usize),
-        CAPSET => Err(-crate::cred::EPERM),
+        CAPSET => sys_capset(a[0] as usize, a[1] as usize),
         // OpenBLAS (numpy) などが呼ぶ。get_mempolicy は MPOL_DEFAULT (0) を返す
         MBIND | SET_MEMPOLICY => Ok(0),
         GET_MEMPOLICY => {
@@ -2580,35 +2580,88 @@ fn sys_mincore(addr: usize, len: usize, vec: usize) -> R {
     if gap { Err(-ENOMEM) } else { Ok(0) }
 }
 
-/// capget(hdr, data): capability (root は全部、ほかはなし。aios は capability を分けない)。
-/// 版が違えば、知っている版 (3) を hdr に書いて EINVAL (Linux と同じ。libcap はそれで版を知る)
-fn sys_capget(hdr: usize, data: usize) -> R {
+/// capget と capset の頭 (Linux の cap_validate_magic): 版 1 は 1 組 (下の 32 ビット)、版 2 と 3 は 2 組。ほかの版なら、
+/// 知っている版 (3) を hdr に書いて EINVAL (libcap はそれで版を知る)。答えは (組の数, pid)
+fn cap_header(hdr: usize) -> Result<(usize, i32), i64> {
+    const V1: u32 = 0x1998_0330;
+    const V2: u32 = 0x2007_1026;
     const V3: u32 = 0x2008_0522;
     let pt = proc::current().pt();
     let mut h = [0u8; 8];
     pt.copy_in(&mut h, hdr).ok_or(-EFAULT)?;
     let ver = u32::from_le_bytes(h[..4].try_into().unwrap());
-    if ver != V3 && ver != 0x1998_0330 && ver != 0x2007_1026 {
-        pt.copy_out(hdr, &V3.to_le_bytes()).ok_or(-EFAULT)?;
-        return if data == 0 { Ok(0) } else { Err(crate::why::inval()) };
-    }
+    let n = match ver {
+        V1 => 1,
+        V2 | V3 => 2,
+        _ => {
+            pt.copy_out(hdr, &V3.to_le_bytes()).ok_or(-EFAULT)?;
+            return Err(crate::why::inval());
+        }
+    };
+    Ok((n, i32::from_le_bytes(h[4..].try_into().unwrap())))
+}
+
+/// capget(hdr, data): pid (0 は自分) の effective、permitted、inheritable (Linux の capget と cap_get_target_pid)。
+/// effective と permitted は LSM (AppArmor のプロファイル) が許すものだけ (security_capget)。data が NULL なら、まちがった
+/// 版でも 0 (版を知るため)
+fn sys_capget(hdr: usize, data: usize) -> R {
+    let (n, pid) = match cap_header(hdr) {
+        Ok(v) => v,
+        Err(e) if data == 0 && e == -22 => return Ok(0),
+        Err(e) => return Err(e),
+    };
     if data == 0 {
         return Ok(0);
     }
-    // v1 は 1 組、v2 と v3 は 2 組の {effective, permitted, inheritable}
-    let n = if ver == 0x1998_0330 { 1 } else { 2 };
-    // root はみな (CAP_LAST_CAP の 40 まで: 上の組は 0x1ff)。LSM のラベル (AppArmor のプロファイル) があれば、その LSM が
-    // 許すものだけ (security_capget)
-    let c = crate::cred::current();
-    let all: u64 = if c.euid == 0 { ((1u64 << 41) - 1) & crate::security::capget(c) } else { 0 };
+    if pid < 0 {
+        return Err(crate::why::inval());
+    }
+    let me = proc::current();
+    let t: &proc::Proc = if pid == 0 || crate::ns::to_global(pid as u32) == Some(me.pid) {
+        me
+    } else {
+        crate::ns::to_global(pid as u32).and_then(proc::find_thread).ok_or(-ESRCH)?
+    };
+    let c = &t.cred;
+    let mask = crate::security::capget(c);
+    let (eff, prm, inh) = (c.cap_eff & mask, c.cap_prm & mask, c.cap_inh);
     let mut out = alloc::vec::Vec::new();
     for i in 0..n {
-        let w = (all >> (32 * i)) as u32;
-        out.extend_from_slice(&w.to_le_bytes());
-        out.extend_from_slice(&w.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
+        for v in [eff, prm, inh] {
+            out.extend_from_slice(&((v >> (32 * i)) as u32).to_le_bytes());
+        }
     }
-    pt.copy_out(data, &out).ok_or(-EFAULT)?;
+    proc::current().pt().copy_out(data, &out).ok_or(-EFAULT)?;
+    Ok(0)
+}
+
+/// capset(hdr, data): 自分の effective、permitted、inheritable を変える (Linux の capset と cap_capset)。自分のほかは EPERM。
+/// 版 1 は上の 32 ビットが 0。permitted は広げられない、effective は新しい permitted の中、inheritable は前の inheritable と
+/// bounding の中で、CAP_SETPCAP がなければ前の inheritable と permitted の中。ambient は新しい permitted と inheritable の
+/// 中に。それから LSM (landlock の CAPABILITY_USE: 7.4-rc4 の hook_capset)
+fn sys_capset(hdr: usize, data: usize) -> R {
+    let (n, pid) = cap_header(hdr)?;
+    let me = proc::current();
+    if pid != 0 && crate::ns::to_global(pid as u32) != Some(me.pid) {
+        return Err(-EPERM);
+    }
+    let mut b = [0u8; 24];
+    me.pt().copy_in(&mut b[..12 * n], data).ok_or(-EFAULT)?;
+    let w = |k: usize, i: usize| u32::from_le_bytes(b[12 * i + 4 * k..12 * i + 4 * k + 4].try_into().unwrap()) as u64;
+    let get = |k: usize| (w(k, 0) | w(k, 1) << 32) & cred::CAP_FULL;
+    let (eff, prm, inh) = (get(0), get(1), get(2));
+    let o = &me.cred;
+    if inh & !(o.cap_inh | o.cap_prm) != 0 && !o.has_cap(cred::CAP_SETPCAP) {
+        return Err(-EPERM);
+    }
+    if inh & !(o.cap_inh | o.cap_bset) != 0 || prm & !o.cap_prm != 0 || eff & !prm != 0 {
+        return Err(-EPERM);
+    }
+    crate::security::capset(o, inh)?;
+    let mut c = o.clone();
+    (c.cap_eff, c.cap_prm, c.cap_inh) = (eff, prm, inh);
+    c.cap_amb &= prm & inh;
+    me.cred = c;
     Ok(0)
 }
 
@@ -3193,33 +3246,39 @@ fn sys_prctl(op: u64, arg: usize, arg3: usize, arg4: u64, arg5: u64) -> R {
             let v = l.map_or(p.child_subreaper, |l| l.child_subreaper);
             put_int(arg, v as i32)?;
         }
-        // securebits の KEEP_CAPS (4)。LOCKED (5) なら変えられない
-        PR_GET_KEEPCAPS => return Ok((p.securebits >> 4 & 1) as i64),
+        // securebits の KEEP_CAPS。KEEP_CAPS_LOCKED なら変えられない (Linux の cap_task_prctl)
+        PR_GET_KEEPCAPS => return Ok((p.cred.securebits & cred::SECBIT_KEEP_CAPS != 0) as i64),
         PR_SET_KEEPCAPS => {
             if arg > 1 {
                 return Err(crate::why::inval());
             }
-            if p.securebits & 1 << 5 != 0 {
+            if p.cred.securebits & cred::SECBIT_KEEP_CAPS << 1 != 0 {
                 return Err(-EPERM);
             }
-            p.securebits = p.securebits & !(1 << 4) | (arg as u32) << 4;
+            p.cred.securebits = p.cred.securebits & !cred::SECBIT_KEEP_CAPS | if arg == 1 { cred::SECBIT_KEEP_CAPS } else { 0 };
         }
-        PR_GET_SECUREBITS => return Ok(p.securebits as i64),
-        // CAP_SETPCAP がなければ、知らないビット (0xfff の外)・ロックしたものを変える・ロックを外すのは EPERM (Linux の
-        // cap_task_prctl)
+        PR_GET_SECUREBITS => return Ok(p.cred.securebits as i64),
+        // ロックしたものを変える・ロックを外す・知らないビット (0xfff の外) は EPERM。CAP_SETPCAP がいるのは、変えるのが
+        // ふつうの人のビット (EXEC_RESTRICT_FILE と EXEC_DENY_INTERACTIVE とそのロック) のほかのときと、何も変えない
+        // とき (Linux 7.4-rc4 の securebits_need_setpcap)
         PR_SET_SECUREBITS => {
-            let old = p.securebits as u64;
+            const UNPRIV: u64 = 0xf00;
+            let old = p.cred.securebits as u64;
             let locks = old & 0xaaa;
-            if (locks >> 1) & (old ^ arg as u64) != 0 || locks & !(arg as u64) != 0 || arg as u64 & !0xfff != 0 || !p.cred.capable(cred::CAP_SETPCAP) {
+            if (locks >> 1) & (old ^ arg as u64) != 0 || locks & !(arg as u64) != 0 || arg as u64 & !0xfff != 0 {
                 return Err(-EPERM);
             }
-            p.securebits = arg as u32;
+            let changed = old ^ arg as u64;
+            if (changed == 0 || changed & !UNPRIV != 0) && !p.cred.capable(cred::CAP_SETPCAP) {
+                return Err(-EPERM);
+            }
+            p.cred.securebits = arg as u32;
         }
         PR_CAPBSET_READ => {
             if arg as u64 > CAP_LAST {
                 return Err(crate::why::inval());
             }
-            return Ok((p.capbset_dropped >> arg & 1 == 0) as i64);
+            return Ok((p.cred.cap_bset >> arg & 1) as i64);
         }
         PR_CAPBSET_DROP => {
             if !p.cred.capable(cred::CAP_SETPCAP) {
@@ -3228,24 +3287,37 @@ fn sys_prctl(op: u64, arg: usize, arg3: usize, arg4: u64, arg5: u64) -> R {
             if arg as u64 > CAP_LAST {
                 return Err(crate::why::inval());
             }
-            p.capbset_dropped |= 1 << arg;
+            p.cred.cap_bset &= !(1 << arg);
         }
-        // ambient の capability はない: IS_SET は 0、RAISE は EPERM (継ぐ集合が空: Linux の root も同じ)
+        // ambient (Linux の PR_CAP_AMBIENT): RAISE は permitted と inheritable にあって、NO_CAP_AMBIENT_RAISE でないとき
         PR_CAP_AMBIENT => {
-            if arg == 4 {
+            const IS_SET: usize = 1;
+            const RAISE: usize = 2;
+            const LOWER: usize = 3;
+            const CLEAR_ALL: usize = 4;
+            if arg == CLEAR_ALL {
                 if arg3 != 0 || arg4 != 0 || arg5 != 0 {
                     return Err(crate::why::inval());
                 }
+                p.cred.cap_amb = 0;
                 return Ok(0);
             }
             if arg3 as u64 > CAP_LAST || arg4 != 0 || arg5 != 0 {
                 return Err(crate::why::inval());
             }
-            return match arg {
-                1 | 3 => Ok(0),
-                2 => Err(-EPERM),
-                _ => Err(crate::why::inval()),
-            };
+            let bit = 1u64 << arg3;
+            match arg {
+                IS_SET => return Ok((p.cred.cap_amb & bit != 0) as i64),
+                RAISE => {
+                    let c = &p.cred;
+                    if c.cap_prm & bit == 0 || c.cap_inh & bit == 0 || c.securebits & cred::SECBIT_NO_CAP_AMBIENT_RAISE != 0 {
+                        return Err(-EPERM);
+                    }
+                    p.cred.cap_amb |= bit;
+                }
+                LOWER => p.cred.cap_amb &= !bit,
+                _ => return Err(crate::why::inval()),
+            }
         }
         PR_GET_TIMING => return Ok(0),
         PR_SET_TIMING => {

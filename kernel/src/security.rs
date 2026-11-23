@@ -115,6 +115,10 @@ pub trait Lsm {
     fn capget(&self, _c: &Cred) -> u64 {
         u64::MAX
     }
+    /// capset で inheritable を inh にする (commoncap がたしかめたあと: Linux の security_capset)
+    fn capset(&self, _old: &Cred, _inh: u64) -> Result<(), i64> {
+        Ok(())
+    }
     fn task_kill(&self, _target: &Proc, _sig: i32) -> Result<(), i64> {
         Ok(())
     }
@@ -240,6 +244,14 @@ pub fn capable(c: &Cred, cap: u32, audit: bool) -> bool {
 /// security_capget: root に見せる capability を、それぞれの LSM がせばめる
 pub fn capget(c: &Cred) -> u64 {
     lsms().iter().fold(u64::MAX, |m, l| m & l.capget(c))
+}
+
+/// security_capset: commoncap (syscall.rs の sys_capset) のあとの LSM
+pub fn capset(old: &Cred, inh: u64) -> Result<(), i64> {
+    for l in lsms() {
+        l.capset(old, inh)?;
+    }
+    Ok(())
 }
 
 /// security_task_kill

@@ -15,7 +15,7 @@ pub const S_ISUID: u32 = 0o4000;
 pub const S_ISGID: u32 = 0o2000;
 pub const S_ISVTX: u32 = 0o1000;
 
-// capability の番号 (Linux の include/uapi/linux/capability.h。aios では root がみな持つ: capable)
+// capability の番号 (Linux の include/uapi/linux/capability.h。Cred の 5 つの組のビット)
 pub const CAP_CHOWN: u32 = 0;
 pub const CAP_DAC_OVERRIDE: u32 = 1;
 pub const CAP_DAC_READ_SEARCH: u32 = 2;
@@ -47,6 +47,24 @@ pub const CAP_PERFMON: u32 = 38;
 pub const CAP_CHECKPOINT_RESTORE: u32 = 40;
 /// ファイルの capability (Linux の CAP_FS_SET: fsuid が 0 でなくなると effective から外れるもの)
 pub const FS_CAPS: [u32; 8] = [CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER, CAP_FSETID, CAP_LINUX_IMMUTABLE, CAP_MKNOD, 32];
+/// FS_CAPS のビット (Linux の CAP_FS_MASK)
+pub const CAP_FS_MASK: u64 = {
+    let mut m = 0u64;
+    let mut i = 0;
+    while i < FS_CAPS.len() {
+        m |= 1 << FS_CAPS[i];
+        i += 1;
+    }
+    m
+};
+/// CAP_LAST_CAP (40: CAP_CHECKPOINT_RESTORE) と、みなの組 (Linux の CAP_FULL_SET)
+pub const CAP_LAST: u32 = 40;
+pub const CAP_FULL: u64 = (1 << (CAP_LAST + 1)) - 1;
+/// securebits (Linux の include/uapi/linux/securebits.h)。ロックはそれぞれ 1 つ上のビット
+pub const SECBIT_NOROOT: u32 = 1 << 0;
+pub const SECBIT_NO_SETUID_FIXUP: u32 = 1 << 2;
+pub const SECBIT_KEEP_CAPS: u32 = 1 << 4;
+pub const SECBIT_NO_CAP_AMBIENT_RAISE: u32 = 1 << 6;
 /// capability の名前 (番号の順。AppArmor の記録の capname と features/caps/mask)
 pub const CAP_NAMES: [&str; 41] = [
     "chown", "dac_override", "dac_read_search", "fowner", "fsetid", "kill", "setgid", "setuid", "setpcap", "linux_immutable", "net_bind_service", "net_broadcast", "net_admin", "net_raw",
@@ -66,11 +84,15 @@ pub struct Cred {
     /// setfsgid で変わる
     pub fsuid: u32,
     pub fsgid: u32,
-    /// capability (aios では root がみな持つ) のうち、permitted があるか (uid・euid・suid のどれかが 0 のあいだ: Linux の
-    /// cap_emulate_setxuid)、ファイルのもの (FS_CAPS) が effective にあるか (fsuid を 0 からほかにすると外れ、0 にもどすと
-    /// permitted から入る。euid が 0 からほかになると外れ、0 にもどると入る。exec で euid が 0 なら入る)
-    pub cap_perm: bool,
-    pub fs_caps: bool,
+    /// capability の組 (Linux の cred の cap_inheritable、cap_permitted、cap_effective、cap_bset、cap_ambient: ビット N が
+    /// CAP_N)。使えるのは effective のもの。set*uid (cap_emulate_setxuid)、setfsuid、capset、exec (exec_caps) で変わる
+    pub cap_inh: u64,
+    pub cap_prm: u64,
+    pub cap_eff: u64,
+    pub cap_bset: u64,
+    pub cap_amb: u64,
+    /// securebits (Linux の cred->securebits: PR_GET/SET_SECUREBITS と KEEPCAPS。exec で KEEP_CAPS は外れる)
+    pub securebits: u32,
     pub groups: Vec<u32>,
     /// prctl(PR_SET_NO_NEW_PRIVS): exec で setuid / setgid のビットを見ない。外せない
     pub no_new_privs: bool,
@@ -95,23 +117,21 @@ pub struct Cred {
 }
 
 impl Cred {
-    pub const ROOT: Cred = Cred { uid: 0, euid: 0, suid: 0, gid: 0, egid: 0, sgid: 0, fsuid: 0, fsgid: 0, cap_perm: true, fs_caps: true, groups: Vec::new(), no_new_privs: false, sandbox: None, seccomp: None, ns: crate::ns::Ns::INIT, label: None, label_ctx: None, audit_tty: 0, loginuid: u32::MAX, sessionid: u32::MAX };
+    pub const ROOT: Cred = Cred { uid: 0, euid: 0, suid: 0, gid: 0, egid: 0, sgid: 0, fsuid: 0, fsgid: 0, cap_inh: 0, cap_prm: CAP_FULL, cap_eff: CAP_FULL, cap_bset: CAP_FULL, cap_amb: 0, securebits: 0, groups: Vec::new(), no_new_privs: false, sandbox: None, seccomp: None, ns: crate::ns::Ns::INIT, label: None, label_ctx: None, audit_tty: 0, loginuid: u32::MAX, sessionid: u32::MAX };
 
     /// gid の組にいるか (Linux の in_group_p: fsgid と、ほかの組)
     pub fn in_group(&self, gid: u32) -> bool {
         self.fsgid == gid || self.groups.contains(&gid)
     }
 
-    /// その capability が effective にあるか: ファイルのもの (FS_CAPS) は fs_caps、ほかは euid が 0 (aios では root が
-    /// みな持つ)
+    /// その capability が effective にあるか (Linux の cap_capable。aios ではいつもはじめのユーザーの namespace で)
     // [lockless]
-    fn has_cap(&self, cap: u32) -> bool {
-        if FS_CAPS.contains(&cap) { self.fs_caps } else { self.euid == 0 }
+    pub fn has_cap(&self, cap: u32) -> bool {
+        cap <= CAP_LAST && self.cap_eff >> cap & 1 != 0
     }
 
-    /// cap を持つか (Linux の capable)。aios では root (euid 0) がみな持つ。持っていても LSM (AppArmor のプロファイル
-    /// など) が許さなければ持たない (記録する: security::capable)。要るときだけ呼ぶ (持ち主などで足りるなら先にそちらを:
-    /// Linux と同じ順)
+    /// cap を持つか (Linux の capable): effective にあり、LSM (landlock の CAPABILITY_USE、AppArmor のプロファイルなど) も
+    /// 許すとき (記録する: security::capable)。要るときだけ呼ぶ (持ち主などで足りるなら先にそちらを: Linux と同じ順)
     // [lockless]
     pub fn capable(&self, cap: u32) -> bool {
         self.has_cap(cap) && self.lsm_capable(cap, true)
@@ -144,12 +164,17 @@ impl Cred {
         if bits & want == want {
             return true;
         }
-        // access(2) は実の id で、実の uid が 0 なら capability がある (Linux の access_override_creds)。ふつうは effective の
-        // ファイルの capability (fsuid を 0 でなくすと外れる)
-        if if real { uid != 0 } else { !self.fs_caps } {
+        // access(2) は実の id で、capability は実の uid が 0 なら permitted、ほかはなし (Linux の access_override_creds。
+        // SECBIT_NO_SETUID_FIXUP ならそのまま)。ふつうは effective (fsuid を 0 でなくすとファイルのものは外れる)
+        let caps = if real && self.securebits & SECBIT_NO_SETUID_FIXUP == 0 {
+            if uid == 0 { self.cap_prm } else { 0 }
+        } else {
+            self.cap_eff
+        };
+        if caps & CAP_FS_MASK == 0 {
             return false;
         }
-        let cap = |c: u32| self.lsm_capable(c, true);
+        let cap = |c: u32| caps >> c & 1 != 0 && self.lsm_capable(c, true);
         if m.mode & S_IFMT == S_IFDIR {
             return (want & W == 0 && cap(CAP_DAC_READ_SEARCH)) || cap(CAP_DAC_OVERRIDE);
         }
@@ -171,7 +196,7 @@ impl Cred {
     /// may の答えを決めた組: 0 持ち主、1 グループ、2 ほか、3 root (why.rs)
     pub fn class(&self, m: &Meta, real: bool) -> u8 {
         let (uid, gid) = if real { (self.uid, self.gid) } else { (self.fsuid, self.fsgid) };
-        if if real { uid == 0 } else { self.fs_caps } {
+        if if real { uid == 0 } else { self.cap_eff & CAP_FS_MASK != 0 } {
             3
         } else if m.uid == uid {
             0
@@ -186,6 +211,119 @@ impl Cred {
     pub fn owns(&self, m: &Meta) -> bool {
         self.fsuid == m.uid || self.capable(CAP_FOWNER)
     }
+}
+
+/// ファイルの capability の拡張属性 (Linux の XATTR_NAME_CAPS: vfs_cap_data は magic_etc と {permitted, inheritable} の
+/// 2 組、版 3 の vfs_ns_cap_data はそのあとに rootid)
+pub const FCAPS: &str = "security.capability";
+const VFS_CAP_REVISION_MASK: u32 = 0xff00_0000;
+const VFS_CAP_REVISION_2: u32 = 0x0200_0000;
+const VFS_CAP_REVISION_3: u32 = 0x0300_0000;
+const VFS_CAP_FLAGS_EFFECTIVE: u32 = 1;
+
+fn fcaps_word(v: &[u8], i: usize) -> u32 {
+    u32::from_le_bytes(v[4 * i..4 * i + 4].try_into().unwrap())
+}
+
+/// setxattr で受ける形 (Linux の validheader と cap_convert_nscap): 版 2 (20 バイト) と版 3 (24 バイト。rootid が -1 は
+/// だめ) だけ。ほかは EINVAL
+pub fn fcaps_valid(v: &[u8]) -> bool {
+    let rev = if v.len() >= 4 { fcaps_word(v, 0) & VFS_CAP_REVISION_MASK } else { 0 };
+    match (rev, v.len()) {
+        (VFS_CAP_REVISION_2, 20) => true,
+        (VFS_CAP_REVISION_3, 24) => fcaps_word(v, 5) != u32::MAX,
+        _ => false,
+    }
+}
+
+/// exec で読むファイルの capability (Linux の get_vfs_caps_from_disk): (permitted, inheritable, effective)。版 1 は下の
+/// 32 ビットだけ。版 3 の rootid が 0 でなければ (はじめのユーザーの namespace の root のものでない) None。形がちがえば EINVAL
+pub fn fcaps_parse(v: &[u8]) -> Result<Option<(u64, u64, bool)>, i64> {
+    if v.len() < 4 {
+        return Err(-22);
+    }
+    let magic = fcaps_word(v, 0);
+    let two = match (magic & VFS_CAP_REVISION_MASK, v.len()) {
+        (0x0100_0000, 12) => false,
+        (VFS_CAP_REVISION_2, 20) => true,
+        (VFS_CAP_REVISION_3, 24) if fcaps_word(v, 5) != 0 => return Ok(None),
+        (VFS_CAP_REVISION_3, 24) => true,
+        _ => return Err(-22),
+    };
+    let (mut p, mut i) = (fcaps_word(v, 1) as u64, fcaps_word(v, 2) as u64);
+    if two {
+        p |= (fcaps_word(v, 3) as u64) << 32;
+        i |= (fcaps_word(v, 4) as u64) << 32;
+    }
+    Ok(Some((p & CAP_FULL, i & CAP_FULL, magic & VFS_CAP_FLAGS_EFFECTIVE != 0)))
+}
+
+/// getxattr で見せる形 (Linux の cap_inode_getsecurity): magic は版と effective のビットだけに。版 3 は rootid が 0 なら
+/// 版 2 に (このユーザーの namespace の root のもの)、ほかはそのまま。ほかの形は EINVAL
+pub fn fcaps_show(v: &[u8]) -> Result<Vec<u8>, i64> {
+    let rev = if v.len() >= 4 { fcaps_word(v, 0) & VFS_CAP_REVISION_MASK } else { 0 };
+    let eff = if v.len() >= 4 { fcaps_word(v, 0) & VFS_CAP_FLAGS_EFFECTIVE } else { 0 };
+    let (rev, len) = match (rev, v.len()) {
+        (VFS_CAP_REVISION_2, 20) => (VFS_CAP_REVISION_2, 20),
+        (VFS_CAP_REVISION_3, 24) if fcaps_word(v, 5) == 0 => (VFS_CAP_REVISION_2, 20),
+        (VFS_CAP_REVISION_3, 24) => (VFS_CAP_REVISION_3, 24),
+        _ => return Err(-22),
+    };
+    let mut out = v[..len].to_vec();
+    out[..4].copy_from_slice(&(rev | eff).to_le_bytes());
+    Ok(out)
+}
+
+/// exec のあとの capability (exec_caps の答え)
+#[derive(Clone, Copy, Default)]
+pub struct ExecCaps {
+    pub prm: u64,
+    pub eff: u64,
+    pub amb: u64,
+    /// 権利の上がる exec (AT_SECURE)
+    pub secure: bool,
+    /// 権利の上がる exec を、あやうい形 (no_new_privs や、CAP_SYS_PTRACE のない tracer) でしたので permitted を前の中に
+    /// しぼった (euid / egid も、CAP_SETUID がなければ実の id に)
+    pub downgrade: bool,
+}
+
+/// exec のあとの capability (Linux の cap_bprm_creds_from_file)。c は exec の前の資格、(euid, egid) は exec のあと
+/// (setuid / setgid のビットで変わったもの)、file はファイルの capability (permitted, inheritable, effective のビット)、
+/// unsafe_ は no_new_privs か、CAP_SYS_PTRACE のない tracer に ptrace されているか。ファイルの permitted が bounding に
+/// なくて effective のビットがあれば EPERM (そのままでは動けないプログラム)
+pub fn exec_caps(c: &Cred, euid: u32, egid: u32, file: Option<(u64, u64, bool)>, unsafe_: bool) -> Result<ExecCaps, i64> {
+    // pP' = (X & fP) | (pI & fI)、pE' は fE しだい
+    let (mut prm, mut effective) = (0u64, false);
+    if let Some((fp, fi, fe)) = file {
+        prm = (c.cap_bset & fp) | (c.cap_inh & fi);
+        effective = fe;
+        if fe && fp & !prm != 0 {
+            return Err(-EPERM);
+        }
+    }
+    // root (Linux の handle_privileged_root): SECBIT_NOROOT でなければ、uid か euid が 0 なら permitted は bounding と
+    // inheritable のみな、euid が 0 なら effective も。ファイルの capability のある setuid root のものを root でない人が
+    // exec するときは、ファイルのもののまま
+    if c.securebits & SECBIT_NOROOT == 0 && !(file.is_some() && c.uid != 0 && euid == 0) {
+        if euid == 0 || c.uid == 0 {
+            prm = c.cap_bset | c.cap_inh;
+        }
+        if euid == 0 {
+            effective = true;
+        }
+    }
+    // 人が変わる (exec の前の実の id とちがう) か permitted がふえるのに、あやうい形なら、前のものの中だけ
+    let setid = euid != c.uid || egid != c.gid;
+    let downgrade = (setid || prm & !c.cap_prm != 0) && unsafe_;
+    if downgrade {
+        prm &= c.cap_prm;
+    }
+    // ファイルの capability か setid なら ambient はなくなる。pP' に pA' を足し、pE' = fE ? pP' : pA'
+    let amb = if file.is_some() || setid { 0 } else { c.cap_amb };
+    let prm = prm | amb;
+    let eff = if effective { prm } else { amb };
+    let secure = setid || (c.uid != 0 && (effective || prm & !amb != 0));
+    Ok(ExecCaps { prm, eff, amb, secure, downgrade })
 }
 
 /// SO_PRIORITY を 7 より上に、SO_MARK をつける: CAP_NET_RAW か CAP_NET_ADMIN (Linux の sk_set_prio_allowed)
@@ -212,17 +350,24 @@ fn set_ids(uid: bool, f: impl FnOnce(&mut Cred) -> Result<(), i64>) -> Res {
     if uid {
         let o = &p.cred;
         c.fsuid = c.euid;
-        let (had, has) = (o.uid == 0 || o.euid == 0 || o.suid == 0, c.uid == 0 || c.euid == 0 || c.suid == 0);
-        // uid・euid・suid がみな 0 でなくなった: permitted も effective も空に
-        if had && !has {
-            (c.cap_perm, c.fs_caps) = (false, false);
-        }
-        // euid が 0 からほかへ: effective を空に。ほかから 0 へ: effective を permitted に
-        if o.euid == 0 && c.euid != 0 {
-            c.fs_caps = false;
-        }
-        if o.euid != 0 && c.euid == 0 {
-            c.fs_caps = c.cap_perm;
+        // capability を uid にあわせる (Linux の cap_emulate_setxuid。SECBIT_NO_SETUID_FIXUP なら何もしない)
+        if o.securebits & SECBIT_NO_SETUID_FIXUP == 0 {
+            let (had, has) = (o.uid == 0 || o.euid == 0 || o.suid == 0, c.uid == 0 || c.euid == 0 || c.suid == 0);
+            // uid・euid・suid がみな 0 でなくなった: permitted と effective を空に (SECBIT_KEEP_CAPS なら残す)。ambient は
+            // いつも空に (root でなくなったあとの exec で capability が残らないように)
+            if had && !has {
+                if o.securebits & SECBIT_KEEP_CAPS == 0 {
+                    (c.cap_prm, c.cap_eff) = (0, 0);
+                }
+                c.cap_amb = 0;
+            }
+            // euid が 0 からほかへ: effective を空に。ほかから 0 へ: effective を permitted に
+            if o.euid == 0 && c.euid != 0 {
+                c.cap_eff = 0;
+            }
+            if o.euid != 0 && c.euid == 0 {
+                c.cap_eff = c.cap_prm;
+            }
         }
     } else {
         c.fsgid = c.egid;
@@ -465,11 +610,14 @@ pub fn setfsuid(uid: u64) -> Res {
     }
     let mut c = p.cred.clone();
     c.fsuid = u;
-    if old == 0 && u != 0 {
-        c.fs_caps = false;
-    }
-    if old != 0 && u == 0 {
-        c.fs_caps = c.cap_perm;
+    // ファイルの capability を fsuid にあわせる (Linux の cap_task_fix_setuid の LSM_SETID_FS)
+    if c.securebits & SECBIT_NO_SETUID_FIXUP == 0 {
+        if old == 0 && u != 0 {
+            c.cap_eff &= !CAP_FS_MASK;
+        }
+        if old != 0 && u == 0 {
+            c.cap_eff |= c.cap_prm & CAP_FS_MASK;
+        }
     }
     changed(p, &c);
     p.cred = c;

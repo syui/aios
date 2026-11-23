@@ -135,6 +135,11 @@ pub trait Inode {
     fn getxattr(&self, _name: &str) -> Result<Vec<u8>, i64> {
         Err(-EOPNOTSUPP)
     }
+    /// 拡張属性があるかもしれないか (安く: ext4 は inode の中か xattr のブロックがあれば)。ないなら書くときに
+    /// security.capability を見ない (Linux の S_NOSEC のかわり)
+    fn may_have_xattrs(&self) -> bool {
+        false
+    }
     /// value が None なら消す (なければ ENODATA)。flags は XATTR_CREATE (1: あれば EEXIST) と XATTR_REPLACE (2: なければ
     /// ENODATA)
     fn setxattr(&self, _name: &str, _value: Option<&[u8]>, _flags: u32) -> Result<(), i64> {
@@ -367,7 +372,12 @@ pub fn write_sealed(ino: &InodeRef, off: usize, len: usize) -> Result<(), i64> {
 pub fn drop_privs(ino: &InodeRef) -> Result<(), i64> {
     use crate::cred::{S_ISGID, S_ISUID};
     let m = ino.meta();
-    if m.mode & S_IFMT != S_IFREG || m.mode & (S_ISUID | S_ISGID) == 0 {
+    if m.mode & S_IFMT != S_IFREG {
+        return Ok(());
+    }
+    // ファイルの capability は、だれが書いても消える (Linux の file_remove_privs の security_inode_need_killpriv)
+    kill_fcaps(ino)?;
+    if m.mode & (S_ISUID | S_ISGID) == 0 {
         return Ok(());
     }
     let c = crate::cred::current();
@@ -379,6 +389,19 @@ pub fn drop_privs(ino: &InodeRef) -> Result<(), i64> {
         return Ok(());
     }
     ino.set_mode(m.mode & 0o7777 & !kill)
+}
+
+/// ファイルの capability (security.capability) を消す (Linux の cap_inode_killpriv: 書く、切りつめる、chown で)
+pub fn kill_fcaps(ino: &InodeRef) -> Result<(), i64> {
+    const ENODATA: i64 = 61;
+    if ino.may_have_xattrs() && ino.getxattr(crate::cred::FCAPS).is_ok() {
+        match ino.setxattr(crate::cred::FCAPS, None, 0) {
+            Ok(()) => {}
+            Err(e) if e == -ENODATA => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 static ROOT: Bkl<Option<InodeRef>> = Bkl::new(None);

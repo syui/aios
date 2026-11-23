@@ -66,6 +66,10 @@ pub struct Image {
     /// setuid / setgid のビットで変わる euid / egid
     pub setuid: Option<u32>,
     pub setgid: Option<u32>,
+    /// exec のあとの euid / egid (setuid / setgid のビットを効かせたあと) と capability
+    pub euid: u32,
+    pub egid: u32,
+    pub caps: crate::cred::ExecCaps,
     pub pagetable: PageTable,
     pub entry: usize,
     pub sp: usize,
@@ -321,6 +325,22 @@ fn exec_depth(t: Target, execfn: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth
     let keep = c.no_new_privs || c.ns.user.is_some();
     let euid = setuid.filter(|_| !keep).unwrap_or(c.euid);
     let egid = setgid.filter(|_| !keep).unwrap_or(c.egid);
+    // capability (Linux の cap_bprm_creds_from_file)。no_new_privs か、CAP_SYS_PTRACE のない tracer に ptrace されて
+    // いれば (Linux の bprm->unsafe と ptracer_capable)、権利の上がる exec でも permitted は前のものの中だけ、euid と
+    // egid も CAP_SETUID がなければ実の id に
+    let tracer = crate::proc::try_current().map_or(0, |me| me.ptracer);
+    let traced = tracer != 0 && crate::proc::find_leader_any(tracer).is_none_or(|t| !t.cred.capable_noaudit(crate::cred::CAP_SYS_PTRACE));
+    // ファイルの capability (security.capability: Linux の get_file_caps。nosuid のマウントのものは見ない)
+    let fcaps = if suid_ok && ino.may_have_xattrs() {
+        match ino.getxattr(crate::cred::FCAPS) {
+            Ok(v) => crate::cred::fcaps_parse(&v)?,
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    let caps = crate::cred::exec_caps(c, euid, egid, fcaps, c.no_new_privs || traced)?;
+    let (euid, egid) = if caps.downgrade && (c.no_new_privs || !c.capable(crate::cred::CAP_SETUID)) { (c.uid, c.gid) } else { (euid, egid) };
     // Linux の create_elf_tables と同じ順 (arm64 の ARCH_DLINFO が先: AT_SYSINFO_EHDR と AT_MINSIGSTKSZ)
     let auxv: [(u64, u64); NAUXV] = [
         if vdso { (AT_SYSINFO_EHDR, crate::vdso::VDSO_VA as u64) } else { (AT_IGNORE, 0) },
@@ -339,7 +359,7 @@ fn exec_depth(t: Target, execfn: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth
         (AT_GID, crate::ns::show_gid(c.gid) as u64),
         (AT_EGID, crate::ns::show_gid(egid) as u64),
         // LSM が環境を消す移りかた (AppArmor の Px など) なら 1: ld.so が LD_* を見ない
-        (AT_SECURE, bprm.secure as u64),
+        (AT_SECURE, (bprm.secure || caps.secure) as u64),
         (AT_RANDOM, random as u64),
         (AT_HWCAP2, hw.1),
         (AT_HWCAP3, 0),
@@ -368,7 +388,7 @@ fn exec_depth(t: Target, execfn: &str, argv: &[Vec<u8>], envp: &[Vec<u8>], depth
     }
     pt.copy_out(sp, &img).ok_or(-ENOMEM)?;
 
-    Ok(Image { setuid, setgid, pagetable: pt, entry, sp, brk, exe, exe_id: ino.id(), args, bprm, nondump, auxv: saved })
+    Ok(Image { setuid, setgid, euid, egid, caps, pagetable: pt, entry, sp, brk, exe, exe_id: ino.id(), args, bprm, nondump, auxv: saved })
 }
 
 

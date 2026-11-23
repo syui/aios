@@ -985,9 +985,10 @@ struct Xa {
     value: Vec<u8>,
 }
 
-/// 名前空間つきの名前から (番号, 名前): "user." と "trusted." だけ。名前空間だけ ("user.") は EINVAL
+/// 名前空間つきの名前から (番号, 名前): "user."、"trusted."、"security." (Linux の EXT4_FS_SECURITY: ファイルの
+/// capability)。名前空間だけ ("user.") は EINVAL
 fn xa_name(name: &str) -> Result<(u8, Vec<u8>), i64> {
-    for (p, i) in [("user.", 1u8), ("trusted.", 4)] {
+    for (p, i) in [("user.", 1u8), ("trusted.", 4), ("security.", 6)] {
         if let Some(s) = name.strip_prefix(p) {
             if s.is_empty() {
                 return Err(-EINVAL);
@@ -2568,6 +2569,12 @@ impl ExtFs {
         }
         let start = 128 + u16_at(&r.0, 0x80) as usize;
         (start + 8 <= self.inode_size).then_some((start, self.inode_size))
+    }
+
+    /// 拡張属性があるかもしれないか (inode の中の頭か、xattr のブロック)
+    // [lockless]
+    fn has_xattrs(&self, r: &Raw) -> bool {
+        Self::xa_block_of(r) != 0 || matches!(self.xa_ibody(r), Some((s, _)) if u32_at(&r.0, s) == XATTR_MAGIC)
     }
 
     /// 拡張属性をみな読む: (inode の中のもの、ブロックのもの、ブロックの (番号, 数え))
@@ -4601,7 +4608,7 @@ impl ExtFs {
         let Some(r) = crate::proc::noio(|| self.read_inode(ino).ok()) else { return refuse(1) };
         let size = r.size() as usize;
         let off = off.unwrap_or(size);
-        if r.mode() & S_IFMT != S_IFREG || r.mode() & 0o6000 != 0 || r.links() == 0 || off != size || r.flags() & (IMMUTABLE_FL | APPEND_FL | INLINE_DATA_FL) != 0 || r.flags() & EXTENTS_FL == 0 || !self.cached(self.inode_loc(ino).0) || unsafe { &*self.swapfiles.0.as_ptr() }.contains(&ino) {
+        if r.mode() & S_IFMT != S_IFREG || r.mode() & 0o6000 != 0 || self.has_xattrs(&r) || r.links() == 0 || off != size || r.flags() & (IMMUTABLE_FL | APPEND_FL | INLINE_DATA_FL) != 0 || r.flags() & EXTENTS_FL == 0 || !self.cached(self.inode_loc(ino).0) || unsafe { &*self.swapfiles.0.as_ptr() }.contains(&ino) {
             // スワップの印 (swapfiles) を変えるのはひとりで持つときだけ (set_swapfile) なので、帳簿のロックなしで見る
             return refuse(1);
         }
@@ -5881,11 +5888,17 @@ impl Inode for ExtInode {
                 let p = match x.index {
                     1 => "user.",
                     4 => "trusted.",
+                    6 => "security.",
                     _ => return None,
                 };
                 Some(alloc::format!("{}{}", p, String::from_utf8_lossy(&x.name)))
             })
             .collect())
+    }
+
+    fn may_have_xattrs(&self) -> bool {
+        let _e = fs_lock();
+        self.raw().is_ok_and(|r| self.fs.has_xattrs(&r))
     }
 
     fn id(&self) -> (usize, u64) {

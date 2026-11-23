@@ -547,10 +547,6 @@ pub struct Proc {
     pub pdeath_signal: u8,
     /// みなし子をひきとる (PR_SET_CHILD_SUBREAPER: 代表スレッドに。fork では受けつがない: Linux の is_child_subreaper)
     pub child_subreaper: bool,
-    /// securebits (PR_GET/SET_SECUREBITS と KEEPCAPS: Linux の cred->securebits。exec で KEEP_CAPS は外れる) と、
-    /// 落とした capability (PR_CAPBSET_DROP: ビットが立っているものが落としたもの)。aios は覚えて見せるだけ
-    pub securebits: u32,
-    pub capbset_dropped: u64,
     /// PR_MCE_KILL (0 既定、1 遅く、2 はやく: Linux の PF_MCE_PROCESS と PF_MCE_EARLY)。aios は覚えて見せるだけ
     pub mce_kill: u8,
     /// nice (-20..19) とスケジューラの決まり (Linux の task の static_prio と policy: スレッドごと。fork とスレッドで
@@ -797,8 +793,6 @@ impl Proc {
         sysno: -1,
         pdeath_signal: 0,
         child_subreaper: false,
-        securebits: 0,
-        capbset_dropped: 0,
         mce_kill: 0,
         nvcsw: 0,
         nivcsw: 0,
@@ -2779,10 +2773,7 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
         child.oom_score_adj = l.oom_score_adj;
         child.oom_score_adj_min = l.oom_score_adj_min;
     }
-    // personality とタイマーのゆとりはスレッドごと (copy_process: ゆとりの既定は親のいまの値)。securebits と落とした
-    // capability は資格 (cred) と同じく受けつぐ。PDEATHSIG は受けつがない
-    child.securebits = parent.securebits;
-    child.capbset_dropped = parent.capbset_dropped;
+    // personality とタイマーのゆとりはスレッドごと (copy_process: ゆとりの既定は親のいまの値)。PDEATHSIG は受けつがない
     child.mce_kill = parent.mce_kill;
     child.personality = parent.personality;
     // nice と決まりは受けつぐ。SCHED_RESET_ON_FORK なら、実時間は SCHED_OTHER に、負の nice は 0 に、slice は既定に
@@ -2957,21 +2948,19 @@ fn finish_exec(p: &mut Proc, img: Image, comm: &str) {
     let mut dumpable = if img.nondump || p.cred.euid != p.cred.uid || p.cred.egid != p.cred.gid { suid_dumpable } else { 1 };
     let (old_euid, old_egid, old_fsuid, old_fsgid) = (p.cred.euid, p.cred.egid, p.cred.fsuid, p.cred.fsgid);
     // setuid / setgid のプログラムなら euid / egid (と保存された id) が変わる。no_new_privs なら変えない
-    // (砂場の中から sudo で外へ出られないように)
-    if let Some(u) = img.setuid.filter(|_| !p.cred.no_new_privs && p.cred.ns.user.is_none()) {
-        p.cred.euid = u;
-    }
-    if let Some(g) = img.setgid.filter(|_| !p.cred.no_new_privs && p.cred.ns.user.is_none()) {
-        p.cred.egid = g;
-    }
+    // (砂場の中から sudo で外へ出られないように: exec.rs が決めたもの)
+    p.cred.euid = img.euid;
+    p.cred.egid = img.egid;
     p.cred.suid = p.cred.euid;
     p.cred.sgid = p.cred.egid;
-    // fs の id は euid と egid に、capability は作りなおす (Linux の cap_bprm_creds_from_file: root (uid か euid が 0) は
-    // permitted がみな、euid が 0 なら effective も。ほかは空)
+    // fs の id は euid と egid に、capability は exec.rs が作りなおしたもの (Linux の cap_bprm_creds_from_file: cred::exec_caps)。
+    // KEEP_CAPS は exec で外れる
     p.cred.fsuid = p.cred.euid;
     p.cred.fsgid = p.cred.egid;
-    p.cred.cap_perm = p.cred.uid == 0 || p.cred.euid == 0;
-    p.cred.fs_caps = p.cred.euid == 0;
+    p.cred.cap_prm = img.caps.prm;
+    p.cred.cap_eff = img.caps.eff;
+    p.cred.cap_amb = img.caps.amb;
+    p.cred.securebits &= !crate::cred::SECBIT_KEEP_CAPS;
     p.set_comm(comm.as_bytes());
     crate::security::audit_proctitle_free(p);
     // 他のスレッドは消える
@@ -3017,11 +3006,10 @@ fn finish_exec(p: &mut Proc, img: Image, comm: &str) {
         dumpable = suid_dumpable;
     }
     p.mm().dumpable = dumpable;
-    // id が変われば PDEATHSIG は外れる (commit_creds)。KEEP_CAPS は exec で外れる
+    // id が変われば PDEATHSIG は外れる (commit_creds)
     if p.cred.euid != old_euid || p.cred.egid != old_egid || p.cred.fsuid != old_fsuid || p.cred.fsgid != old_fsgid {
         p.pdeath_signal = 0;
     }
-    p.securebits &= !(1 << 4);
     if fatal {
         crate::signal::send_thread(p, crate::signal::SIGSEGV, crate::signal::SigInfo::from(crate::signal::SI_KERNEL));
     }

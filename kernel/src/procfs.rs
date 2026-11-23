@@ -999,8 +999,6 @@ fn status_text(p: &Proc, threads: usize, sig: &str) -> String {
         None => (0, 0, 0, [0; 9], 0, 0),
     };
     let kb = |pages: usize| pages * 4;
-    let caps: u64 = if c.euid == 0 { ((1u64 << 41) - 1) & crate::security::capget(c) } else { 0 };
-    let bnd = ((1u64 << 41) - 1) & !p.capbset_dropped;
     let cpus = crate::smp::online().max(1);
     let mut s = String::new();
     s += &format!("Name:\t{}\n", p.comm());
@@ -1045,7 +1043,7 @@ fn status_text(p: &Proc, threads: usize, sig: &str) -> String {
     }
     s += &format!("Threads:\t{}\n", threads);
     s += sig;
-    s += &format!("CapInh:\t{:016x}\nCapPrm:\t{:016x}\nCapEff:\t{:016x}\nCapBnd:\t{:016x}\nCapAmb:\t{:016x}\n", 0, caps, caps, bnd, 0);
+    s += &format!("CapInh:\t{:016x}\nCapPrm:\t{:016x}\nCapEff:\t{:016x}\nCapBnd:\t{:016x}\nCapAmb:\t{:016x}\n", c.cap_inh, c.cap_prm, c.cap_eff, c.cap_bset, c.cap_amb);
     s += &format!("NoNewPrivs:\t{}\nSeccomp:\t{}\nSeccomp_filters:\t{}\n", c.no_new_privs as u8, crate::seccomp::mode(c).0, crate::seccomp::mode(c).1);
     s += &format!("Landlock:\t{}\n", crate::landlock::layers(c));
     s += &spec_status(p.spec_ssb);

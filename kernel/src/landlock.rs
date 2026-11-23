@@ -629,6 +629,15 @@ impl crate::security::Lsm for Landlock {
         cap_ok(c, cap)
     }
 
+    /// hook_capset (7.4-rc4): inheritable を前の inheritable と permitted の外へ広げるのは CAP_SETPCAP を使うこと (commoncap
+    /// の cap_inh_is_capped は LSM を通らないので、ここで層にも聞く)
+    fn capset(&self, old: &crate::cred::Cred, inh: u64) -> Result<(), i64> {
+        if inh & !(old.cap_inh | old.cap_prm) != 0 && !cap_ok(old, crate::cred::CAP_SETPCAP) {
+            return Err(-EPERM);
+        }
+        Ok(())
+    }
+
     /// hook_task_kill: 層のある送り主が、ほかのスレッドグループの層の外の相手へ送るのは EPERM
     fn task_kill(&self, target: &crate::proc::Proc, _sig: i32) -> Result<(), i64> {
         let me = crate::proc::current();

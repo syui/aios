@@ -3151,6 +3151,46 @@ sysdiff は CI の 800 case の答えが rc3 と版の行のほかは同じ。�
 (なくして) 1 を返す (__skb_datagram_iter の short_copy: 入れ物の残りが 0 なら写せなくてもまちがいではない)。aios は EFAULT
 だったのを同じにした。
 
+### capability の 5 つの組 (2026-11-23)
+
+前の aios の capability は「root (euid 0) ならみな持つ」だけだった (Cred の cap_perm と fs_caps の 2 つの印)。capset(2) は
+いつも EPERM、capget は root ならみな、PR_CAPBSET_DROP と securebits は覚えて見せるだけ、ambient はなかった。docker や
+systemd (CapabilityBoundingSet、AmbientCapabilities)、ping の cap_net_raw+ep、libcap の cap_set_proc を使うものは、root から
+capability を落とせず、ふつうの人に capability を渡せなかった。いまは Linux の cred と同じ 5 つの組 (cap_inh、cap_prm、cap_eff、
+cap_bset、cap_amb) と securebits を Cred に持ち、使えるのは effective のもの (cred::has_cap):
+
+- capget: 版 1 (下の 32 ビット)・2・3、ほかの pid (ESRCH)、pid が負なら EINVAL、まちがった版は版 3 を書いて EINVAL (data が
+  NULL なら 0)。effective と permitted は LSM (AppArmor) がせばめる
+- capset: 自分だけ (ほかの pid は EPERM)、permitted は広げられない、effective は新しい permitted の中、inheritable は前の
+  inheritable と bounding の中で、CAP_SETPCAP がなければ前の inheritable と permitted の中 (cap_inh_is_capped)。ambient は
+  新しい permitted と inheritable の中にしぼる。版 1 は上の 32 ビットが 0。そのあと LSM の capset (Landlock の 7.4-rc4 の
+  hook_capset: inheritable を広げるのは CAP_SETPCAP を使うこと)
+- set*uid: uid・euid・suid がみな 0 でなくなれば permitted と effective を空に (SECBIT_KEEP_CAPS なら残す)、ambient はいつも
+  空に。euid が 0 から出れば effective を空に、0 にもどれば permitted に (cap_emulate_setxuid)。setfsuid はファイルの
+  capability (CAP_FS_MASK: CHOWN、DAC_*、FOWNER、FSETID、LINUX_IMMUTABLE、MKNOD、MAC_OVERRIDE) を出し入れ。
+  SECBIT_NO_SETUID_FIXUP ならどれもしない。access(2) は実の uid が 0 なら permitted で (access_override_creds)
+- exec (cred::exec_caps: Linux の cap_bprm_creds_from_file): pP' = (bounding & fP) | (pI & fI) | pA'、pE' = fE ? pP' : pA'。
+  root (uid か euid が 0) は permitted が bounding と inheritable のみな、euid が 0 なら effective も (SECBIT_NOROOT ならしない。
+  ファイルの capability のある setuid root のものを root でない人が使うときもしない)。ファイルの capability か setid なら
+  ambient はなくなる。ファイルの permitted が bounding になくて effective のビットがあれば EPERM。no_new_privs か、
+  CAP_SYS_PTRACE のない tracer に ptrace されていれば、権利の上がる exec でも permitted は前のものの中だけ (euid と egid も
+  CAP_SETUID がなければ実の id に)。KEEP_CAPS は外れる。権利の上がる exec は AT_SECURE
+- prctl: KEEPCAPS、SECUREBITS (ロック、知らないビット、CAP_SETPCAP は変えるのがふつうの人のビットのほかのときと、何も変えない
+  とき: 7.4-rc4 の securebits_need_setpcap)、CAPBSET_READ / DROP (CAP_SETPCAP、番号のたしかめの順も Linux と同じ)、
+  CAP_AMBIENT (RAISE は permitted と inheritable にあって NO_CAP_AMBIENT_RAISE でないとき)
+- /proc/PID/status の CapInh〜CapAmb は組そのまま (前は LSM でせばめていたが、Linux の status は LSM を通らない)
+- ファイルの capability (security.capability): ext4 に security.* の拡張属性 (index 6。手本の Linux に EXT4_FS_SECURITY を
+  足した)。setxattr は版 2 (20 バイト) と版 3 (24 バイト) だけ (前は版 1 も受けていた: Linux の validheader は受けない)、
+  CAP_SETFCAP がいる。getxattr は magic を版と effective のビットだけにし、版 3 の rootid が 0 なら版 2 で見せる
+  (cap_inode_getsecurity)。exec では版 3 の rootid が 0 でなければ見ない、nosuid のマウントでも見ない。書く・切りつめる・
+  chown (id を変えなくても) で消える (cap_inode_killpriv。chmod では消えない)。拡張属性のあるファイルはロックなしの書きたし
+  (fast_append) を使わない (Linux の S_NOSEC のかわり)
+
+`test/caps.c` (root で ext4: `test/ldiff.sh --root caps @home`。142 行: status、capget、capset、DAC と chown、setuid と
+KEEPCAPS、seteuid と setfsuid、bounding、ambient、securebits、ファイルの capability) は Linux 7.4-rc4 と 1 バイトもちがわない。
+まだ: ユーザーの namespace の中の capability (Linux は新しいユーザーの namespace の中でみなを持ち、外の capability は
+使えない。aios はユーザーの namespace を作っても組を変えず、中で capability を見ないところを決めている)。
+
 ### マウントの番号と st_dev (/proc/PID/mountinfo、statx の STATX_MNT_ID)
 
 systemd、findmnt、psutil、コンテナの道具は、マウントを /proc/self/mountinfo で知り、statx の stx_mnt_id と
