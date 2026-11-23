@@ -1105,6 +1105,21 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   SIGALRM を受けとったときに鳴った時刻からの目盛りで鳴らしなおす (Linux の dequeue_signal。無視されて捨てられれば止まった
   まま)。ちがい: 無視されて捨てられた POSIX タイマーのシグナルは、tick (cpu0) で見つけて鳴らしなおす (Linux 6.13 からは
   無視しているあいだ止め、無視をやめたら鳴らしなおす)
+- CHECKPOINT_RESTORE のもの (test/kcmp.c、Linux 7.4-rc3 と 44 行同じ。root でも): 手本の Linux に CHECKPOINT_RESTORE を
+  入れた (ふつうの配布の Linux と同じ)。kcmp (272: kcmp.rs。Linux の CONFIG_KCMP) は、2 つのスレッドが開いたファイル
+  (KCMP_FILE)、アドレス空間 (VM)、fd の表 (FILES)、cwd と root (FS)、シグナルのハンドラ (SIGHAND)、SEM_UNDO (SYSVSEM)、
+  epoll に入れたもの (EPOLL_TFD: struct kcmp_epoll_slot。epoll でなければ EINVAL、入っていなければ ENOENT) を分けているかを、
+  番地を起動ごとの乱数でまぜてくらべる (Linux の kcmp_ptr: 0 同じ、1 と 2 は並び)。見てよいかは ptrace の READ_REALCREDS
+  (ほかの人のものは EPERM)。CRIU と、Mesa の DRM の fd くらべ (os_same_file_description) が使う。ちがい: aios は fd の表と
+  cwd・root を 1 つ (proc::Files) に持つので FILES と FS は同じ答え、KCMP_IO はいつも同じ (Linux の io_context がないとき)。
+  /proc/PID/timers (POSIX タイマーを新しいものから: ID、シグナルと値、notify、ClockID。CPU の時計は Linux の PROCESS_CLOCK
+  -6 と THREAD_CLOCK -2)。timer_create の ID は使いまわさずに増やす (Linux の next_posix_timer_id。前は空いたいちばん小さい
+  ID)、sevp がなければ値は 0 (Linux 7.4 と同じ。前は ID)。/proc/PID/task/TID/children (子の pid と空白。ちがい: aios は子の
+  並びを代表スレッドに持つ)。/proc/sys/kernel/ns_last_pid (いまの PID の namespace でさいごに渡した番号。0666 で、書くのは
+  CAP_CHECKPOINT_RESTORE か CAP_SYS_ADMIN。書けば次の fork はその次。ちがい: aios は番号を使いまわさないので、いまより前の
+  値は受けて何もしない)。prctl の PR_GET_TID_ADDRESS (set_tid_address の番地)。そのとき見つけたもの: プロセスに来たシグナルを
+  預けるスレッドを、sigwaitinfo などでそれを待っているものからも選ぶ (Linux の wants_signal。前はブロックしていないものだけ
+  から選び、ほかのスレッドが既定の動作で終わらせていた)
 - atime (test/atime.c、root で ext4 と tmpfs とマウントの印で Linux と 5 行同じ): 前は持たなかった (stat の atime は mtime、
   utimensat の atime は捨てていた)。いまは ext4 は inode の i_atime (秒)、tmpfs は自分の属性に持ち、stat と statx に出す。
   utimensat は atime も決め、ctime をいまに (Linux の notify_change。前は ctime を変えなかった)。読んだら (read、pread、

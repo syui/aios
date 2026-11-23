@@ -39,6 +39,9 @@ pub struct Entry {
 /// kernel/uname だけ (aibox --image が、中の UTS を linux の形にする)。Linux の /proc/sys は本当の root だけが書ける
 const UTS_ADMIN: &[&str] = &["kernel/uname"];
 
+/// だれでも開いて書け、書いてよいかは書くときに見るもの (Linux の 0666: ns_last_pid は CAP_CHECKPOINT_RESTORE を見る)
+const ANY_WRITE: &[&str] = &["kernel/ns_last_pid"];
+
 impl Entry {
     pub fn writable(&self) -> bool {
         self.set.is_some()
@@ -49,9 +52,13 @@ impl Entry {
         UTS_ADMIN.contains(&self.path)
     }
 
+    pub fn any_write(&self) -> bool {
+        ANY_WRITE.contains(&self.path)
+    }
+
     /// いまのプロセスがこれを書いてよいか (root か、UTS_ADMIN のものを自分の UTS で)
     pub fn may_write(&self) -> bool {
-        self.writable() && (crate::cred::current().euid == 0 || self.uts_scoped() && crate::ns::uts_admin())
+        self.writable() && (crate::cred::current().euid == 0 || self.any_write() || self.uts_scoped() && crate::ns::uts_admin())
     }
 
     pub fn read(&self) -> String {
@@ -146,6 +153,20 @@ pub static TABLE: &[Entry] = &[
         set: Some(|s| Ok(crate::kmsg::set_dmesg_restrict(num(s, 0, 1)? == 1))),
     },
     Entry { path: "kernel/osrelease", get: crate::ns::release, set: None },
+    // いまの PID の namespace でさいごに渡した番号。書けば次の fork はその次 (CHECKPOINT_RESTORE: CRIU が pid をもどす。
+    // その namespace で CAP_CHECKPOINT_RESTORE か CAP_SYS_ADMIN: Linux の pid_ns_ctl_handler)
+    Entry {
+        path: "kernel/ns_last_pid",
+        get: || format!("{}", crate::proc::ns_last_pid()),
+        set: Some(|s| {
+            let c = crate::cred::current();
+            if !c.capable(crate::cred::CAP_CHECKPOINT_RESTORE) && !c.capable(crate::cred::CAP_SYS_ADMIN) {
+                return Err(-1);
+            }
+            crate::proc::set_ns_last_pid(num(s, 0, 4 << 20)? as u32);
+            Ok(())
+        }),
+    },
     // perf (perf.rs): paranoid ほか
     Entry { path: "kernel/perf_event_paranoid", get: || crate::perf::knob_get(0), set: Some(|s| crate::perf::knob_set(0, s)) },
     Entry { path: "kernel/perf_event_max_sample_rate", get: || crate::perf::knob_get(1), set: Some(|s| crate::perf::knob_set(1, s)) },

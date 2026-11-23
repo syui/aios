@@ -149,6 +149,9 @@ pub struct PosixTimer {
     pub notify: i32,
     pub tid: u32,
     pub value: u64,
+    /// /proc/PID/timers の ClockID (CPU の時計の CLOCK_PROCESS_CPUTIME_ID と THREAD は Linux の PROCESS_CLOCK と
+    /// THREAD_CLOCK: -6 と -2)
+    pub clockid: i32,
     /// 次に鳴る時刻 (起動からの ns、0 なら止まっている) と、くり返しの間隔 (ns)。シグナルが来ていてまだ受けとられて
     /// いないあいだ (queued) は、鳴った時刻のまま止まっている
     pub deadline: u64,
@@ -548,7 +551,10 @@ pub fn send_group(tgid: u32, sig: i32, info: SigInfo) -> Result<(), i64> {
     if threads.is_empty() {
         return Err(-ESRCH);
     }
-    let pick = threads.iter().position(|t| t.pid == tgid && t.sig_mask & b == 0).or_else(|| threads.iter().position(|t| t.sig_mask & b == 0)).unwrap_or(0);
+    // 受けとれるスレッド: ブロックしていないか、sigwaitinfo などでそれを待っているもの (Linux の wants_signal: 待つあいだは
+    // blocked から外している)。代表を先に
+    let wants = |t: &Proc| t.sig_mask & b == 0 || t.sigwait & b != 0;
+    let pick = threads.iter().position(|t| t.pid == tgid && wants(t)).or_else(|| threads.iter().position(|t| wants(t))).unwrap_or(0);
     // プロセスに来たもの (Linux の shared_pending): 選んだスレッドに預け、スレッドに来たものよりあとで受けとる
     queue(threads.swap_remove(pick), sig, info, true);
     Ok(())

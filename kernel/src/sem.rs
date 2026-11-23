@@ -98,6 +98,12 @@ static NEXT_CHAN: Bkl<usize> = Bkl::new(1);
 /// SEM_UNDO の戻し: (IPC の namespace, スレッドグループ) ごとに、組のチャンネルとセマフォごとの足す値
 static UNDO: Bkl<BTreeMap<(u64, u32), Vec<(usize, Vec<i32>)>>> = Bkl::new(BTreeMap::new());
 
+/// kcmp の KCMP_SYSVSEM: SEM_UNDO の戻しを持っていれば、そのスレッドグループの印 (0 でない)。なければ 0 (Linux の
+/// sysvsem.undo_list: semop で SEM_UNDO を使うまではない)
+pub fn undo_id(tgid: u32) -> usize {
+    if UNDO.get().keys().any(|k| k.1 == tgid) { tgid as usize + 1 } else { 0 }
+}
+
 fn table() -> &'static mut Table {
     let all = TABLES.get();
     all.retain(|_, t| t.ns.as_ref().is_none_or(|w| w.strong_count() > 0));

@@ -136,6 +136,16 @@ impl Epoll {
     }
 }
 
+/// kcmp の KCMP_EPOLL_TFD: epoll の f に fd 番号 tfd で入れたファイル (toff 番目: aios は fd ごとに 1 つなので 0 だけ)。
+/// epoll でなければ EINVAL、なければ ENOENT (Linux の get_epoll_tfile_raw_ptr)
+pub fn target_of(f: &file::FileRef, tfd: u32, toff: u32) -> Result<file::FileRef, i64> {
+    const ENOENT: i64 = 2;
+    let ep = f.borrow().kind.ops::<EpollFile>().ok_or_else(|| crate::why::inval())?;
+    let ep = ep.0.borrow();
+    let e = ep.entries.get(&(tfd as i32)).filter(|_| toff == 0).ok_or(-ENOENT)?;
+    e.file.upgrade().ok_or(-ENOENT)
+}
+
 fn epoll_of(fd: i64) -> Result<EpollRef, i64> {
     let f = proc::current().files().get(fd as u64).cloned().ok_or(-EBADF)?;
     let b = f.borrow();

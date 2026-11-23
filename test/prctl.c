@@ -1,6 +1,6 @@
 // prctl の答えが Linux と同じか: 知らない値は EINVAL、PDEATHSIG (親のスレッドが終わると子にシグナル。fork した子には
 // 受けつがない)、CHILD_SUBREAPER (みなし子をひきとる: 孫の getppid がこちらに)、KEEPCAPS、CAPBSET_READ、SECUREBITS、
-// TIMING、THP_DISABLE、TAGGED_ADDR_CTRL、手本の設定にないもの (TID_ADDRESS、SET_VMA、MEMORY_MERGE)、arm64 にないもの
+// TIMING、THP_DISABLE、TAGGED_ADDR_CTRL、TID_ADDRESS (CHECKPOINT_RESTORE)、手本の設定にないもの (SET_VMA、MEMORY_MERGE)、arm64 にないもの
 // (TSC、ENDIAN、FPEMU)
 #define _GNU_SOURCE
 #include <errno.h>

@@ -586,6 +586,8 @@ pub struct Proc {
     /// 代表スレッドだけ: 終わったスレッドの ioac (Linux の signal->ioac)
     pub ioac_dead: [u64; 7],
     pub timers: Vec<PosixTimer>,
+    /// 代表スレッドだけ: 次の POSIX タイマーの ID (Linux の next_posix_timer_id: 使いまわさずに増やす。exec でも消えない)
+    pub timer_next_id: i32,
     /// 親が SIGCHLD を無視しているので、終わったらすぐ片付ける
     autoreap: bool,
     /// ユーザーとグループ
@@ -810,6 +812,7 @@ impl Proc {
         ioac: IoAc::new(),
         ioac_dead: [0; 7],
         timers: Vec::new(),
+        timer_next_id: 0,
         autoreap: false,
         cred: crate::cred::Cred::ROOT,
         cred_work: core::sync::atomic::AtomicU8::new(0),
@@ -1901,6 +1904,39 @@ pub static SYS_NS: [core::sync::atomic::AtomicU64; MAXCPU] = [const { core::sync
 pub static LOAD: [core::sync::atomic::AtomicU64; 3] = [const { core::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// いちばん新しく渡した PID
+/// /proc/sys/kernel/ns_last_pid: いまのプロセスの PID の namespace でさいごに渡した番号
+pub fn ns_last_pid() -> u32 {
+    match current().pid_ns.as_ref() {
+        Some(ns) => ns.last(),
+        None => last_pid(),
+    }
+}
+
+/// ns_last_pid を書く: 次の fork はその次の番号に (Linux の pid_ns_ctl_handler)。ちがい: aios は番号を使いまわさない
+/// (pidfd は番号だけを持つ: pidfd.rs) ので、いまより前の値は受けて何もしない
+pub fn set_ns_last_pid(v: u32) {
+    match current().pid_ns.as_ref() {
+        Some(ns) => ns.set_last(v),
+        None => {
+            let n = NEXT_PID.get();
+            *n = (*n).max(v.saturating_add(1));
+        }
+    }
+}
+
+/// /proc/PID/task/TID/children: 代表スレッド leader の子 (fork したもの。古いものから、終わって回収されていないものも:
+/// Linux の get_children_pid)
+pub fn children_of(leader: &Proc) -> Vec<u32> {
+    let ps = procs();
+    let mut v = Vec::new();
+    let mut i = leader.kids.0;
+    while i != NONE {
+        v.push(ps[i as usize].pid);
+        i = ps[i as usize].sib.next;
+    }
+    v
+}
+
 pub fn last_pid() -> u32 {
     *NEXT_PID.get() - 1
 }

@@ -132,6 +132,16 @@ pub struct Pid {
 }
 
 impl Pid {
+    /// さいごに渡した番号 (/proc/sys/kernel/ns_last_pid)
+    pub fn last(&self) -> u32 {
+        self.next.get()
+    }
+
+    /// 次は v の次から (前にはもどさない: 番号は使いまわさない)
+    pub fn set_last(&self, v: u32) {
+        self.next.set(self.next.get().max(v));
+    }
+
     pub fn alloc(&self) -> u32 {
         let n = self.next.get() + 1;
         self.next.set(n);

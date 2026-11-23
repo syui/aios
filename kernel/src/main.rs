@@ -10,6 +10,7 @@ mod auditfilter;
 mod perf;
 mod pmu;
 mod ptrace;
+mod kcmp;
 mod securityfs;
 mod efirt;
 mod efivarfs;
@@ -210,6 +211,7 @@ pub extern "C" fn kmain() -> ! {
     syscall::register_fast_splice(splice::fast);
     // ptrace (止まるところは signal.rs と proc.rs)
     syscall::register(ptrace::SYSCALLS, ptrace::sys);
+    syscall::register(kcmp::SYSCALLS, kcmp::sys);
     // perf_event_open (ソフトウェアの数) と、fork / exit / exec / prctl で知らせてもらうもの
     syscall::register(perf::SYSCALLS, perf::sys);
     proc::register_perf(&perf::HOOKS);

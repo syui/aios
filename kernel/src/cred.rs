@@ -44,6 +44,7 @@ pub const CAP_AUDIT_CONTROL: u32 = 30;
 pub const CAP_MAC_ADMIN: u32 = 33;
 pub const CAP_AUDIT_READ: u32 = 37;
 pub const CAP_PERFMON: u32 = 38;
+pub const CAP_CHECKPOINT_RESTORE: u32 = 40;
 /// ファイルの capability (Linux の CAP_FS_SET: fsuid が 0 でなくなると effective から外れるもの)
 pub const FS_CAPS: [u32; 8] = [CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER, CAP_FSETID, CAP_LINUX_IMMUTABLE, CAP_MKNOD, 32];
 /// capability の名前 (番号の順。AppArmor の記録の capname と features/caps/mask)

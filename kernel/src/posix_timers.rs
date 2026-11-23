@@ -123,10 +123,15 @@ fn timer_create(clock: u64, sev: usize, idp: usize) -> R {
     }
     let cpu = matches!(c, crate::timer::Clock::Cpu { .. }).then_some(c);
     let leader = proc::current_leader();
-    let id = (0..).find(|i| !leader.timers.iter().any(|t| t.id == *i)).unwrap();
-    if value == 0 && sev == 0 {
-        value = id as u64;
-    }
+    // ID は使いまわさずに増やす (Linux の next_posix_timer_id: 使っているものはとばす。INT_MAX のあとは 0 から)。sevp が
+    // なければ SIGALRM で、値は 0 (Linux 7.4 と同じ: si_timerid が ID)
+    let id = loop {
+        let i = leader.timer_next_id;
+        leader.timer_next_id = (i + 1) & i32::MAX;
+        if !leader.timers.iter().any(|t| t.id == i) {
+            break i;
+        }
+    };
     leader.timers.push(PosixTimer {
         id,
         realtime: c == crate::timer::Clock::Real,
@@ -134,6 +139,11 @@ fn timer_create(clock: u64, sev: usize, idp: usize) -> R {
         notify,
         tid,
         value,
+        clockid: match clk {
+            2 => -6,
+            3 => -2,
+            c => c,
+        },
         deadline: 0,
         interval: 0,
         overrun: 0,

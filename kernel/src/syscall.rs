@@ -320,6 +320,7 @@ nrs! {
     PRLIMIT64 = 261,
     INIT_MODULE = 105,
     DELETE_MODULE = 106,
+    KCMP = 272,
     FINIT_MODULE = 273,
     RENAMEAT2 = 276,
     COPY_FILE_RANGE = 285,
@@ -3156,6 +3157,7 @@ fn sys_prctl(op: u64, arg: usize, arg3: usize, arg4: u64, arg5: u64) -> R {
     const PR_SET_MM: u64 = 35;
     const PR_SET_CHILD_SUBREAPER: u64 = 36;
     const PR_GET_CHILD_SUBREAPER: u64 = 37;
+    const PR_GET_TID_ADDRESS: u64 = 40;
     const PR_SET_THP_DISABLE: u64 = 41;
     const PR_GET_THP_DISABLE: u64 = 42;
     const PR_CAP_AMBIENT: u64 = 47;
@@ -3175,6 +3177,8 @@ fn sys_prctl(op: u64, arg: usize, arg3: usize, arg4: u64, arg5: u64) -> R {
             p.pdeath_signal = arg as u8;
         }
         PR_GET_PDEATHSIG => put_int(arg, p.pdeath_signal as i32)?,
+        // set_tid_address と CLONE_CHILD_CLEARTID の番地 (Linux は CHECKPOINT_RESTORE のときだけ)
+        PR_GET_TID_ADDRESS => out(arg, &(p.clear_tid as u64).to_le_bytes())?,
         // みなし子をひきとる (代表スレッドに。proc::reparent_kids が見る)
         PR_SET_CHILD_SUBREAPER => {
             let l = if p.pid != p.tgid { proc::find_leader_any(p.tgid) } else { None };
