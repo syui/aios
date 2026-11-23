@@ -326,7 +326,9 @@ static int wfd = -1;
 
 // fd が一度もつないでいない TCP か: aios は dport が 0 のもの (connect していない、listen しているもの、connect に
 // しくじったもの、AF_UNSPEC で切ったもの: Linux の inet_dport と同じ)。Linux では、それと同じく 0 にもどる TCP_INFO の
-// 送った segment の数 (tcpi_segs_out。SYN も送っていない) で見る
+// 送った segment の数 (tcpi_segs_out。SYN も送っていない) で見る。ノンブロッキングの connect が RST だけを受けて
+// しくじり、そのエラーを後の send や recv が持っていったものは tcp_disconnect を通らず segs_out が 0 にもどらないので、
+// CLOSE で受けた segment が 1 つまで (tcpi_segs_in: RST だけ。つながったものは SYN-ACK と RST で 2 つ) のものも
 static int fresh_tcp(int fd) {
     int dom = 0, typ = 0;
     socklen_t l = sizeof dom;
@@ -342,9 +344,14 @@ static int fresh_tcp(int fd) {
     l = sizeof ti;
     if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, ti, &l) != 0 || l < 140)
         return 0;
-    uint32_t segs;
+    uint32_t segs, segs_in;
     memcpy(&segs, ti + 136, sizeof segs);
-    return segs == 0;
+    if (segs == 0)
+        return 1;
+    if (l < 144)
+        return 0;
+    memcpy(&segs_in, ti + 140, sizeof segs_in);
+    return ti[0] == 7 /* TCP_CLOSE */ && segs_in <= 1;
 }
 
 static void ret(long r) {

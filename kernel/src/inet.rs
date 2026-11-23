@@ -212,6 +212,10 @@ const EE_ORIGIN_LOCAL: u8 = 1;
 
 pub struct Inet {
     pub tcp: bool,
+    /// TCP: つながりの表 (Linux の ehash か listen の表) から外れたときの状態 (Linux 7.4 の inet_unhash の
+    /// unhashed_state)。つながろうとしたもの・つながったものは、もう listen できない (EINVAL)。listen していたものは、
+    /// もう connect できない (EINVAL)。accept した子は新しく (None)
+    unhashed: Option<St>,
     /// SO_PROTOCOL
     protocol: u8,
     /// 分けた NET (なければ 0)
@@ -478,6 +482,7 @@ fn new_sock_as(tcp: bool, protocol: u8, uid: u32, gid: u32, netns: u64) -> InetR
     let now = crate::timer::coarse_epoch_ns();
     let u = Rc::new(RefCell::new(Inet {
         tcp,
+        unhashed: None,
         protocol,
         net: netns,
         state: St::Close,
@@ -1247,6 +1252,11 @@ pub fn listen(u: &InetRef, backlog: u64) -> R {
         u.borrow_mut().state = St::Close;
         return Err(e);
     }
+    // つながろうとしたもの・つながったものは、表に入れられない (Linux 7.4 の __inet_hash: ポートはとったまま)
+    if u.borrow().unhashed.is_some_and(|st| st != St::Listen) {
+        u.borrow_mut().state = St::Close;
+        return Err(crate::why::inval());
+    }
     let (k, q) = {
         let mut s = u.borrow_mut();
         s.sport = s.num;
@@ -1981,8 +1991,11 @@ fn tcp_v4_connect(u: &InetRef, a: &[u8]) -> Result<(), i64> {
         s.syn_next = 0;
         s.err = 0;
     }
-    // ポート (Linux の inet_hash_connect: なければ空いているもの、あれば 4 つ組がほかと同じでないこと)
-    let r = if u.borrow().num == 0 {
+    // ポート (Linux の inet_hash_connect: なければ空いているもの、あれば 4 つ組がほかと同じでないこと)。listen して
+    // いたものはつながりの表に入れられない (Linux 7.4 の __inet_hash_connect: EINVAL)
+    let r = if u.borrow().unhashed == Some(St::Listen) {
+        Err(crate::why::inval())
+    } else if u.borrow().num == 0 {
         get_port_for(u, 0, true).map_err(|_| -EADDRNOTAVAIL)
     } else {
         let (s1, p1) = {
@@ -2070,7 +2083,9 @@ fn tcp_v6_connect(u: &InetRef, a: &[u8]) -> Result<(), i64> {
         s.syn_next = 0;
         s.err = 0;
     }
-    let r = if u.borrow().num == 0 {
+    let r = if u.borrow().unhashed == Some(St::Listen) {
+        Err(crate::why::inval())
+    } else if u.borrow().num == 0 {
         get_port_for(u, 0, true).map_err(|_| -EADDRNOTAVAIL)
     } else {
         let p1 = u.borrow().num;
@@ -2275,10 +2290,19 @@ fn time_wait(u: &InetRef) {
     tcp_done(u);
 }
 
+/// つながりの表から外れる (CLOSE にする前に): そのときの状態を覚える (Linux 7.4 の inet_unhash の unhashed_state)。
+/// CLOSE のもの (表にない) は覚えない
+fn unhash(s: &mut Inet) {
+    if s.tcp && s.state != St::Close {
+        s.unhashed = Some(s.state);
+    }
+}
+
 /// つながりの終わり (Linux の tcp_done): CLOSE、両方の shutdown。fd のないものは消す
 fn tcp_done(u: &InetRef) {
     let (dead, lock_port) = {
         let mut s = u.borrow_mut();
+        unhash(&mut s);
         s.state = St::Close;
         s.shutdown = BOTH;
         s.peer = None;
@@ -2330,6 +2354,11 @@ fn tcp_reset(u: &InetRef) {
     };
     u.borrow_mut().err = -err;
     tcp_done(u);
+    // connect にしくじった (SYN_SENT で RST): 一度もつないでいないものにもどす (相手のポートを 0 に。aios がえらんだ
+    // ちがい send-notconn: そのあと書くと ENOTCONN。Linux は tcp_disconnect を通らないと dport が残り EPIPE)
+    if st == St::SynSent {
+        u.borrow_mut().dport = 0;
+    }
     // O_ASYNC: エラー (Linux の tcp_done_with_error の sk_error_report)
     if !u.borrow().dead {
         wake_async(u, crate::fasync::POLL_ERR);
@@ -2416,6 +2445,7 @@ fn tcp_disconnect(u: &InetRef) -> Result<(), i64> {
     let old = u.borrow().state;
     let lock_port = u.borrow().lock_port;
     if old != St::Close {
+        unhash(&mut u.borrow_mut());
         u.borrow_mut().state = St::Close;
         if !lock_port {
             put_port(u);
@@ -3018,7 +3048,8 @@ fn tcp_send(u: &InetRef, src: &Src, len: usize, ctl: &[u8], flags: u64, nonblock
             return Err(stream_error(u, flags, e));
         }
         if !matches!(st, St::SynSent | St::SynRecv) {
-            // 相手のポートは connect で決まり、しくじるか切ると 0 にもどる (閉じられたものは残る)
+            // 相手のポートは connect で決まり、しくじる (connect のときでも、あとで RST や時間切れでも) か切ると 0 に
+            // もどる (つながってから閉じられたものは残る)
             if u.borrow().dport == 0 {
                 return Err(-ENOTCONN);
             }
@@ -5263,6 +5294,8 @@ pub fn tick() {
                 if tries >= syncnt {
                     u.borrow_mut().err = -ETIMEDOUT;
                     tcp_done(&u);
+                    // connect にしくじった: 一度もつないでいないものにもどす (tcp_reset と同じ)
+                    u.borrow_mut().dport = 0;
                 } else {
                     {
                         let mut s = u.borrow_mut();
@@ -5626,12 +5659,14 @@ fn ext_sync(u: &InetRef) {
         match (st, ts) {
             (St::SynSent, tcp::State::SynSent | tcp::State::SynReceived) => false,
             (St::SynSent, tcp::State::Closed) => {
-                // RST (ICMP のエラーで止めたものは、そのエラーのまま)
+                // RST (ICMP のエラーで止めたものは、そのエラーのまま)。一度もつないでいないものにもどす (tcp_reset と同じ)
                 if s.err == 0 {
                     s.err = -ECONNREFUSED;
                 }
+                unhash(&mut s);
                 s.state = St::Close;
                 s.shutdown = BOTH;
+                s.dport = 0;
                 true
             }
             (St::SynSent, _) => {
@@ -5654,6 +5689,7 @@ fn ext_sync(u: &InetRef) {
                 true
             }
             (St::Established | St::CloseWait, tcp::State::Closed) => {
+                unhash(&mut s);
                 s.state = St::Close;
                 s.shutdown = BOTH;
                 true
