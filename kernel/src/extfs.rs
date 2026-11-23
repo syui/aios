@@ -2563,6 +2563,7 @@ impl ExtFs {
     }
 
     /// inode の中の拡張属性のところ (はじめ, 終わり)。なければ None
+    // [lockless]
     fn xa_ibody(&self, r: &Raw) -> Option<(usize, usize)> {
         if self.inode_size <= 128 {
             return None;
