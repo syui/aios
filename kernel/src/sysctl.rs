@@ -185,6 +185,8 @@ pub static TABLE: &[Entry] = &[
     Entry { path: "kernel/random/uuid", get: random_uuid, set: None },
     Entry { path: "fs/inotify/max_queued_events", get: || format!("{}", INOTIFY_MAX_QUEUED.load(Ordering::Relaxed)), set: Some(|s| Ok(INOTIFY_MAX_QUEUED.store(num(s, 16, 1 << 20)?, Ordering::Relaxed))) },
     Entry { path: "fs/inotify/max_user_watches", get: || format!("{}", INOTIFY_MAX_WATCHES.load(Ordering::Relaxed)), set: Some(|s| Ok(INOTIFY_MAX_WATCHES.store(num(s, 1, 1 << 20)?, Ordering::Relaxed))) },
+    Entry { path: "fs/lease-break-time", get: || format!("{}", crate::locks::LEASE_BREAK_TIME.load(Ordering::Relaxed)), set: Some(|s| Ok(crate::locks::LEASE_BREAK_TIME.store(num(s, 0, i32::MAX as usize)?, Ordering::Relaxed))) },
+    Entry { path: "fs/leases-enable", get: || format!("{}", crate::locks::LEASES_ENABLE.load(Ordering::Relaxed)), set: Some(|s| Ok(crate::locks::LEASES_ENABLE.store(num(s, 0, i32::MAX as usize)?, Ordering::Relaxed))) },
     Entry { path: "fs/nr_open", get: || format!("{}", crate::proc::NOFILE), set: None },
     Entry { path: "fs/suid_dumpable", get: || format!("{}", SUID_DUMPABLE.load(Ordering::Relaxed)), set: Some(|s| Ok(SUID_DUMPABLE.store(num(s, 0, 2)?, Ordering::Relaxed))) },
     Entry {

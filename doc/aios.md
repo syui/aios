@@ -973,6 +973,19 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   グループ (なければ自分) を持ち主に (Linux の __tty_fasync)。子の口 (とコンソール) はカノニカルなら行が終わるたびに、でなければ
   読めるものがあれば POLL_IN、親の口は子が書いたものとエコーで POLL_IN。aios とちがうところ: 読む人がソケットで待っているとき
   にも POLL_IN を送る (Linux は SOCKWQ_ASYNC_WAITDATA で送らない)
+- ファイルのリース (test/lease.c、Linux 7.4-rc3 と 14 行同じ): locks.rs (Linux の fs/locks.c のリース)。F_SETLEASE /
+  F_GETLEASE と F_SETDELEG / F_GETDELEG (struct delegation。d_flags と __pad は 0 でないと EINVAL)。開いたファイルごとに 1 つ。
+  読むリースは書く口がどこにもないとき (自分も読むだけの口で)、書くリースはほかに開いた口がないとき (Linux の
+  lease_open_conflict: 生きているプロセスの fd の表を見て数える)、ほかにリースがあれば書くリースはだめ、外すのを待っている
+  ものがあれば新しいものもだめ (EAGAIN)。ディレクトリは EINVAL (aios はディレクトリの F_SETDELEG もない)、ふつうのファイル
+  でないもの (パイプ ...) とまちがった型も EINVAL、持ち主か CAP_LEASE でなければ EACCES、ないものを外すのは EAGAIN。つけると
+  O_ASYNC の印がつき (知らせの表に入る)、持ち主がまだなければ自分のプロセスに (Linux の lease_setup)。外すと持ち主と
+  F_SETSIG も消える (lease_modify)。ほかの人が開く (sysfile::open_found: 書く口はみな、読む口は書くリースと) か truncate
+  すると、リースを持つものに POLL_MSG (si_band 0x441、si_fd) を送り、外すか読むリースに下げるまで待つ (O_NONBLOCK なら
+  EWOULDBLOCK、F_GETLEASE はそのあいだ求める型を答える)。lease-break-time (秒、/proc/sys/fs、既定 45) で時間切れ: 外すもの
+  は外し、下げるものは下げる。leases-enable が 0 なら新しいリースは EINVAL。閉じたら (最後の参照) 外れる。リースがあるあいだ
+  は、ロックなしの open (file::fast_open) をしない (file::LEASES)。aios とちがうところ: exec で開くプログラムは書くリースを
+  こわさない
 - perf の PERF_RECORD_MMAP / MMAP2 (test/perf4.c、Linux 7.4-rc3 と 11 行同じ): perf record が新しく写したライブラリを知る。
   attr.mmap か mmap2 なら実行できる写し、mmap_data なら読み書きのものも (MISC_MMAP_DATA の印)。きっかけは mmap (Linux の
   mmap_region の perf_event_mmap)、実行できなかったところを実行できるようにした mprotect (mprotect_fixup)、exec の

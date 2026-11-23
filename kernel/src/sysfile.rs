@@ -49,6 +49,8 @@ const F_GETSIG: u64 = 11;
 const F_SETOWN_EX: u64 = 15;
 const F_GETOWN_EX: u64 = 16;
 const F_GETOWNER_UIDS: u64 = 17;
+const F_SETLEASE: u64 = 1024;
+const F_GETLEASE: u64 = 1025;
 const F_DUPFD_QUERY: u64 = 1027;
 const F_CREATED_QUERY: u64 = 1028;
 const F_DUPFD_CLOEXEC: u64 = 1030;
@@ -58,6 +60,8 @@ const F_ADD_SEALS: u64 = 1033;
 const F_GET_SEALS: u64 = 1034;
 const F_GET_RW_HINT: u64 = 1035;
 const F_SET_RW_HINT: u64 = 1036;
+const F_GETDELEG: u64 = 1039;
+const F_SETDELEG: u64 = 1040;
 const FD_CLOEXEC: u64 = 1;
 
 const O_NONBLOCK: u32 = 0o4000;
@@ -1511,6 +1515,10 @@ fn open_found(found: Found, flags: u64, mode: u64) -> R {
         vfs::S_IFLNK => return Err(-40), // ELOOP (O_NOFOLLOW)
         vfs::S_IFSOCK => return Err(-6),  // ENXIO (unix ソケットは開けない。connect する)
         _ => {
+            // リースをこわす (Linux の do_dentry_open の break_lease: 書く口なら外させ、読む口なら書くリースを下げさせる)
+            if file::LEASES.load(core::sync::atomic::Ordering::Relaxed) != 0 && ino.meta().mode & S_IFMT == vfs::S_IFREG {
+                file::locks().break_lease(ino.id(), accmode != file::O_RDONLY, flags as u32 & O_NONBLOCK != 0)?;
+            }
             // (書く口なら EROFS と ETXTBSY は上で見た: reg_write)
             // O_TRUNC は O_RDONLY でも切りつめる (書く許可は上で確かめた。Linux の do_open と同じ)
             if flags & O_TRUNC != 0 {
@@ -2241,6 +2249,10 @@ pub fn truncate(pathp: usize, len: i64) -> R {
     if proc::executing(ino.id()) {
         return Err(-ETXTBSY);
     }
+    // リースをこわす (Linux の vfs_truncate の break_lease: 書く口と同じ)
+    if file::LEASES.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+        file::locks().break_lease(ino.id(), true, false)?;
+    }
     crate::security::path_truncate(&full, ino.meta().uid)?;
     vfs::drop_privs(&ino)?;
     ino.truncate(len as usize)?;
@@ -2724,6 +2736,25 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
             Ok(alloc::rc::Rc::ptr_eq(&me, &other.file) as i64)
         }
         F_CREATED_QUERY => Ok(entry.file.borrow().created as i64),
+        // リース (locks.rs: Linux の fcntl_setlease、fcntl_getlease)
+        F_SETLEASE => file::locks().setlease(fd as i32, &entry.file.clone(), arg as i32 as i64, false),
+        F_GETLEASE => Ok(file::locks().getlease(&entry.file.clone(), false)),
+        // struct delegation { d_flags、d_type、__pad }: d_flags と __pad は 0 (Linux の fcntl_setdeleg、fcntl_getdeleg)
+        F_GETDELEG | F_SETDELEG => {
+            let mut b = [0u8; 8];
+            proc::current().pt().copy_in(&mut b, arg as usize).ok_or(-EFAULT)?;
+            if b[..4] != [0; 4] || b[6..8] != [0; 2] {
+                return Err(crate::why::inval());
+            }
+            let f = entry.file.clone();
+            if cmd == F_SETDELEG {
+                return file::locks().setlease(fd as i32, &f, u16::from_le_bytes([b[4], b[5]]) as i16 as i64, true);
+            }
+            let t = file::locks().getlease(&f, true) as u16;
+            b[4..6].copy_from_slice(&t.to_le_bytes());
+            out(arg as usize, &b)?;
+            Ok(0)
+        }
         // 書き込みの寿命の見こみ (Linux の inode->i_write_hint: 中だけで覚える)。たしかめる順は Linux の
         // fcntl_set_rw_hint: 変えられない印 (+i)、持ち主か CAP_FOWNER (EPERM)、読む (EFAULT)、値 (EINVAL)
         F_GET_RW_HINT => {

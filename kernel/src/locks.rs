@@ -37,6 +37,15 @@ impl crate::file::FileLocks for Locks {
     fn fcntl(&self, f: &FileRef, files: usize, cmd: u64, arg: usize) -> Result<i64, i64> {
         fcntl(f, files, cmd, arg)
     }
+    fn setlease(&self, fd: i32, f: &FileRef, arg: i64, deleg: bool) -> Result<i64, i64> {
+        setlease(fd, f, arg, deleg)
+    }
+    fn getlease(&self, f: &FileRef, deleg: bool) -> i64 {
+        getlease(f, deleg)
+    }
+    fn break_lease(&self, key: Key, write: bool, nonblock: bool) -> Result<(), i64> {
+        break_lease(key, write, nonblock)
+    }
 }
 
 /// flock (main.rs が syscall::register で置く。Linux の COND_SYSCALL(flock))
@@ -146,6 +155,20 @@ fn release_file(file: usize) {
     if changed {
         tidy();
         proc::wakeup(chan());
+    }
+    // リースも外れる (Linux の locks_remove_lease)
+    if crate::file::LEASES.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+        let mut gone = false;
+        leases().retain(|_, v| {
+            let n = v.len();
+            v.retain(|l| l.ptr != file);
+            gone |= v.len() != n;
+            !v.is_empty()
+        });
+        if gone {
+            lease_count();
+            proc::wakeup(lease_chan());
+        }
     }
 }
 
@@ -442,5 +465,272 @@ fn flock(fd: u64, op: u64) -> Result<i64, i64> {
             return Err(-EAGAIN);
         }
         proc::sleep(chan())?;
+    }
+}
+
+// ---- リース (Linux の fs/locks.c の lease: F_SETLEASE / F_GETLEASE、F_SETDELEG / F_GETDELEG) ----
+//
+// ふつうのファイルの開いたもの (OpenFile) ごとに 1 つ。読むリース (F_RDLCK) は、書く口がどこにもないとき。書くリース
+// (F_WRLCK) は、ほかに開いたものがないとき。ほかの人が開く (書く口か、書くリースなら読む口も) か truncate すると、リースを
+// 持つものに F_SETSIG のシグナル (POLL_MSG、si_fd: fasync.rs) を送り、外すか下げるまで (lease-break-time 秒まで) 待つ
+// (O_NONBLOCK なら EWOULDBLOCK)。時間が来たら、外すものは外し、下げるものは下げる。閉じたら外れる
+
+/// lease-break-time (秒) と leases-enable (sysctl.rs)
+pub static LEASE_BREAK_TIME: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(45);
+pub static LEASES_ENABLE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(1);
+
+struct Lease {
+    file: alloc::rc::Weak<core::cell::RefCell<OpenFile>>,
+    ptr: usize,
+    typ: i16,
+    /// F_SETDELEG で置いたもの (Linux の FL_DELEG)
+    deleg: bool,
+    /// 外すのを待っている (Linux の FL_UNLOCK_PENDING): Some(締め切りの tick。0 は時間切れなし)
+    unlock: Option<u64>,
+    /// 読むリースに下げるのを待っている (FL_DOWNGRADE_PENDING)
+    downgrade: Option<u64>,
+}
+
+static LEASES: Bkl<BTreeMap<Key, Vec<Lease>>> = Bkl::new(BTreeMap::new());
+
+fn leases() -> &'static mut BTreeMap<Key, Vec<Lease>> {
+    LEASES.get()
+}
+
+/// リースが変わった (外した、下げた、時間切れ): 開くのを待っている人を起こす
+fn lease_chan() -> usize {
+    (&raw const LEASES) as usize
+}
+
+/// リースのシグナルの表の鍵 (fasync.rs): 開いたファイルの場所 + 3 (ほかのものの鍵とぶつからない)
+fn lease_fasync(ptr: usize) -> usize {
+    ptr + 3
+}
+
+fn lease_count() {
+    let n: usize = leases().values().map(|v| v.len()).sum();
+    crate::file::LEASES.store(n, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// 外す (Linux の lease_modify の F_UNLCK): 持ち主と F_SETSIG を消し、シグナルの表から外す
+fn lease_unlock(l: &Lease) {
+    if let Some(f) = l.file.upgrade() {
+        crate::fasync::set(&f, 0, crate::fasync::PidType::Tgid, true);
+        let _ = crate::fasync::setsig(&f, 0);
+        crate::fasync::helper(lease_fasync(l.ptr), 0, &f, false);
+    }
+}
+
+/// 時間切れのものを下げる・外す (Linux の time_out_leases)
+fn time_out_leases(key: Key) {
+    let now = crate::timer::ticks();
+    let past = |t: Option<u64>| t.is_some_and(|t| t != 0 && now > t);
+    let Some(v) = leases().get_mut(&key) else { return };
+    let mut gone = Vec::new();
+    let mut changed = false;
+    let mut i = 0;
+    while i < v.len() {
+        if past(v[i].downgrade) {
+            v[i].typ = F_RDLCK;
+            v[i].downgrade = None;
+            changed = true;
+        }
+        if past(v[i].unlock) {
+            gone.push(v.remove(i));
+            changed = true;
+            continue;
+        }
+        i += 1;
+    }
+    if v.is_empty() {
+        leases().remove(&key);
+    }
+    for l in &gone {
+        lease_unlock(l);
+    }
+    if changed {
+        lease_count();
+        proc::wakeup(lease_chan());
+    }
+}
+
+/// いま求める型 (Linux の target_leasetype): 外すのを待っていれば F_UNLCK、下げるのを待っていれば F_RDLCK
+fn target(l: &Lease) -> i16 {
+    if l.unlock.is_some() {
+        F_UNLCK
+    } else if l.downgrade.is_some() {
+        F_RDLCK
+    } else {
+        l.typ
+    }
+}
+
+/// 開いたもののうち、key のファイルの (読むだけの口の数, 書く口の数)。me (リースを置く口) はのぞく (Linux の
+/// i_readcount と i_writecount)
+fn open_counts(key: Key, me: usize) -> (usize, usize) {
+    let mut seen: Vec<usize> = Vec::new();
+    let (mut r, mut w) = (0, 0);
+    proc::each_open_file(|f| {
+        let p = ptr_of(f);
+        if p == me || seen.contains(&p) || self::key(f) != Some(key) || !matches!(f.kind, Kind::Inode(..)) {
+            return;
+        }
+        seen.push(p);
+        if f.writable() {
+            w += 1;
+        } else if f.readable() {
+            r += 1;
+        }
+    });
+    (r, w)
+}
+
+/// F_GETLEASE / F_GETDELEG (Linux の __fcntl_getlease)
+fn getlease(f: &FileRef, deleg: bool) -> i64 {
+    let (k, me) = {
+        let b = f.borrow();
+        (key(&b), ptr_of(&b))
+    };
+    let Some(k) = k else { return F_UNLCK as i64 };
+    time_out_leases(k);
+    leases().get(&k).and_then(|v| v.iter().find(|l| l.ptr == me)).filter(|l| l.deleg == deleg).map_or(F_UNLCK, target) as i64
+}
+
+/// F_SETLEASE / F_SETDELEG (Linux の fcntl_setlease、vfs_setlease、generic_setlease)
+fn setlease(fd: i32, f: &FileRef, arg: i64, deleg: bool) -> Result<i64, i64> {
+    const EACCES: i64 = 13;
+    const EINVAL: i64 = 22;
+    const CAP_LEASE: u32 = 28;
+    let (k, me, is_dir, uid, ok_kind, writable) = {
+        let b = f.borrow();
+        let (dir, uid, inode) = match &b.kind {
+            Kind::Inode(i, _) => {
+                let m = i.meta();
+                (m.is_dir(), Some(m.uid), m.mode & crate::vfs::S_IFMT == crate::vfs::S_IFREG || m.is_dir())
+            }
+            _ => (false, None, false),
+        };
+        (key(&b), ptr_of(&b), dir, uid.or_else(|| Some(b.stat().uid)), inode, b.writable())
+    };
+    // ディレクトリには置けない (fcntl_setlease。aios はディレクトリの F_SETDELEG もない)
+    if is_dir {
+        return Err(-EINVAL);
+    }
+    // 型 (lease_init の assign_type)、持ち主か CAP_LEASE (vfs_setlease)、ふつうのファイル (generic_setlease)
+    if !matches!(arg as i16, F_RDLCK | F_WRLCK | F_UNLCK) || arg as i16 as i64 != arg {
+        return Err(-EINVAL);
+    }
+    let c = crate::cred::current();
+    if uid != Some(c.fsuid) && !c.capable(CAP_LEASE) {
+        return Err(-EACCES);
+    }
+    let Some(k) = k.filter(|_| ok_kind) else { return Err(-EINVAL) };
+    let arg = arg as i16;
+    if arg == F_UNLCK {
+        let Some(v) = leases().get_mut(&k) else { return Err(-EAGAIN) };
+        let Some(i) = v.iter().position(|l| l.ptr == me) else { return Err(-EAGAIN) };
+        let l = v.remove(i);
+        if v.is_empty() {
+            leases().remove(&k);
+        }
+        lease_unlock(&l);
+        lease_count();
+        proc::wakeup(lease_chan());
+        return Ok(0);
+    }
+    time_out_leases(k);
+    // ほかに開いている口 (Linux の lease_open_conflict)
+    let (r, w) = open_counts(k, me);
+    if arg == F_RDLCK && (w > 0 || writable) {
+        return Err(-EAGAIN);
+    }
+    if arg == F_WRLCK && (w > 0 || r > 0) {
+        return Err(-EAGAIN);
+    }
+    let v = leases().entry(k).or_default();
+    let mut mine = None;
+    for (i, l) in v.iter().enumerate() {
+        if l.ptr == me {
+            mine = Some(i);
+            continue;
+        }
+        // ほかにリースがあれば書くリースはだめ、外すのを待っているものがあれば新しいものもだめ
+        if arg == F_WRLCK || l.unlock.is_some() {
+            if v.is_empty() {
+                leases().remove(&k);
+            }
+            return Err(-EAGAIN);
+        }
+    }
+    if let Some(i) = mine {
+        // 型を変える (Linux の lease_modify): 読むリースにしたら下げる待ちは終わり
+        let l = &mut v[i];
+        l.typ = arg;
+        if arg == F_RDLCK {
+            l.downgrade = None;
+        }
+        proc::wakeup(lease_chan());
+    } else {
+        if LEASES_ENABLE.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+            if v.is_empty() {
+                leases().remove(&k);
+            }
+            return Err(-EINVAL);
+        }
+        v.push(Lease { file: Rc::downgrade(f), ptr: me, typ: arg, deleg, unlock: None, downgrade: None });
+    }
+    // シグナルの表に入れ、持ち主がまだなければ自分のプロセスに (Linux の lease_setup)
+    crate::fasync::helper(lease_fasync(me), fd, f, true);
+    crate::fasync::set(f, proc::current().tgid, crate::fasync::PidType::Tgid, false);
+    lease_count();
+    Ok(0)
+}
+
+/// 開く・切りつめる前に、ぶつかるリースをこわす (Linux の __break_lease)。write は書く口 (truncate も)
+fn break_lease(k: Key, write: bool, nonblock: bool) -> Result<(), i64> {
+    const EWOULDBLOCK: i64 = 11;
+    time_out_leases(k);
+    let conflict = |l: &Lease| write || l.typ == F_WRLCK;
+    let Some(v) = leases().get_mut(&k) else { return Ok(()) };
+    if !v.iter().any(|l| conflict(l)) {
+        return Ok(());
+    }
+    let secs = LEASE_BREAK_TIME.load(core::sync::atomic::Ordering::Relaxed) as u64;
+    let until = if secs > 0 { (crate::timer::ticks() + secs * crate::timer::HZ).max(1) } else { 0 };
+    let mut tell = Vec::new();
+    for l in v.iter_mut() {
+        if !conflict(l) {
+            continue;
+        }
+        if write {
+            if l.unlock.is_some() {
+                continue;
+            }
+            l.unlock = Some(until);
+        } else {
+            if l.unlock.is_some() || l.downgrade.is_some() {
+                continue;
+            }
+            l.downgrade = Some(until);
+        }
+        tell.push(l.ptr);
+    }
+    // 知らせる (Linux の lease_break_callback: kill_fasync の POLL_MSG)
+    for p in tell {
+        crate::fasync::kill(lease_fasync(p), crate::signal::SIGIO, crate::fasync::POLL_MSG);
+    }
+    loop {
+        // まだぶつかるもの (外すのを待っているものの、締め切り)
+        let wait = leases().get(&k).and_then(|v| v.iter().find(|l| write || l.typ == F_WRLCK).map(|l| l.unlock.or(l.downgrade).unwrap_or(0)));
+        let Some(deadline) = wait else { return Ok(()) };
+        if nonblock {
+            return Err(-EWOULDBLOCK);
+        }
+        if deadline == 0 {
+            proc::sleep(lease_chan())?;
+        } else {
+            proc::sleep_until(lease_chan(), deadline)?;
+        }
+        time_out_leases(k);
     }
 }

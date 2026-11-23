@@ -97,7 +97,23 @@ pub trait FileLocks: Sync {
     fn fcntl(&self, _f: &FileRef, _files: usize, _cmd: u64, _arg: usize) -> Result<i64, i64> {
         Err(-EINVAL)
     }
+    /// F_SETLEASE / F_SETDELEG (fd はこわすときの知らせの si_fd)
+    fn setlease(&self, _fd: i32, _f: &FileRef, _arg: i64, _deleg: bool) -> Result<i64, i64> {
+        Err(-EINVAL)
+    }
+    /// F_GETLEASE / F_GETDELEG (なければ F_UNLCK)
+    fn getlease(&self, _f: &FileRef, _deleg: bool) -> i64 {
+        2
+    }
+    /// 開く・切りつめる前に、ぶつかるリースをこわす (Linux の break_lease。LEASES が 0 でないときだけ呼ぶ)。key は
+    /// (ファイルシステム, inode)
+    fn break_lease(&self, _key: (usize, u64), _write: bool, _nonblock: bool) -> Result<(), i64> {
+        Ok(())
+    }
 }
+
+/// いま置いてあるリースの数 (locks.rs。0 なら開くときにリースを見ない: ロックなしの open も使える)
+pub static LEASES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 struct NoLocks;
 
@@ -692,6 +708,10 @@ fn note(i: usize) {
 /// 着くものなら、ext4 の名前と inode から新しく開く (fastdir::fast_open)。ほかは None (ふつうの道へ)
 pub fn fast_open(me: &proc::Proc, dirfd: i64, pathp: usize, flags: u64) -> Option<i64> {
     use core::sync::atomic::Ordering::Relaxed;
+    // リースがあれば、こわすのはふつうの道で
+    if LEASES.load(Relaxed) != 0 {
+        return None;
+    }
     const O_LARGEFILE: u64 = 0o400000;
     const O_CLOEXEC: u64 = 0o2000000;
     const OPENAT: u64 = 56;

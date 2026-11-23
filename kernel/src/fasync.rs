@@ -27,6 +27,7 @@ pub const F_OWNER_PGRP: i32 = 2;
 /// si_code (POLL_IN から POLL_HUP) と、そのときの si_band (Linux の band_table)
 pub const POLL_IN: i32 = 1;
 pub const POLL_OUT: i32 = 2;
+pub const POLL_MSG: i32 = 3;
 pub const POLL_ERR: i32 = 4;
 pub const POLL_PRI: i32 = 5;
 pub const POLL_HUP: i32 = 6;
