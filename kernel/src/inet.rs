@@ -449,6 +449,11 @@ fn notify(u: &InetRef) {
     proc::poll_wake(key(u));
 }
 
+/// O_ASYNC の表に知らせる (fasync.rs。Linux の sk_wake_async)
+fn wake_async(u: &InetRef, band: i32) {
+    crate::fasync::kill(key(u), crate::signal::SIGIO, band);
+}
+
 fn upgrade(w: &Option<W>) -> Option<InetRef> {
     w.as_ref().and_then(|w| w.upgrade())
 }
@@ -1445,6 +1450,7 @@ fn syn(u: &InetRef, in_call: bool) {
         s.syn_tries = 0;
         drop(s);
         notify(u);
+        wake_async(u, crate::fasync::POLL_OUT);
         return;
     }
     let found = if v6 { lookup_listener6(netns, daddr6, dport) } else { lookup_listener(netns, daddr, dport) };
@@ -1580,6 +1586,10 @@ fn syn(u: &InetRef, in_call: bool) {
     }
     l.borrow_mut().acceptq.push_back(c);
     notify(&l);
+    // O_ASYNC: listen のものに POLL_IN (Linux の tcp_child_process の sk_data_ready)、つないだものに POLL_OUT (Linux の
+    // tcp_rcv_synsent_state_process)
+    wake_async(&l, crate::fasync::POLL_IN);
+    wake_async(u, crate::fasync::POLL_OUT);
     // 外 (eth0) からも受ける待ち (0.0.0.0 などに bind したもの: ext_listen) の accept は、ネットワークの知らせ
     // (net::chan) で眠っている。中どうしのつなぎが来たら、そちらも起こす (でないと、ほかのスレッドで accept して
     // 眠っているもの (Rust の std や node のサーバー) が起きない)
@@ -2141,32 +2151,38 @@ pub fn accept(f: &FileRef, u: &InetRef) -> Result<InetRef, i64> {
 // ---- TCP: 受ける ----
 
 /// 相手から届いたもの (Linux の tcp_urg、tcp_check_urg、tcp_data_queue)。urg なら最後のバイトが urgent
-fn rx_data(s: &mut Inet, data: Vec<u8>, urg: bool) {
+/// 受けたデータを入れる。答えは (新しい urgent の場所を知らせた、urgent のバイトがここで来た): O_ASYNC の知らせのため
+/// (Linux の tcp_urg)
+fn rx_data(s: &mut Inet, data: Vec<u8>, urg: bool) -> (bool, bool) {
     let seq = s.rcv_nxt;
     let len = data.len() as u32;
+    let mut told = false;
+    let mut valid = false;
     if urg && len > 0 {
-        check_urg(s, seq.wrapping_add(len - 1));
+        told = check_urg(s, seq.wrapping_add(len - 1));
     }
     if s.urg_data == URG_NOTYET {
         let off = s.urg_seq.wrapping_sub(seq) as usize;
         if off < data.len() {
             s.urg_data = URG_VALID | data[off] as u16;
+            valid = true;
         }
     }
     if len == 0 {
-        return;
+        return (told, valid);
     }
     s.rq.push_back(Seg { seq, data, fin: false });
     s.rcv_nxt = s.rcv_nxt.wrapping_add(len);
+    (told, valid)
 }
 
-/// 新しい urgent の場所 (Linux の tcp_check_urg)
-fn check_urg(s: &mut Inet, ptr: u32) {
+/// 新しい urgent の場所 (Linux の tcp_check_urg)。新しければ true (SIGURG を送るところ: sk_send_sigurg)
+fn check_urg(s: &mut Inet, ptr: u32) -> bool {
     if after(s.copied_seq, ptr) || before(ptr, s.rcv_nxt) {
-        return;
+        return false;
     }
     if s.urg_data != 0 && !after(ptr, s.urg_seq) {
-        return;
+        return false;
     }
     // 前の urgent のバイトを読むところだったら、それはとばす
     if s.urg_seq == s.copied_seq && s.urg_data != 0 && !s.oobinline && s.copied_seq != s.rcv_nxt {
@@ -2179,6 +2195,7 @@ fn check_urg(s: &mut Inet, ptr: u32) {
     }
     s.urg_data = URG_NOTYET;
     s.urg_seq = ptr;
+    true
 }
 
 /// FIN が届いた (Linux の tcp_fin)。FIN_WAIT2 は TIME_WAIT に (fd があれば、それは CLOSE になり、TIME_WAIT は別に残る)
@@ -2199,6 +2216,14 @@ fn rx_fin(u: &InetRef) {
         _ => {}
     }
     notify(u);
+    // O_ASYNC (Linux の tcp_fin: 両方閉じたか CLOSE なら POLL_HUP、片方なら POLL_IN。それから tcp_data_queue の
+    // sk_data_ready の POLL_IN)
+    let hup = {
+        let s = u.borrow();
+        s.shutdown == BOTH || s.state == St::Close
+    };
+    wake_async(u, if hup { crate::fasync::POLL_HUP } else { crate::fasync::POLL_IN });
+    wake_async(u, crate::fasync::POLL_IN);
 }
 
 /// TIME_WAIT に (Linux の tcp_time_wait)。fd のないものはそのまま TIME_WAIT で残り、fd のあるものは CLOSE になって、
@@ -2305,6 +2330,10 @@ fn tcp_reset(u: &InetRef) {
     };
     u.borrow_mut().err = -err;
     tcp_done(u);
+    // O_ASYNC: エラー (Linux の tcp_done_with_error の sk_error_report)
+    if !u.borrow().dead {
+        wake_async(u, crate::fasync::POLL_ERR);
+    }
 }
 
 /// 相手に RST を送る
@@ -2710,6 +2739,8 @@ fn wake_peer(u: &InetRef) {
     let peer = upgrade(&u.borrow().peer);
     if let Some(p) = peer {
         notify(&p);
+        // O_ASYNC: 書けなかったものが書けるようになった (Linux の sk_stream_write_space)
+        crate::fasync::write_space(key(&p));
     }
 }
 
@@ -2946,11 +2977,23 @@ fn deliver_now(u: &InetRef, data: Vec<u8>, urg: bool) {
         tcp_reset(u);
         return;
     }
-    rx_data(&mut p.borrow_mut(), data, urg);
+    let has = !data.is_empty();
+    let (told, valid) = rx_data(&mut p.borrow_mut(), data, urg);
     // データの segment と、その ACK がたがいの窓を知らせる
     wnd_seen(&p);
     wnd_seen(u);
     notify(&p);
+    // O_ASYNC (Linux の tcp_urg: 新しい urgent は sk_send_sigurg、urgent のバイトが来たら sk_data_ready。それから
+    // tcp_data_queue の sk_data_ready)
+    if told {
+        crate::fasync::sigurg(key(&p));
+    }
+    if valid {
+        wake_async(&p, crate::fasync::POLL_IN);
+    }
+    if has {
+        wake_async(&p, crate::fasync::POLL_IN);
+    }
 }
 
 /// TCP の sendmsg (Linux の tcp_sendmsg_locked): つながるのを待つ (つながっていなければ EPIPE)、付帯データの
@@ -3013,15 +3056,27 @@ fn tcp_send(u: &InetRef, src: &Src, len: usize, ctl: &[u8], flags: u64, nonblock
             return if done > 0 { Ok(done as i64) } else { Err(stream_error(u, flags, -EPIPE)) };
         };
         if space == 0 {
-            if done > 0 && nb {
-                break;
+            // O_ASYNC: あいたら POLL_OUT (Linux の sk_stream_wait_memory の SOCKWQ_ASYNC_NOSPACE)。読む相手に、あいたら
+            // 知らせてもらう
+            let fa = crate::fasync::listed(key(u));
+            if fa {
+                crate::fasync::nospace(key(u));
             }
-            if nb {
+            if nb && (done > 0 || !fa) {
+                if done > 0 {
+                    break;
+                }
                 return Err(-EAGAIN);
             }
             let peer = upgrade(&u.borrow().peer);
             if let Some(p) = peer {
                 p.borrow_mut().writer_waits = true;
+            }
+            if nb {
+                if done > 0 {
+                    break;
+                }
+                return Err(-EAGAIN);
             }
             let timeo = u.borrow().sndtimeo;
             if let Err(e) = wait(key(u), timeo, 0) {
@@ -3475,6 +3530,7 @@ fn udp6_mcast_deliver(netns: u64, src: u128, sport: u16, dst: u128, dport: u16, 
         };
         if ok {
             notify(&r);
+            wake_async(&r, crate::fasync::POLL_IN);
         }
     }
 }
@@ -3721,6 +3777,7 @@ fn udp6_send(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], 
             };
             if ok {
                 notify(&r);
+                wake_async(&r, crate::fasync::POLL_IN);
             }
         }
         None => {
@@ -3922,6 +3979,7 @@ fn udp_send4(u: &InetRef, src: &Src, len: usize, to: Option<&[u8]>, ctl: &[u8], 
             };
             if ok {
                 notify(&r);
+                wake_async(&r, crate::fasync::POLL_IN);
             }
         }
         // だれもいない: ICMP の port unreachable が返る (Linux の __udp4_lib_err)。connect した相手そのものか、
@@ -5757,6 +5815,7 @@ fn ext_udp_pull(u: &InetRef) {
     }
     if got {
         notify(u);
+        wake_async(u, crate::fasync::POLL_IN);
     }
 }
 

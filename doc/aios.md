@@ -961,6 +961,18 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   できごとをためたとき (まとめたものはのぞく)。F_DUPFD_QUERY、F_CREATED_QUERY (open で作ったファイル: OpenFile::created)、
   F_GET_RW_HINT / F_SET_RW_HINT ((装置, inode) ごとに中で覚える。作ったファイルは消す) も。aios とちがうところ: 持ち主は番号で
   覚える (Linux は struct pid) ので、終わって番号がほかのプロセスに使われると、そちらに送る
+- ソケットと端末の SIGIO / SIGURG (test/fasync2.c、Linux 7.4-rc3 と 32 行同じ): Linux の sk_wake_async の場所で。AF_UNIX は
+  受けると POLL_IN (stream も dgram も)、相手の SHUT_WR で POLL_IN、両方なら POLL_HUP、stream の相手が閉じると POLL_HUP、
+  いっぱい (EAGAIN か眠る前: fasync::nospace) のあと読まれて書けるようになると 1 度だけ POLL_OUT (unix_write_space)、MSG_OOB
+  は持ち主に SIGURG (O_ASYNC がなくても: send_sigurg。ソケットの開いたファイルは持ち主をつけたときに覚える) と、F_SETSIG を
+  したものに POLL_PRI。TCP はつながると listen のものに POLL_IN、つないだものに POLL_OUT、データで POLL_IN、urgent は SIGURG
+  と POLL_PRI、urgent のバイトが来た POLL_IN、それからデータの POLL_IN (Linux の tcp_urg と tcp_data_queue)、FIN で
+  POLL_IN か (両方閉じたか CLOSE なら) POLL_HUP とデータの POLL_IN (tcp_fin)、RST で POLL_ERR、窓があくと POLL_OUT。UDP は
+  受けると POLL_IN。FIOSETOWN / SIOCSPGRP / FIOGETOWN / SIOCGPGRP (ソケットだけ)。O_ASYNC のソケットは AF_UNIX のロックなしの
+  読み書きをしない (UnixCell::fasync を相手のロックを取らずに見る)。端末は O_ASYNC にしたとき持ち主がなければ、前にいる
+  グループ (なければ自分) を持ち主に (Linux の __tty_fasync)。子の口 (とコンソール) はカノニカルなら行が終わるたびに、でなければ
+  読めるものがあれば POLL_IN、親の口は子が書いたものとエコーで POLL_IN。aios とちがうところ: 読む人がソケットで待っているとき
+  にも POLL_IN を送る (Linux は SOCKWQ_ASYNC_WAITDATA で送らない)
 - perf の PERF_RECORD_MMAP / MMAP2 (test/perf4.c、Linux 7.4-rc3 と 11 行同じ): perf record が新しく写したライブラリを知る。
   attr.mmap か mmap2 なら実行できる写し、mmap_data なら読み書きのものも (MISC_MMAP_DATA の印)。きっかけは mmap (Linux の
   mmap_region の perf_event_mmap)、実行できなかったところを実行できるようにした mprotect (mprotect_fixup)、exec の

@@ -27,7 +27,6 @@ pub const F_OWNER_PGRP: i32 = 2;
 /// si_code (POLL_IN から POLL_HUP) と、そのときの si_band (Linux の band_table)
 pub const POLL_IN: i32 = 1;
 pub const POLL_OUT: i32 = 2;
-pub const POLL_MSG: i32 = 3;
 pub const POLL_ERR: i32 = 4;
 pub const POLL_PRI: i32 = 5;
 pub const POLL_HUP: i32 = 6;
@@ -82,6 +81,7 @@ fn resolve(who: u32) -> Option<u32> {
 /// 持ち主をつける (Linux の __f_setown)。force でなければ、まだいないときだけ
 pub fn set(f: &FileRef, pid: u32, ty: PidType, force: bool) {
     let o = fown_of(f);
+    remember_owner(f);
     if force || o.pid.get() == 0 {
         o.pid.set(pid);
         o.ty.set(ty);
@@ -165,6 +165,7 @@ pub fn setsig(f: &FileRef, sig: i32) -> Result<i64, i64> {
         return Err(crate::why::inval());
     }
     fown_of(f).signum.set(sig);
+    remember_owner(f);
     Ok(0)
 }
 
@@ -180,7 +181,30 @@ struct Entry {
 }
 
 /// 鍵 (ものの番地) ごとの表
-static LISTS: Bkl<BTreeMap<usize, Vec<Entry>>> = Bkl::new(BTreeMap::new());
+#[derive(Default)]
+struct List {
+    entries: Vec<Entry>,
+    /// 書けなくなった (Linux の SOCKWQ_ASYNC_NOSPACE): 書けるようになったら 1 度だけ POLL_OUT
+    nospace: bool,
+}
+
+static LISTS: Bkl<BTreeMap<usize, List>> = Bkl::new(BTreeMap::new());
+
+/// ソケットの開いたファイル (Linux の sock->file: ソケットごとに 1 つ)。持ち主をつけたときに覚える: SIGURG は
+/// O_ASYNC がなくても持ち主に送る (send_sigurg)
+static OWNERS: Bkl<BTreeMap<usize, Weak<RefCell<OpenFile>>>> = Bkl::new(BTreeMap::new());
+
+fn remember_owner(f: &FileRef) {
+    let key = match &f.borrow().kind {
+        crate::file::Kind::Ops(o) => o.fasync_key(),
+        _ => None,
+    };
+    if let Some(k) = key {
+        let owners = OWNERS.get();
+        owners.retain(|_, w| w.strong_count() > 0);
+        owners.insert(k, Rc::downgrade(f));
+    }
+}
 
 /// O_ASYNC を入れる / 外す (Linux の fasync_helper)。ファイルの O_ASYNC の印もここで (表にいるかと印をいつも合わせる)。
 /// 変えたら true
@@ -189,28 +213,28 @@ pub fn helper(key: usize, fd: i32, f: &FileRef, on: bool) -> bool {
     let me = Rc::as_ptr(f);
     if !on {
         let Some(l) = lists.get_mut(&key) else { return false };
-        let Some(i) = l.iter().position(|e| core::ptr::eq(e.file.as_ptr(), me)) else { return false };
-        l.remove(i);
-        if l.is_empty() {
+        let Some(i) = l.entries.iter().position(|e| core::ptr::eq(e.file.as_ptr(), me)) else { return false };
+        l.entries.remove(i);
+        if l.entries.is_empty() {
             lists.remove(&key);
         }
         f.borrow_mut().flags &= !FASYNC;
         return true;
     }
     let l = lists.entry(key).or_default();
-    l.retain(|e| e.file.strong_count() > 0);
-    if let Some(e) = l.iter_mut().find(|e| core::ptr::eq(e.file.as_ptr(), me)) {
+    l.entries.retain(|e| e.file.strong_count() > 0);
+    if let Some(e) = l.entries.iter_mut().find(|e| core::ptr::eq(e.file.as_ptr(), me)) {
         e.fd = fd;
         return false;
     }
-    l.push(Entry { file: Rc::downgrade(f), fd });
+    l.entries.push(Entry { file: Rc::downgrade(f), fd });
     f.borrow_mut().flags |= FASYNC;
     true
 }
 
 /// 鍵の表にだれかいるか (パイプのロックなしの道が見る数のため)
 pub fn listed(key: usize) -> bool {
-    LISTS.get().get(&key).is_some_and(|l| l.iter().any(|e| e.file.strong_count() > 0))
+    LISTS.get().get(&key).is_some_and(|l| l.entries.iter().any(|e| e.file.strong_count() > 0))
 }
 
 /// 表のみなの持ち主に知らせる (Linux の kill_fasync)。sig は SIGIO か SIGURG、band は POLL_IN ...
@@ -220,9 +244,9 @@ pub fn kill(key: usize, sig: i32, band: i32) {
         return;
     }
     let Some(l) = lists.get_mut(&key) else { return };
-    l.retain(|e| e.file.strong_count() > 0);
-    let to: Vec<(Rc<Fown>, i32)> = l.iter().filter_map(|e| e.file.upgrade().and_then(|f| fown_get(&f)).map(|o| (o, e.fd))).collect();
-    if l.is_empty() {
+    l.entries.retain(|e| e.file.strong_count() > 0);
+    let to: Vec<(Rc<Fown>, i32)> = l.entries.iter().filter_map(|e| e.file.upgrade().and_then(|f| fown_get(&f)).map(|o| (o, e.fd))).collect();
+    if l.entries.is_empty() {
         lists.remove(&key);
     }
     for (o, fd) in to {
@@ -230,6 +254,37 @@ pub fn kill(key: usize, sig: i32, band: i32) {
         if !(sig == signal::SIGURG && o.signum.get() == 0) {
             send_sigio(&o, fd, band);
         }
+    }
+}
+
+/// 書けなくなった (いっぱいで EAGAIN か、眠る前: Linux の sock_alloc_send_pskb の SOCKWQ_ASYNC_NOSPACE)
+pub fn nospace(key: usize) {
+    if let Some(l) = LISTS.get().get_mut(&key) {
+        l.nospace = true;
+    }
+}
+
+/// 書けるようになった: 前に書けなくなっていたら 1 度だけ POLL_OUT (Linux の sock_wake_async の SOCK_WAKE_SPACE)
+pub fn write_space(key: usize) {
+    let was = LISTS.get().get_mut(&key).is_some_and(|l| core::mem::take(&mut l.nospace));
+    if was {
+        kill(key, signal::SIGIO, POLL_OUT);
+    }
+}
+
+/// 帯域外のデータが来た (Linux の sk_send_sigurg): ソケットの持ち主に SIGURG、いれば O_ASYNC の表に POLL_PRI
+pub fn sigurg(key: usize) {
+    let f = {
+        let owners = OWNERS.get();
+        if owners.is_empty() {
+            return;
+        }
+        owners.get(&key).and_then(|w| w.upgrade())
+    };
+    if let Some(f) = f
+        && send_sigurg(&f)
+    {
+        kill(key, signal::SIGURG, POLL_PRI);
     }
 }
 
@@ -350,6 +405,8 @@ static RANDOM_KEY: u8 = 0;
 pub fn toggle(fd: i32, f: &FileRef, on: bool) -> Option<()> {
     use crate::file::Kind;
     let mut pipe = None;
+    let mut ops = None;
+    let mut tty: Option<u32> = None;
     let keys: Vec<usize> = match &f.borrow().kind {
         Kind::PipeRead(p) => {
             pipe = Some(p.clone());
@@ -365,11 +422,37 @@ pub fn toggle(fd: i32, f: &FileRef, on: bool) -> Option<()> {
             alloc::vec![r, w]
         }
         Kind::Random => alloc::vec![&RANDOM_KEY as *const u8 as usize],
-        Kind::Ops(o) => alloc::vec![o.fasync_key()?],
+        Kind::Tty(t) => {
+            tty = Some(t.borrow().pgrp);
+            alloc::vec![crate::tty::fasync_key(t, false)]
+        }
+        Kind::PtyMaster(t) => {
+            tty = Some(0);
+            alloc::vec![crate::tty::fasync_key(t, true)]
+        }
+        Kind::Ops(o) => {
+            ops = Some(o.clone());
+            alloc::vec![o.fasync_key()?]
+        }
         _ => return None,
     };
-    for k in keys {
-        helper(k, fd, f, on);
+    let mut added = false;
+    for &k in &keys {
+        added |= helper(k, fd, f, on) && on;
+    }
+    // 端末は、まだ持ち主がなければ前にいるグループ (なければ自分のプロセス) を持ち主に (Linux の __tty_fasync)
+    if let Some(pgrp) = tty
+        && added
+    {
+        if pgrp != 0 {
+            set(f, pgrp, PidType::Pgid, false);
+        } else {
+            set(f, proc::current().tgid, PidType::Tgid, false);
+        }
+    }
+    remember_owner(f);
+    if let Some(o) = ops {
+        o.fasync_changed(listed(keys[0]));
     }
     if let Some(p) = pipe {
         let l = pipe_listed(&p);

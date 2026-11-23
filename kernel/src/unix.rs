@@ -255,6 +255,8 @@ pub type UnixRef = Arc<UnixCell>;
 pub struct UnixCell {
     owner: core::sync::atomic::AtomicUsize,
     inner: crate::spinlock::SpinLock<Unix>,
+    /// O_ASYNC の表にいる (fasync.rs): 知らせるのはふつうの道で (ロックなしの道は、相手のロックを取らずにこれを見る)
+    pub fasync: core::sync::atomic::AtomicBool,
 }
 
 pub struct UnixGuard<'a> {
@@ -264,7 +266,7 @@ pub struct UnixGuard<'a> {
 
 impl UnixCell {
     fn new(u: Unix) -> Self {
-        Self { owner: core::sync::atomic::AtomicUsize::new(0), inner: crate::spinlock::SpinLock::new(u) }
+        Self { owner: core::sync::atomic::AtomicUsize::new(0), inner: crate::spinlock::SpinLock::new(u), fasync: core::sync::atomic::AtomicBool::new(false) }
     }
 
     pub fn borrow_mut(&self) -> UnixGuard<'_> {
@@ -1105,6 +1107,8 @@ fn wait_wmem(u: &UnixRef, nonblock: bool) -> Result<(), i64> {
             if s.wmem < s.sndbuf {
                 return Ok(());
             }
+            // O_ASYNC: 書けるようになったら POLL_OUT (Linux の sock_alloc_send_pskb の SOCKWQ_ASYNC_NOSPACE)
+            crate::fasync::nospace(key(u));
             if nonblock {
                 return Err(-EAGAIN);
             }
@@ -1254,6 +1258,11 @@ fn deliver(u: &UnixRef, other: &UnixRef, data: Vec<u8>, fds: Vec<FileRef>, cred:
     }
     u.borrow_mut().wmem += truesize;
     notify(other);
+    // O_ASYNC (Linux の queue_oob の sk_send_sigurg と、sk_data_ready の sock_def_readable)
+    if oob {
+        crate::fasync::sigurg(key(other));
+    }
+    crate::fasync::kill(key(other), crate::signal::SIGIO, crate::fasync::POLL_IN);
     Ok(())
 }
 
@@ -1341,6 +1350,7 @@ fn dgram_send(u: &UnixRef, it: &mut Iter, len: usize, to: Option<&[u8]>, scm: Sc
     other.borrow_mut().q.push_back(m);
     u.borrow_mut().wmem += ts;
     notify(&other);
+    crate::fasync::kill(key(&other), crate::signal::SIGIO, crate::fasync::POLL_IN);
     Ok(len as i64)
 }
 
@@ -1350,14 +1360,18 @@ fn dgram_send(u: &UnixRef, it: &mut Iter, len: usize, to: Option<&[u8]>, scm: Sc
 fn free(msgs: impl IntoIterator<Item = Msg>) {
     for mut m in msgs {
         if let Some(s) = m.sender.take() {
-            let was_full = {
+            let (was_full, writable) = {
                 let mut b = s.borrow_mut();
                 let before = b.wmem;
                 b.wmem = before.saturating_sub(m.truesize);
-                before >= b.sndbuf || (before + 1) * 4 > b.sndbuf
+                (before >= b.sndbuf || (before + 1) * 4 > b.sndbuf, b.state != State::Listen && (b.wmem + 1) * 4 <= b.sndbuf)
             };
             if was_full {
                 notify(&s);
+            }
+            // O_ASYNC: 書けなかったものが書けるようになった (Linux の unix_write_space)
+            if writable {
+                crate::fasync::write_space(key(&s));
             }
         }
         drop(m);
@@ -1845,7 +1859,7 @@ fn fast_send(me: &proc::Proc, u: &UnixRef, buf: usize, len: usize) -> Option<i64
     // 相手: 受けられるか (deliver と add_creds の見るもの)。こちらにつないでいる相手だけ (行列のものの送り手は相手の peer)
     let wake = {
         let mut o = peer.borrow_mut();
-        if o.dead || o.shutdown & RCV != 0 || o.passcred || !o.has_file || !same(&o.peer, u) {
+        if o.dead || o.shutdown & RCV != 0 || o.passcred || !o.has_file || !same(&o.peer, u) || peer.fasync.load(core::sync::atomic::Ordering::Relaxed) {
             None
         } else {
             o.q.push_back(Msg::plain(data, u, ts));
@@ -1877,7 +1891,8 @@ fn fast_recv(me: &proc::Proc, u: &UnixRef, buf: usize, len: usize) -> Option<i64
     let mut tmp = crate::heap::try_vec(len, false).ok()?;
     let (gone, n) = {
         let mut s = u.borrow_mut();
-        if s.typ != SOCK_STREAM || s.state != State::Established || s.passcred || s.oob.is_some() {
+        // 送り手が O_ASYNC なら、書けるようになった知らせ (POLL_OUT) はふつうの道で
+        if s.typ != SOCK_STREAM || s.state != State::Established || s.passcred || s.oob.is_some() || s.peer.as_ref().is_some_and(|p| p.fasync.load(core::sync::atomic::Ordering::Relaxed)) {
             return None;
         }
         // 読むだけあるか (stream_recv の target)。読むメッセージはどれも fd のないもので、相手が送ったもの (それを落としても
@@ -1979,6 +1994,12 @@ pub fn shutdown(u: &UnixRef, how: u64) -> R {
             }
             p.borrow_mut().shutdown |= pm;
             notify(&p);
+            // O_ASYNC: 両方なら POLL_HUP、受けるのをやめたら POLL_IN (Linux の unix_shutdown)
+            if pm == SEND | RCV {
+                crate::fasync::kill(key(&p), crate::signal::SIGIO, crate::fasync::POLL_HUP);
+            } else if pm & RCV != 0 {
+                crate::fasync::kill(key(&p), crate::signal::SIGIO, crate::fasync::POLL_IN);
+            }
         }
     }
     Ok(0)
@@ -2148,7 +2169,8 @@ fn release_sock(u: &UnixRef, embryo: bool) {
         (peer.map(|p| (p, unread)), msgs, embryos, was, s.typ)
     };
     if let Some((p, unread)) = peer {
-        if typ == SOCK_STREAM || typ == SOCK_SEQPACKET {
+        let stream = typ == SOCK_STREAM || typ == SOCK_SEQPACKET;
+        if stream {
             let mut ps = p.borrow_mut();
             ps.shutdown = BOTH;
             if unread || embryo {
@@ -2156,6 +2178,10 @@ fn release_sock(u: &UnixRef, embryo: bool) {
             }
         }
         notify(&p);
+        // O_ASYNC (Linux の unix_release_sock: stream と seqpacket の相手に POLL_HUP)
+        if stream {
+            crate::fasync::kill(key(&p), crate::signal::SIGIO, crate::fasync::POLL_HUP);
+        }
     }
     free(msgs);
     if was == State::Listen {
@@ -2741,6 +2767,9 @@ impl file::FileOps for UnixFile {
     /// O_ASYNC の表の鍵 (fasync.rs: ソケットの番地。Linux の sock_fasync)
     fn fasync_key(&self) -> Option<usize> {
         Some(Arc::as_ptr(&self.0) as *const u8 as usize)
+    }
+    fn fasync_changed(&self, listed: bool) {
+        self.0.fasync.store(listed, core::sync::atomic::Ordering::Relaxed);
     }
     fn class(&self) -> usize {
         3

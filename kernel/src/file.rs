@@ -282,6 +282,8 @@ pub trait FileOps: core::any::Any {
     fn fasync_key(&self) -> Option<usize> {
         None
     }
+    /// O_ASYNC の表にだれかいるかが変わった (ロックなしの道を使わないものの印に)
+    fn fasync_changed(&self, _listed: bool) {}
     /// splice で位置のないものとして読む (TCP / UDP: Linux の tcp_splice_read と copy_splice_read)
     fn splice_stream(&self) -> bool {
         false

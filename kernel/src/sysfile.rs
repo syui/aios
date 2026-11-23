@@ -3034,6 +3034,16 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
         }
         return Ok(0);
     }
+    // ソケットの持ち主 (Linux の sock_ioctl): FIOSETOWN と SIOCSPGRP は F_SETOWN、FIOGETOWN と SIOCGPGRP は F_GETOWN
+    if (0x8901..=0x8904).contains(&req) && f.borrow().stat().mode & S_IFMT == vfs::S_IFSOCK {
+        if req == 0x8901 || req == 0x8902 {
+            let mut v = [0u8; 4];
+            proc::current().pt().copy_in(&mut v, arg).ok_or(-EFAULT)?;
+            return crate::fasync::setown(&f, i32::from_le_bytes(v));
+        }
+        out(arg, &(crate::fasync::getown(&f) as i32).to_le_bytes())?;
+        return Ok(0);
+    }
     // FIOASYNC: O_ASYNC (fasync.rs)。fasync のないものは ENOTTY (Linux の ioctl_fioasync)
     const FIOASYNC: u64 = 0x5452;
     if req == FIOASYNC {

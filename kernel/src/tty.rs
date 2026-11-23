@@ -446,14 +446,33 @@ fn send(pgrp: u32, sig: i32) {
     }
 }
 
+/// O_ASYNC の表の鍵 (fasync.rs): 子の口 (とコンソール) と親の口
+pub fn fasync_key(tty: &TtyRef, master: bool) -> usize {
+    Rc::as_ptr(tty) as *const u8 as usize + master as usize
+}
+
+/// 入力の知らせ (Linux の n_tty): カノニカルなら行が終わるたびに、でなければ読めるものがあれば POLL_IN
+fn input_async(tty: &TtyRef, lines_before: usize) {
+    let (canon, lines, any) = {
+        let t = tty.borrow();
+        (t.canon(), t.lines, !t.inq.is_empty())
+    };
+    let n = if canon { lines.saturating_sub(lines_before) } else { any as usize };
+    for _ in 0..n {
+        crate::fasync::kill(fasync_key(tty, false), signal::SIGIO, crate::fasync::POLL_IN);
+    }
+}
+
 /// UART の受信割り込みから
 pub fn console_input(c: u8) {
     let tty = console();
+    let lines = tty.borrow().lines;
     let r = tty.borrow_mut().input(c);
     if let Ok(Some(sig)) = r {
         let pg = tty.borrow().pgrp;
         send(pg, sig);
     }
+    input_async(&tty, lines);
 }
 
 /// コンソールにもう 1 文字入る場所があるか (UART の受信を止めるか: uart::intr)。止めているあいだ、文字は
@@ -589,6 +608,10 @@ pub fn write(tty: &TtyRef, src: &[u8], nonblock: bool) -> Result<usize, i64> {
                 if let Dev::Pty(_) = t.dev {
                     proc::wakeup(t.chan(MREAD));
                     proc::poll_wake(t.chan(0));
+                    // O_ASYNC: 親の口に読めるものが来た (Linux の pty_write から親の n_tty)
+                    drop(t);
+                    crate::fasync::kill(fasync_key(tty, true), signal::SIGIO, crate::fasync::POLL_IN);
+                    t = tty.borrow_mut();
                 }
             }
             if done == src.len() {
@@ -641,6 +664,11 @@ pub fn master_read(tty: &TtyRef, dst: &mut [u8], nonblock: bool) -> Result<usize
 pub fn master_write(tty: &TtyRef, src: &[u8], nonblock: bool) -> Result<usize, i64> {
     let mut done = 0;
     loop {
+        let (lines, echoed) = {
+            let mut t = tty.borrow_mut();
+            (t.lines, t.pty().map_or(0, |p| p.out.len()))
+        };
+        let start = done;
         while done < src.len() {
             let r = tty.borrow_mut().input(src[done]);
             match r {
@@ -659,6 +687,14 @@ pub fn master_write(tty: &TtyRef, src: &[u8], nonblock: bool) -> Result<usize, i
             let t = tty.borrow();
             proc::wakeup(t.chan(MREAD));
             proc::poll_wake(t.chan(0));
+        }
+        // O_ASYNC: 子の入力 (行が終わったか、カノニカルでなければ読めるもの) と、親に返ったエコー
+        if done > start {
+            input_async(tty, lines);
+            let more = tty.borrow_mut().pty().map_or(0, |p| p.out.len()) > echoed;
+            if more {
+                crate::fasync::kill(fasync_key(tty, true), signal::SIGIO, crate::fasync::POLL_IN);
+            }
         }
         if done == src.len() {
             return Ok(done);
