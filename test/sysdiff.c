@@ -310,8 +310,50 @@ static const struct {
 } linux_bugs[] = {
     {"zero-range-eof", "ext4 の fallocate ZERO_RANGE で、範囲がファイルの終わりをこえ、終わりのブロックがもうディスクにあると、そのブロックの中 (ファイルの終わりまで) が 0 にならない (7.2.11 と 7.3: ext4_alloc_file_blocks の ext4_block_zero_eof が、落としたばかりのページを読みもどす。6.18 は 0 になる)"},
     {"efault-extend", "ファイルの終わりより先への書きこみがさわれない入れ物で EFAULT になっても、ファイルがその位置まで伸びる (ext4 も tmpfs も。6.18、7.2.11、7.3: generic_perform_write が write_begin のあとに写し、0 バイトでも write_end (ext4_da_do_write_end、shmem_write_end) が i_size を pos にする)。なにも書けなかったのだから伸びないのが正しい"},
+    {"unix-oob-inq", "AF_UNIX の stream で、MSG_OOB の 1 バイトを SO_OOBINLINE なしに読みとばす (ふつうの read や recv が読まずに捨てる) と、FIONREAD の数がそのぶん多いままになる (7.3 と 7.4: manage_oob が skb を外すが inq_len を減らさない)。読めないバイトを数えるのはまちがい"},
     {"tmpfs-extend", "tmpfs で、写し (mmap) でファイルの終わりの先 (同じページの中) に書いたものが、ファイルを伸ばすと (ftruncate、fallocate、終わりより先への write) そのまま中身になる (7.2.11 と 7.3: shmem_setattr と shmem_write_end はページの終わりの先を 0 にしない。ext4 は pagecache_isize_extended で 0 にする)。POSIX は、伸ばしたところは 0 と読めると決めている"},
 };
+
+// linuxbug unix-oob-inq: AF_UNIX の stream で、SO_OOBINLINE なしに MSG_OOB の 1 バイトを読みとばした数 (ソケットの inode ごと)。
+// 読みとばしたかは、読む op の前に印 (SIOCATMARK) にいて、あとでいなくなったかで見る (両方で)
+static struct {
+    ino_t ino;
+    int n;
+} oobskip[16];
+
+static ino_t unix_stream_ino(int fd) {
+    struct stat st;
+    int dom = 0, typ = 0, inl = 0;
+    socklen_t l = sizeof dom;
+    if (fstat(fd, &st) != 0 || !S_ISSOCK(st.st_mode) || getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &dom, &l) != 0 || dom != AF_UNIX)
+        return 0;
+    l = sizeof typ;
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &typ, &l) != 0 || typ != SOCK_STREAM)
+        return 0;
+    l = sizeof inl;
+    if (getsockopt(fd, SOL_SOCKET, SO_OOBINLINE, &inl, &l) != 0 || inl)
+        return 0;
+    return st.st_ino;
+}
+
+static int at_mark(int fd) {
+    int m = 0;
+    return ioctl(fd, SIOCATMARK, &m) == 0 && m;
+}
+
+static int *oobskip_of(ino_t ino, int add) {
+    for (unsigned i = 0; i < sizeof oobskip / sizeof *oobskip; i++)
+        if (oobskip[i].ino == ino)
+            return &oobskip[i].n;
+    if (!add)
+        return NULL;
+    for (unsigned i = 0; i < sizeof oobskip / sizeof *oobskip; i++)
+        if (oobskip[i].ino == 0) {
+            oobskip[i].ino = ino;
+            return &oobskip[i].n;
+        }
+    return NULL;
+}
 
 // seek-unwritten: この case で、未初期化のブロックをとる fallocate (mode 0、KEEP_SIZE、ZERO_RANGE) がうまくいったか
 static int fallocated;
@@ -323,6 +365,9 @@ static int raw;
 
 // chosen send-notconn: 書く op (write、writev、pwritev2、send、sendfile、splice など) の書く先の fd (なければ -1)
 static int wfd = -1;
+// chosen send-notconn: 書く先に、op の前からエラーが残っていたか (POLLERR)。残っていれば、Linux も aios もそのエラーを
+// 先に返す (つながっていたものが RST を受けて CLOSE になり、AF_UNSPEC で切ってもエラーは残る: EPIPE はそのエラー)
+static int wfd_err;
 
 // fd が一度もつないでいない TCP か: aios は dport が 0 のもの (connect していない、listen しているもの、connect に
 // しくじったもの、AF_UNSPEC で切ったもの: Linux の inet_dport と同じ)。Linux では、それと同じく 0 にもどる TCP_INFO の
@@ -358,7 +403,7 @@ static void ret(long r) {
     // chosen send-notconn: 一度もつないでいない TCP へ書くと、aios は ENOTCONN。Linux は EPIPE なので ENOTCONN にしてまねる。
     // しらべる getsockopt が errno を変えないように (書く先がソケットでなければ ENOTSOCK になる)
     int e = errno;
-    if (r < 0 && wfd >= 0 && e == (on_aios ? ENOTCONN : EPIPE) && fresh_tcp(wfd)) {
+    if (r < 0 && wfd >= 0 && !wfd_err && e == (on_aios ? ENOTCONN : EPIPE) && fresh_tcp(wfd)) {
         errno = ENOTCONN;
         say(" = ENOTCONN [chosen send-notconn]");
         return;
@@ -3060,9 +3105,16 @@ static void sockexec(int i, const struct op *o, int fd) {
             int n = -7;
             say("ioctl(%d, FIONREAD)", fd);
             r = syscall(SYS_ioctl, fd, FIONREAD, &n);
+            // linuxbug unix-oob-inq: Linux は読みとばした MSG_OOB の 1 バイトも数えたままなので、そのぶん引く
+            ino_t ui = r == 0 ? unix_stream_ino(fd) : 0;
+            int *sk = ui ? oobskip_of(ui, 0) : NULL;
+            if (sk && *sk && !on_aios && !raw)
+                n -= *sk;
             ret(r);
             if (r == 0)
                 say(" n%d", n);
+            if (sk && *sk)
+                say(" [linuxbug unix-oob-inq]");
         }
         break;
     }
@@ -3085,12 +3137,21 @@ static void exec(int i, const struct op *o) {
     struct statfs xsf;
     int xt = xfd >= 0 && fstat(xfd, &xs0) == 0 && S_ISREG(xs0.st_mode) && fstatfs(xfd, &xsf) == 0 && xsf.f_type == K_TMPFS_MAGIC;
     long long wstart = xt ? wstart_of(o, xfd, (long long)xs0.st_size) : 0;
+    // linuxbug unix-oob-inq: AF_UNIX の stream を読む op (MSG_OOB と MSG_PEEK のものはのぞく) の前に印にいたか
+    int rdop = o->kind == READ || o->kind == READV || o->kind == PREADV2 || o->kind == SPLICE || (o->kind == RECV && !(rflv[o->y] & (MSG_OOB | MSG_PEEK)));
+    ino_t uino = rdop ? unix_stream_ino(fd) : 0;
+    int umark = uino && at_mark(fd);
     // chosen send-notconn: 書く op の書く先 (ret が見る)
     wfd = -1;
     if (o->kind == WRITE || o->kind == WRITEV || o->kind == PWRITEV2 || o->kind == SEND)
         wfd = fd;
     else if (o->kind == SENDFILE || o->kind == COPYRANGE || o->kind == SPLICE)
         wfd = fdref(o->d2, o->fb, fd);
+    wfd_err = 0;
+    if (wfd >= 0) {
+        struct pollfd q = {.fd = wfd};
+        wfd_err = poll(&q, 1, 0) == 1 && (q.revents & POLLERR);
+    }
     switch (o->kind) {
     case SOCKET:
     case SOCKPAIR:
@@ -4230,6 +4291,12 @@ static void exec(int i, const struct op *o) {
     }
     if (o->kind == TRUNCATE && xfd >= 0)
         close(xfd);
+    // linuxbug unix-oob-inq: 印にいたのに、読んだあと印でなくなった (MSG_OOB の 1 バイトを読みとばした)
+    if (umark && !at_mark(fd)) {
+        int *sk = oobskip_of(uino, 1);
+        if (sk)
+            (*sk)++;
+    }
     flush();
 }
 
