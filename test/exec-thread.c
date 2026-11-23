@@ -1,7 +1,7 @@
 // 代表でないスレッドからの execve のテスト (カーネル: proc.rs の exec_takeover): aios の中で動かす。
 // Linux と同じく、ほかのスレッドは消えて、プロセスは同じ PID のまま新しいプログラムになり、親にはその終わりが見える
 // (前は代表スレッドが SIGKILL で終わったように見えた。zig cc -MM が make で "Killed" になった)。
-// 100 回くり返して、/proc/ai/heap が読めれば (root か wheel) カーネルのヒープがふえないかも見る
+// 100 回を 2 度くり返して、/proc/ai/heap が読めれば (root か wheel) カーネルのヒープがどちらでもふえないかも見る
 // (前はスレッドを exit で終わらせて、execve の引数と環境のコピーがもれた)。
 // aarch64-linux-gnu-gcc -O2 -static -pthread -o exec-thread test/exec-thread.c。aish-vm の try で file: test/exec-thread.c でも
 #include <pthread.h>
@@ -77,16 +77,23 @@ int main(int argc, char **argv) {
     printf("exec-thread: FAIL exit status %d (want 3: the same pid after execve)\n", WEXITSTATUS(st));
     return 1;
   }
-  long h0 = heap_used();
-  for (int i = 0; i < 100; i++) {
-    if (once() != 3 << 8) {
-      printf("exec-thread: FAIL run %d\n", i);
-      return 1;
+  // 100 回を 2 度。もれていれば、どちらの 100 回でも同じだけふえる (ほかのテストのあとで ext4 のキャッシュの表がのびる
+  // ことがあり、1 度だけでは見分けられない)
+  long h[3];
+  for (int k = 0; k < 3; k++) {
+    h[k] = heap_used();
+    if (k == 2) {
+      break;
+    }
+    for (int i = 0; i < 100; i++) {
+      if (once() != 3 << 8) {
+        printf("exec-thread: FAIL run %d\n", k * 100 + i);
+        return 1;
+      }
     }
   }
-  long h1 = heap_used();
-  if (h0 >= 0 && h1 - h0 > 32 * 1024) {
-    printf("exec-thread: FAIL the kernel heap grew %ld bytes in 100 runs (a leak)\n", h1 - h0);
+  if (h[0] >= 0 && h[1] - h[0] > 32 * 1024 && h[2] - h[1] > 32 * 1024) {
+    printf("exec-thread: FAIL the kernel heap grew %ld and %ld bytes in 100 runs (a leak)\n", h[1] - h[0], h[2] - h[1]);
     return 1;
   }
   puts("exec-thread: ok");

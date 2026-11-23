@@ -341,6 +341,18 @@ fn dirty_base(bsize: usize) -> usize {
     CACHE_BLOCKS.min(crate::memlayout::ram_size() / 8 / bsize).max(64)
 }
 
+/// 書いていない中身 (data) をためてよい数 (ブロック)。こえたら書き出しのスレッドを起こし、2 倍で書く人を待たせる。
+/// 使えるメモリ (空きのページと、覚えているブロック: Linux の global_dirtyable_memory) の 1/10 (Linux の
+/// dirty_background_ratio。2 倍は dirty_ratio の 20%)。少なくとも dirty_base の 1/4 (前はいつもこれ: 16 MiB で、4 つの
+/// プロセスが大きく書くと書き出しとディスクを待ってほとんど伸びなかった)。すぐに切りつめたり消したりするもの (一時の
+/// ファイル) はディスクに行かずにすむ (切りつめと消すのは、書いていない中身の印を捨てる: forget_blocks)。5 秒たてば
+/// いつも書き出す (maybe_flush、dirty_level) のは同じ
+// [lockless]
+fn data_limit(bsize: usize, cached: usize) -> usize {
+    let avail = crate::kalloc::nfree() * crate::memlayout::PGSIZE / bsize + cached;
+    (avail / 10).max(dirty_base(bsize) / 4).max(512)
+}
+
 /// 覚えておくブロックの数の上限: RAM の半分まで (Linux のページキャッシュのように、空いたメモリを使う。前は 64 MiB までで、
 /// tar で展開したばかりの木 (zig の 2 万のファイル) を cp -r すると、中身をみなディスクから読みなおしていた)。メモリが
 /// 足りなくなれば vm::reclaim の shrinker が捨てる
@@ -438,8 +450,8 @@ struct Resv {
 
 const RESV_SLOTS: usize = 64;
 const RESV_BLOCKS: u32 = 64;
-/// 先取りのいちばん大きいもの (8 MiB: 1 MiB の write の 8 回分)
-const RESV_MAX: u32 = 2048;
+/// 先取りのいちばん大きいもの (32 MiB: 1 MiB の write の 32 回分)
+const RESV_MAX: u32 = 8192;
 /// ディレクトリブロックの末尾にある、チェックサム用の偽のエントリ
 const DIR_TAIL: usize = 12;
 const DIR_TAIL_FT: u8 = 0xde;
@@ -2813,17 +2825,16 @@ impl ExtFs {
     /// システムコールの終わりで待たせる (vfs::balance_dirty。Linux の balance_dirty_pages)。ここで書くのは、スレッドが
     /// まだいない (起動のとちゅう) ときと、それでも 3 倍までたまったとき (ジャーナルに入りきらないほどためない)。
     /// ほかは sync、暇なとき (vfs::idle_sync)、再起動のときにまとめて 1 つのトランザクションで
-    /// メタデータ (ジャーナルを通す) と中身 (直接書く) は別に数える。中身は dirty_base の 1/4 までためる
+    /// メタデータ (ジャーナルを通す) と中身 (直接書く) は別に数える。中身は data_limit までためる
     fn maybe_flush(&self) -> Result<(), i64> {
         self.take_fast_writes();
         let limit = match self.journal.borrow().as_ref() {
             Some(j) => (j.capacity() / 4).min(512),
             None => 512,
         };
-        let data_limit = (dirty_base(self.bsize) / 4).max(512);
-        let (meta, data) = {
+        let (meta, data, data_limit) = {
             let c = self.cache.borrow();
-            (c.dirty.len(), c.data.len())
+            (c.dirty.len(), c.data.len(), data_limit(self.bsize, c.map.len()))
         };
         if meta >= limit || data >= data_limit || crate::timer::coarse_ticks() >= self.last_flush.get() + 5 * crate::timer::HZ {
             if meta < 3 * limit && data < 3 * data_limit && crate::vfs::kick_flusher() {
@@ -2877,7 +2888,8 @@ impl ExtFs {
 
     /// 切りつめでためた、放したブロックのキャッシュの片づけ (forget_later)。いっしょに持っているときは BOOK を 64 ブロック
     /// ずつ取りなおす (ロックなしの書きたしは 1 回ごとに BOOK を取る: 長く持つと止まる)。flush のはじめにも (放した
-    /// ブロックはコミットのあとにまた取れる: その前に片づける)
+    /// ブロックはコミットのあとにまた取れる: その前に片づける)。切りつめからは大きなロックを放して (smp::unlocked: 中は
+    /// ロックなしの道のものだけ。prof::span も atomic と CPU ごとのもの)
     fn drain_forgets(&self) {
         const CHUNK: u64 = 64;
         loop {
@@ -4531,12 +4543,12 @@ impl ExtFs {
     /// 書いた人を待たせるところの手前)
     // [lockless]
     fn dirty_level(&self) -> u8 {
-        let data_limit = (dirty_base(self.bsize) / 4).max(512);
         let level = |j: &Option<jbd2::Journal>, c: &Cache| {
             let limit = match j.as_ref() {
                 Some(j) => (j.capacity() / 4).min(512),
                 None => 512,
             };
+            let data_limit = data_limit(self.bsize, c.map.len());
             // いくつもの CPU がいっしょに書くので、のこりに 1 つ 16 ずつ
             let (meta, data) = (c.dirty.len() + 16 * crate::smp::MAXCPU, c.data.len());
             if meta >= 2 * limit || data >= 2 * data_limit {
@@ -4678,8 +4690,8 @@ impl ExtFs {
                     // 先取りは書く大きさの 8 回分 (RESV_BLOCKS から RESV_MAX まで: Linux の mballoc がファイルの大きさで
                     // 先取りを大きくするのと同じ。決まった大きさだと、それより大きい write は先取りが goal をふさいで
                     // ふつうの道に落ちた)
-                    let want_extra = (k * 8).clamp(RESV_BLOCKS, RESV_MAX);
-                    let extra = if first { 0 } else { self.free_after(g, gbit + k, want_extra.min(self.gd_cnt(g, 0xc, 0x2c).saturating_sub(k))) };
+                    let want_extra = (k * 32).clamp(RESV_BLOCKS, RESV_MAX);
+                    let extra = if first && k < RESV_BLOCKS { 0 } else { self.free_after(g, gbit + k, want_extra.min(self.gd_cnt(g, 0xc, 0x2c).saturating_sub(k))) };
                     let b = self.take_bits(g, gbit, k + extra);
                     if let Ok(b) = b {
                         let old = slot.get();
@@ -6260,16 +6272,19 @@ impl Inode for ExtInode {
     fn truncate(&self, len: usize) -> Result<(), i64> {
         // ページキャッシュ (vm.rs) のこのファイルのページは、ext4 のロックを取る前にいちど捨てておく (8 MiB で 2048 枚を表から
         // 抜くのに 0.9 ms: ロックの中でしていたとき、切りつめのあいだの 8 割)。ロックの中の file_changed はそのまま (書きこみの
-        // 許しを取り消し、ロックなしで写しているものを待ち、そのあいだに入ったものだけを捨てる)
-        crate::vm::file_changed(self.id());
+        // 許しを取り消し、ロックなしで写しているものを待ち、そのあいだに入ったものだけを捨てる)。大きなロックも放して
+        // (ロックなしの道のもの: 32 MiB の切りつめで 3〜4 ms。4 つのプロセスが大きく書いて切りつめると、大きなロックに並んだ)
+        let id = self.id();
+        crate::smp::unlocked(|| crate::vm::file_changed(id));
         let (r, pages) = self.truncate_locked(len);
-        // 外したブロックのキャッシュのページは、ext4 のロックを放してから返す
-        pages.into_iter().for_each(kalloc::put);
-        // 外したブロックのキャッシュの片づけも、ロックをいっしょに持って (ロックなしの書きたしを止めない)
-        {
+        // 外したブロックのキャッシュのページを返すのと、そのキャッシュの片づけは、ext4 のロックをいっしょに持って (ロックなしの
+        // 書きたしを止めない)、大きなロックも放して
+        let fs = &*self.fs;
+        crate::smp::unlocked(|| {
+            pages.into_iter().for_each(kalloc::put);
             let _e = fs_lock_shared();
-            self.fs.drain_forgets();
-        }
+            fs.drain_forgets();
+        });
         r
     }
 

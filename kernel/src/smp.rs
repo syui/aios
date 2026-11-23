@@ -758,6 +758,19 @@ pub fn holding() -> bool {
     BKL.load(Ordering::Relaxed) == id() + 1
 }
 
+/// 持っていれば大きなロックを放して f をし、取りなおす (gpu::unlocked と同じ)。f は大きなロックのものにさわらない
+/// (ロックなしの道の印のあるものと、自分だけのもの。Rc の数も変えない)。システムコールの中は割り込みが止まっているので、途中で
+/// 放しても横取りされない。取りなおすときに、いまのプロセスの表と fd の表をまた置く (lock の own_user_pt / own_user_files)
+pub fn unlocked<R>(f: impl FnOnce() -> R) -> R {
+    if !holding() {
+        return f();
+    }
+    unlock();
+    let r = f();
+    lock();
+    r
+}
+
 // ---- 2 つめからの CPU ----
 
 core::arch::global_asm!(
