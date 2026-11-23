@@ -915,8 +915,20 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   みな。/proc/sys/kernel の perf_event_paranoid (2)、perf_event_max_sample_rate、perf_event_mlock_kb (516)、
   perf_event_max_stack、perf_cpu_time_max_percent、perf_event_max_contexts_per_stack と、/sys/bus/event_source
   (devices の breakpoint と software は /sys/devices/NAME へのリンク: type、perf_event_mux_interval_ms、subsystem、
-  uevent)。まだないもの (todo.json の syscall-gaps): PMU のハードウェアの数、ブレークポイントの数 (EOPNOTSUPP)、
-  サンプリング (mmap の輪、オーバーフローのシグナル)、CPU ごとのもの (root でも EOPNOTSUPP)
+  uevent)。まだないもの (todo.json の syscall-gaps): PMU のハードウェアの数、サンプリング (mmap の輪、オーバーフローの
+  シグナル)、CPU ごとのもの (root でも EOPNOTSUPP)
+- perf の PERF_TYPE_BREAKPOINT (test/perf2.c、Linux 7.4-rc3 と 7 行同じ): ハードウェアのブレークポイントと
+  ウォッチポイントで数える。数えるスレッドの hwdebug.rs の State に perf のもの (イベントの id、種類、CPU の値、
+  当たった数) を置き、切りかえで ptrace のものといっしょに前から詰めて CPU に載せる。当たったら数えて 1 命令越える
+  (Linux のふつうのオーバーフローの手当て: ブレークポイントかウォッチポイントをみな止め (E を落とし)、1 命令ずつで
+  すすめ、1 命令すすんだら戻す: bps_disabled、wps_disabled、try_step_suspended_breakpoints。ptrace の 1 命令ずつの
+  さいちゅうなら suspended_step で、すすんだら ptrace にも知らせる)。ウォッチポイントは読み書きの種類が合って
+  見張るバイトにかかるもの (なければいちばん近いもの)。止めているあいだは CPU に置かない (動いているかは、有効で
+  グループのリーダーも有効か)。自分のものを変えたら戻る前に CPU に。スロットは Linux の reserve_bp_slot と同じく
+  スレッドごとに ptrace と perf を合わせて数え (止めたものも)、こえると ENOSPC。bp_type の EMPTY と INVALID と
+  まぜたもの、bp_len の 0 と 9 から、ずらして 8 バイトをはみ出すもの、カーネルの番地は EINVAL (番地と長さの検査は
+  hwdebug::parse に移し、ptrace と perf でいっしょに)。inherit なら fork した子にも置く。exec で消えるのは ptrace の
+  ものだけ (perf のものは残る)
 - atime (test/atime.c、root で ext4 と tmpfs とマウントの印で Linux と 5 行同じ): 前は持たなかった (stat の atime は mtime、
   utimensat の atime は捨てていた)。いまは ext4 は inode の i_atime (秒)、tmpfs は自分の属性に持ち、stat と statx に出す。
   utimensat は atime も決め、ctime をいまに (Linux の notify_change。前は ctime を変えなかった)。読んだら (read、pread、

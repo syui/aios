@@ -60,8 +60,6 @@ const HW_R: u8 = 1;
 const HW_W: u8 = 2;
 const HW_RW: u8 = 3;
 const HW_X: u8 = 4;
-/// ユーザーの番地の上 (Linux の TASK_SIZE: VA_BITS 48)
-const TASK_SIZE: u64 = 1 << 48;
 /// AUDIT_ARCH_AARCH64 (PTRACE_GET_SYSCALL_INFO の arch)
 const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
 
@@ -393,43 +391,19 @@ fn iov_len_set(iov: usize, len: usize) -> R {
 // ---- ハードウェアのブレークポイントとウォッチポイント (Linux の arch/arm64/kernel/ptrace.c の ptrace_hbp_* と
 // hw_break_get / hw_break_set、hw_breakpoint.c の hw_breakpoint_arch_parse)。CPU に載せるのと例外は hwdebug.rs ----
 
-/// attr から CPU の値に (hw_breakpoint_arch_parse): 実行は 4 バイトだけ (ほかの長さは 4 に)、番地は実行 4 バイト・
-/// 読み書き 8 バイトにそろえて長さ (BAS) をずらす。ずらして 8 ビットをはみ出す (見張るバイトが落ちる) か、カーネルの
-/// 番地 (ptrace のものは EL0 だけ) なら EINVAL
+/// attr から CPU の値に (hwdebug.rs の parse: Linux の hw_breakpoint_arch_parse)
 fn hw_parse(a: &Attr) -> Result<(u64, Ctrl), i64> {
-    let ty = match a.ty {
-        HW_X => 0,
-        HW_R => 1,
-        HW_W => 2,
-        HW_RW => 3,
-        _ => return Err(-EINVAL),
-    };
-    let mut len: u8 = match a.len {
-        1..=8 => ((1u16 << a.len) - 1) as u8,
-        _ => return Err(-EINVAL),
-    };
-    if ty == 0 {
-        len = 0xf;
-    }
-    let bytes = len.count_ones() as u64;
-    if a.addr >= TASK_SIZE && a.addr.wrapping_add(bytes).wrapping_sub(1) >= TASK_SIZE {
-        return Err(-EINVAL);
-    }
-    let mask = if ty == 0 { 3 } else { 7 };
-    let off = a.addr & mask;
-    if (len as u32) << off > 0xff {
-        return Err(-EINVAL);
-    }
-    Ok((a.addr & !mask, Ctrl { len: len << off, ty, privilege: 2, enabled: !a.disabled }))
+    hwdebug::parse(a)
 }
 
 /// ptrace のスロット idx (なければ作る: Linux の ptrace_hbp_create。はじめは番地 0、4 バイト、実行か読み書き、無効)。
 /// 無効なものも数えて、CPU のスロットの数をこえて作ろうとすると ENOSPC (perf の reserve_bp_slot)
 fn hw_event(t: &mut Proc, watch: bool, idx: usize) -> Result<&mut Ev, i64> {
     let st = t.hwdbg.get_or_insert_with(Default::default);
+    let used = st.used(watch);
     let arr = if watch { &mut st.wch } else { &mut st.brk };
     if arr[idx].is_none() {
-        if arr.iter().flatten().count() >= hwdebug::slots(watch) {
+        if used >= hwdebug::slots(watch) {
             return Err(-ENOSPC);
         }
         let attr = Attr { addr: 0, len: 4, ty: if watch { HW_RW } else { HW_X }, disabled: true };

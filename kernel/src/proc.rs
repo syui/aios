@@ -2292,7 +2292,7 @@ pub fn exit(code: i32) -> ! {
 /// perf (perf.rs: なくてもよい部分) に知らせること: fork した子 (inherit で数える相手に)、スレッドの終わり (数を
 /// まとめる)、exec (enable_on_exec)、prctl の PR_TASK_PERF_EVENTS_DISABLE / ENABLE
 pub trait PerfHooks: Sync {
-    fn fork(&self, parent: &Proc, child: &Proc, thread: bool);
+    fn fork(&self, parent: &Proc, child: &mut Proc, thread: bool);
     fn exit(&self, p: &Proc);
     fn exec(&self, p: &Proc);
     fn task_enable(&self, on: bool) -> i64;
@@ -2795,8 +2795,9 @@ fn finish_exec(p: &mut Proc, img: Image, comm: &str) {
     crate::futex::exit_robust_list();
     let old = p.mm.take();
     p.load_image(img);
-    // ハードウェアのブレークポイントとウォッチポイントは消える (Linux の flush_thread の flush_ptrace_hw_breakpoint)
-    p.hwdbg = None;
+    // ptrace のハードウェアのブレークポイントとウォッチポイントは消える (Linux の flush_thread の
+    // flush_ptrace_hw_breakpoint。perf のものは残る)
+    crate::hwdebug::flush_ptrace(p);
     // perf の enable_on_exec (Linux の perf_event_exec)
     if let Some(h) = perf() {
         h.exec(p);

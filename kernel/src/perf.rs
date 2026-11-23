@@ -7,10 +7,13 @@
 // 数はイベントごとに数えず、スレッドの数 (proc.rs の cpu_ns、pgfault、min_flt、maj_flt、nvcsw + nivcsw、
 // nr_migrations) を読んだときの差で出す: 動いている (on で、グループならリーダーも on) あいだの差を足し、変わるたびに
 // 写しなおす (sync)。時間 (time_enabled、time_running) は Linux のタスクの文脈と同じく、そのスレッドが走った時間。
-// まだないもの (todo.json の syscall-gaps): PMU (ハードウェアの数: ENOENT)、ブレークポイントの数 (EOPNOTSUPP)、
-// サンプリング (mmap の輪、シグナル)、CPU ごとのもの (cpu >= 0: EOPNOTSUPP。root でないなら Linux と同じ EACCES)
+// PERF_TYPE_BREAKPOINT (ブレークポイントとウォッチポイントで数える) は、数えるスレッドの hwdebug.rs の State に置き、
+// 当たった数をそこから読む (当たったら hwdebug.rs が数えて 1 命令越える)。
+// まだないもの (todo.json の syscall-gaps): PMU (ハードウェアの数: ENOENT)、サンプリング (mmap の輪、シグナル)、
+// CPU ごとのもの (cpu >= 0: EOPNOTSUPP。root でないなら Linux と同じ EACCES)
 use crate::cell::Bkl;
 use crate::file::{self, Kind};
+use crate::hwdebug;
 use crate::proc::{self, Proc};
 use alloc::rc::{Rc, Weak};
 use alloc::vec::Vec;
@@ -175,7 +178,10 @@ struct St {
 
 pub struct Event {
     id: u64,
+    ty: u32,
     config: u64,
+    /// ブレークポイントなら (ウォッチポイントか、bp_type、CPU の番地、ctrl)
+    bp: Option<(bool, u8, u64, hwdebug::Ctrl)>,
     read_format: u64,
     bits: u64,
     sampling: bool,
@@ -211,12 +217,16 @@ impl Event {
         self.st.borrow().on && self.leader().map_or(true, |l| l.st.borrow().on)
     }
 
-    /// スレッドの今の数 (exclude_user と exclude_kernel: フォルトはユーザーで、切りかえと移りはカーネルで起きる)
-    fn source(&self, t: &Proc) -> u64 {
+    /// スレッドの今の数 (exclude_user と exclude_kernel: フォルトはユーザーで、切りかえと移りはカーネルで起きる)。
+    /// 時計のものは、いっしょに読んだ走った時間 now (time_enabled と同じ時刻にするため)
+    fn source(&self, t: &Proc, now: u64) -> u64 {
         let user = !self.bit(B_EXCLUDE_USER);
         let kernel = !self.bit(B_EXCLUDE_KERNEL);
+        if self.ty == TYPE_BREAKPOINT {
+            return t.hwdbg.as_ref().and_then(|s| s.perf.iter().find(|b| b.id == self.id)).map_or(0, |b| b.count);
+        }
         match self.config {
-            SW_CPU_CLOCK | SW_TASK_CLOCK => proc::cpu_ns(t),
+            SW_CPU_CLOCK | SW_TASK_CLOCK => now,
             SW_PAGE_FAULTS if user => t.pgfault,
             SW_PAGE_FAULTS_MIN if user => t.min_flt,
             SW_PAGE_FAULTS_MAJ if user => t.maj_flt,
@@ -233,7 +243,8 @@ impl Event {
         let (mut c, mut e, mut r) = (st.cnt, st.en, st.run);
         for k in &st.tasks {
             let Some(t) = proc::find_thread(k.tid) else { continue };
-            let (dc, dt) = (self.source(t).wrapping_sub(k.c), proc::cpu_ns(t).wrapping_sub(k.t));
+            let now = proc::cpu_ns(t);
+            let (dc, dt) = (self.source(t, now).wrapping_sub(k.c), now.wrapping_sub(k.t));
             if act {
                 c = c.wrapping_add(dc);
                 r += dt;
@@ -252,7 +263,8 @@ impl Event {
         (st.cnt, st.en, st.run) = (c, e, r);
         for k in st.tasks.iter_mut() {
             if let Some(t) = proc::find_thread(k.tid) {
-                (k.c, k.t) = (self.source(t), proc::cpu_ns(t));
+                let now = proc::cpu_ns(t);
+                (k.c, k.t) = (self.source(t, now), now);
             }
         }
     }
@@ -268,6 +280,47 @@ impl Event {
         }
         self.sync();
         self.st.borrow_mut().on = on;
+        self.apply_hw();
+        for m in &members {
+            m.apply_hw();
+        }
+    }
+
+    /// ブレークポイントなら、数えているスレッドの CPU の値を動いているかに合わせる (自分なら、戻る前に CPU にも)
+    fn apply_hw(&self) {
+        if self.bp.is_none() {
+            return;
+        }
+        let on = self.active() && !self.bit(B_EXCLUDE_USER);
+        let tids: Vec<u32> = self.st.borrow().tasks.iter().map(|k| k.tid).collect();
+        for tid in tids {
+            let Some(t) = proc::find_thread(tid) else { continue };
+            if let Some(b) = t.hwdbg.as_mut().and_then(|s| s.perf.iter_mut().find(|b| b.id == self.id)) {
+                b.ctrl.enabled = on;
+            }
+            reload(t);
+        }
+    }
+
+    /// ブレークポイントを、スレッド t の State に (はじめは止めて。スロットがなければ ENOSPC)
+    fn install(&self, t: &mut Proc) -> Result<(), i64> {
+        let Some((watch, ty, addr, ctrl)) = self.bp else { return Ok(()) };
+        let st = t.hwdbg.get_or_insert_with(Default::default);
+        if st.used(watch) >= hwdebug::slots(watch) {
+            return Err(-ENOSPC);
+        }
+        st.perf.push(hwdebug::PerfBp { id: self.id, watch, ty, addr, ctrl: hwdebug::Ctrl { enabled: false, ..ctrl }, count: 0 });
+        Ok(())
+    }
+
+    /// スレッド t の State から外す
+    fn uninstall(&self, t: &mut Proc) {
+        if self.bp.is_some() {
+            if let Some(st) = t.hwdbg.as_mut() {
+                st.perf.retain(|b| b.id != self.id);
+            }
+            reload(t);
+        }
     }
 
     fn reset(&self) {
@@ -290,6 +343,16 @@ impl Event {
     fn untrack(&self, tid: u32) {
         self.sync();
         self.st.borrow_mut().tasks.retain(|k| k.tid != tid);
+        if let Some(t) = proc::find_thread(tid) {
+            self.uninstall(t);
+        }
+    }
+}
+
+/// いまのスレッドのものを変えたら、戻る前に CPU に (ほかのスレッドは、次に走るときに)
+fn reload(t: &Proc) {
+    if t.pid == proc::current().pid {
+        hwdebug::switch_in(t);
     }
 }
 
@@ -466,6 +529,12 @@ impl file::FileOps for PerfFile {
         if let Some(l) = ev.leader() {
             l.siblings.borrow_mut().retain(|w| w.upgrade().is_some_and(|m| !Rc::ptr_eq(&m, ev)));
         }
+        let tids: Vec<u32> = ev.st.borrow().tasks.iter().map(|k| k.tid).collect();
+        for tid in tids {
+            if let Some(t) = proc::find_thread(tid) {
+                ev.uninstall(t);
+            }
+        }
         let p = Rc::as_ptr(ev);
         EVENTS.get().retain(|w| w.strong_count() > 0 && w.as_ptr() != p);
     }
@@ -624,12 +693,30 @@ fn open(uattr: usize, pid: i32, cpu: i32, group_fd: i32, flags: u64) -> R {
     if b(B_INHERIT) && sample_type & SAMPLE_READ != 0 && sample_type & SAMPLE_TID == 0 {
         return Err(-EINVAL);
     }
-    // 種類 (perf_init_event): ソフトウェアだけ。PMU (ハードウェア、キャッシュ、RAW) もトレースポイントもない
+    // 種類 (perf_init_event): ソフトウェアとブレークポイント。PMU (ハードウェア、キャッシュ、RAW) もトレースポイントもない
+    let mut bp = None;
     match ty {
         TYPE_SOFTWARE if config >= SW_MAX => return Err(-ENOENT),
-        TYPE_SOFTWARE if sample_type & SAMPLE_BRANCH_STACK != 0 => return Err(-EOPNOTSUPP),
+        TYPE_SOFTWARE | TYPE_BREAKPOINT if sample_type & SAMPLE_BRANCH_STACK != 0 => return Err(-EOPNOTSUPP),
         TYPE_SOFTWARE => {}
-        TYPE_BREAKPOINT => return Err(-EOPNOTSUPP),
+        // Linux の hw_breakpoint_event_init: スロットをとって (EMPTY と INVALID は EINVAL、スレッドの ptrace と perf の
+        // ものを合わせてスロットの数をこえると ENOSPC)、番地と長さを hwdebug::parse で
+        TYPE_BREAKPOINT => {
+            let bty = u32::from_le_bytes(a[52..56].try_into().unwrap());
+            let (baddr, blen) = (le64(&a, 56), le64(&a, 64));
+            if bty == 0 || bty >= 7 {
+                return Err(-EINVAL);
+            }
+            let watch = bty & 3 != 0;
+            if let Some(t) = &task
+                && t.hwdbg.as_ref().map_or(0, |s| s.used(watch)) >= hwdebug::slots(watch)
+            {
+                return Err(-ENOSPC);
+            }
+            let len = if blen > 8 { 0 } else { blen as u8 };
+            let (addr, ctrl) = hwdebug::parse(&hwdebug::Attr { addr: baddr, len, ty: bty as u8, disabled: false })?;
+            bp = Some((watch, bty as u8, addr, ctrl));
+        }
         _ => return Err(-ENOENT),
     }
     // cgroup の perf (CGROUP_PERF) はない: Linux の perf_cgroup_connect のないものと同じ
@@ -664,7 +751,9 @@ fn open(uattr: usize, pid: i32, cpu: i32, group_fd: i32, flags: u64) -> R {
     }
     let ev = Rc::new(Event {
         id: NEXT_ID.fetch_add(1, Relaxed),
+        ty,
         config,
+        bp,
         read_format,
         bits,
         sampling: period != 0,
@@ -675,11 +764,14 @@ fn open(uattr: usize, pid: i32, cpu: i32, group_fd: i32, flags: u64) -> R {
         leader: RefCell::new(leader.as_ref().map(Rc::downgrade)),
         siblings: RefCell::new(Vec::new()),
     });
-    let (c, t) = (ev.source(task), proc::cpu_ns(task));
+    ev.install(task)?;
+    let t = proc::cpu_ns(task);
+    let c = ev.source(task, t);
     ev.st.borrow_mut().tasks.push(Task { tid: task.pid, c, t });
     if !b(B_DISABLED) {
         ev.st.borrow_mut().on = true;
     }
+    ev.apply_hw();
     let fl = file::O_RDWR;
     let fd = proc::current().files().add(file::new(Kind::Ops(Rc::new(PerfFile(ev.clone()))), fl), flags & FLAG_FD_CLOEXEC != 0, 0).ok_or(-EMFILE)?;
     if let Some(l) = &leader {
@@ -705,10 +797,20 @@ pub static HOOKS: Hooks = Hooks;
 
 impl proc::PerfHooks for Hooks {
     /// inherit: 親を数えているものは、子も (inherit_thread ならスレッドだけ。Linux の inherit_task_group)
-    fn fork(&self, parent: &Proc, child: &Proc, thread: bool) {
+    fn fork(&self, parent: &Proc, child: &mut Proc, thread: bool) {
         for ev in live() {
             if ev.bit(B_INHERIT) && (thread || !ev.bit(B_INHERIT_THREAD)) && ev.tracks(parent.pid) {
-                let (c, t) = (ev.source(child), proc::cpu_ns(child));
+                // ブレークポイントは子にも置く (スロットがなければ数えない)
+                if ev.install(child).is_err() {
+                    continue;
+                }
+                // 子はまだ find_thread で見えないので、ここで有効に
+                let on = ev.active() && !ev.bit(B_EXCLUDE_USER);
+                if let Some(b) = child.hwdbg.as_mut().and_then(|s| s.perf.iter_mut().find(|b| b.id == ev.id)) {
+                    b.ctrl.enabled = on;
+                }
+                let t = proc::cpu_ns(child);
+                let c = ev.source(child, t);
                 ev.st.borrow_mut().tasks.push(Task { tid: child.pid, c, t });
             }
         }
