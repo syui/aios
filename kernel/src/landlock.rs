@@ -44,8 +44,9 @@ const EAFNOSUPPORT: i64 = 97;
 /// 答える ABI の版 (12: Linux 7.4 の namespace と capability の permission まで)
 pub const ABI: i64 = 12;
 /// 直したもの (LANDLOCK_CREATE_RULESET_ERRATA): 1 TCP は IPPROTO_TCP だけ、2 scope のシグナルは同じスレッドグループを
-/// 許す、3 つながっていないディレクトリ、4 whiteout は MAKE_REG
-pub const ERRATA: i64 = 0b1111;
+/// 許す、3 つながっていないディレクトリ、4 whiteout は MAKE_REG、5 REFER を止めるのはファイルシステムの権利をあつかう
+/// 層だけ (7.4-rc4: ネットワークだけの層を重ねても、ほかの層が許した rename や link を止めない)
+pub const ERRATA: i64 = 0b11111;
 
 pub const EXECUTE: u64 = 1 << 0;
 pub const WRITE_FILE: u64 = 1 << 1;
@@ -549,7 +550,13 @@ pub fn restrict_self(fd: u64, flags: u64) -> R {
         if layers.len() >= 16 {
             return Err(-E2BIG); // Linux と同じく 16 層まで
         }
-        layers.push(Rc::new(r.borrow().clone()));
+        // ファイルシステムの権利をあつかう層は、REFER をあつかわなくても止める (ABI 2 から: Linux の
+        // landlock_upgrade_handled_layer_config の _LANDLOCK_ACCESS_FS_INITIALLY_DENIED)。あつかわない層は止めない (erratum 5)
+        let mut layer = r.borrow().clone();
+        if layer.fs != 0 {
+            layer.fs |= REFER;
+        }
+        layers.push(Rc::new(layer));
         Some(Rc::new(layers) as Domain)
     };
     // TSYNC: ほかのスレッドにも同じ層 (と、呼んだスレッドが no_new_privs なら no_new_privs も: Linux の tsync)

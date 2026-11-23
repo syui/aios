@@ -4,7 +4,8 @@
 //         PATH_BENEATH、NET_PORT の UDP、NAMESPACE、CAPABILITY)、restrict_self (LOG_*、TSYNC、NO_NEW_PRIVS、fd -1)
 //   止めかた: UDP の bind / connect / sendto (と autobind)、RESOLVE_UNIX (名前のある unix ソケット)、IOCTL_DEV と
 //         TRUNCATE (開いたときの許し)、scope (抽象 unix ソケット、シグナル)、namespace と capability の permission、
-//         TSYNC (ほかのスレッドにも)
+//         TSYNC (ほかのスレッドにも)、REFER (ディレクトリをまたぐ rename と link: ファイルシステムの権利をあつかう層は、
+//         REFER をあつかわなくても止める。あつかわない層は止めない: 7.4-rc4 の erratum 5)
 //   aios の中で: ./landlockabi      gcc -O2 -static -pthread -o landlockabi test/landlockabi.c
 #define _GNU_SOURCE
 #include <errno.h>
@@ -51,6 +52,9 @@ struct ns_attr {
 #define FS_WRITE (1ULL << 1)
 #define FS_READ (1ULL << 2)
 #define FS_READ_DIR (1ULL << 3)
+#define FS_REMOVE_FILE (1ULL << 5)
+#define FS_MAKE_REG (1ULL << 8)
+#define FS_REFER (1ULL << 13)
 #define FS_TRUNCATE (1ULL << 14)
 #define FS_IOCTL_DEV (1ULL << 15)
 #define FS_RESOLVE_UNIX (1ULL << 16)
@@ -78,6 +82,7 @@ static const char *err(int e) {
     case ENOTTY: return "ENOTTY";
     case ECONNREFUSED: return "ECONNREFUSED";
     case ENOENT: return "ENOENT";
+    case EXDEV: return "EXDEV";
     default: return strerror(e);
     }
 }
@@ -143,6 +148,54 @@ static void enforce(int rs) {
     long r = restrict_(rs, 0);
     if (r < 0)
         printf("restrict_self: %s\n", err(errno));
+    close(rs);
+}
+
+// ---- REFER ----
+
+// base/A/rN (N は子の pid) を作り、ruleset の層をかけたあと B へつなぎ、移す (と、A の中の名前を変える)
+static void refer_try(const char *what, int rs1, int rs2, int same) {
+    char a[300], b[300];
+    int n = getpid();
+    snprintf(a, sizeof a, "%s/A/r%d", base, n);
+    close(open(a, O_CREAT | O_RDWR, 0644));
+    enforce(rs1);
+    if (rs2 >= 0)
+        enforce(rs2);
+    char name[96];
+    snprintf(b, sizeof b, "%s/B/r%d", base, n);
+    snprintf(name, sizeof name, "%s: link to another dir", what);
+    res(name, link(a, b));
+    unlink(b);
+    snprintf(name, sizeof name, "%s: rename to another dir", what);
+    res(name, rename(a, b));
+    if (same) {
+        snprintf(b, sizeof b, "%s/A/s%d", base, n);
+        snprintf(name, sizeof name, "%s: rename in the same dir", what);
+        res(name, rename(a, b));
+    }
+}
+
+static void t_refer_fs(void) { refer_try("REFER, fs READ only", ruleset(FS_READ, 0, 0, 0), -1, 1); }
+static void t_refer_net(void) { refer_try("REFER, net only", ruleset(0, NET_BIND_TCP, 0, 0), -1, 0); }
+static void t_refer_scope(void) { refer_try("REFER, scope only", ruleset(0, 0, SCOPE_SIGNAL, 0), -1, 0); }
+static void t_refer_perm(void) { refer_try("REFER, permissions only", ruleset(0, 0, 0, PERM_NS), -1, 0); }
+
+static int refer_rules(uint64_t handled, uint64_t allowed) {
+    int rs = ruleset(handled, 0, 0, 0);
+    path_rule(rs, base, allowed);
+    return rs;
+}
+
+#define MOVE (FS_MAKE_REG | FS_REMOVE_FILE)
+static void t_refer_granted(void) { refer_try("REFER, granted on base", refer_rules(MOVE | FS_REFER, MOVE | FS_REFER), -1, 0); }
+static void t_refer_not_granted(void) { refer_try("REFER, handled, not granted", refer_rules(MOVE | FS_REFER, MOVE), -1, 0); }
+static void t_refer_implicit(void) { refer_try("REFER, not handled, MAKE_REG granted", refer_rules(MOVE, MOVE), -1, 0); }
+static void t_refer_layered(void) { refer_try("REFER, granted, then a net-only layer", refer_rules(MOVE | FS_REFER, MOVE | FS_REFER), ruleset(0, NET_BIND_TCP, 0, 0), 0); }
+static void t_refer_layered2(void) { refer_try("REFER, a net-only layer, then granted", ruleset(0, NET_BIND_TCP, 0, 0), refer_rules(MOVE | FS_REFER, MOVE | FS_REFER), 0); }
+static void t_refer_rule(void) {
+    int rs = ruleset(FS_READ, 0, 0, 0);
+    res("REFER: a rule with REFER, not handled", path_rule(rs, base, FS_REFER));
     close(rs);
 }
 
@@ -671,6 +724,16 @@ int main(void) {
     child(t_cap_netraw);
     child(t_tsync);
     child(t_notsync);
+    child(t_refer_fs);
+    child(t_refer_net);
+    child(t_refer_scope);
+    child(t_refer_perm);
+    child(t_refer_granted);
+    child(t_refer_not_granted);
+    child(t_refer_implicit);
+    child(t_refer_layered);
+    child(t_refer_layered2);
+    child(t_refer_rule);
     for (int i = 0; i < ns_; i++)
         close(servers[i]);
     return 0;
