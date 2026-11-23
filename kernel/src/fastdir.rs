@@ -107,11 +107,12 @@ fn usable_any(me: &Proc) -> Option<&'static dyn FastFs> {
     root_fs()
 }
 
-/// 作る・消すのできごとを待つ見張りも、読むだけのマウントもない (ext4 のロックの中でもう一度見る: inotify::add_watch と
-/// vfs::mount_ro は、印を立ててから ext4 のロックを取って、いま書きかえているものが終わるのを待つ)
+/// 作る・消すのできごとを待つ見張りも、読むだけのマウントも、こわすかもしれないリースや delegation もない
+/// (ext4 のロックの中でもう一度見る: inotify::add_watch と vfs::mount_ro は、印を立ててから ext4 のロックを取って、
+/// いま書きかえているものが終わるのを待つ)
 // [lockless]
 fn watch_free() -> bool {
-    crate::vfs::notify::NAME_WATCHED.load(Relaxed) == 0 && file::OPEN_WATCHED.load(Relaxed) == 0 && !crate::vfs::RO_MOUNTED.load(Relaxed)
+    crate::vfs::notify::NAME_WATCHED.load(Relaxed) == 0 && file::OPEN_WATCHED.load(Relaxed) == 0 && !crate::vfs::RO_MOUNTED.load(Relaxed) && file::LEASES.load(Relaxed) == 0
 }
 
 /// ユーザーのパスを buf に写して、(親のディレクトリの部分の長さ, 最後の名前) に分ける (/name の親は /、name の親は

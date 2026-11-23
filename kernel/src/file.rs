@@ -110,6 +110,11 @@ pub trait FileLocks: Sync {
     fn break_lease(&self, _key: (usize, u64), _write: bool, _nonblock: bool) -> Result<(), i64> {
         Ok(())
     }
+    /// 名前や属性を変える前に、その inode (ディレクトリなら中を変える) の delegation (F_SETDELEG のもの) をこわし、
+    /// 外すまで待つ (Linux の try_break_deleg と break_deleg_wait。LEASES が 0 でないときだけ呼ぶ)
+    fn break_deleg(&self, _key: (usize, u64)) -> Result<(), i64> {
+        Ok(())
+    }
 }
 
 /// いま置いてあるリースの数 (locks.rs。0 なら開くときにリースを見ない: ロックなしの open も使える)

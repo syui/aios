@@ -1415,6 +1415,7 @@ fn open_found(found: Found, flags: u64, mode: u64) -> R {
             crate::security::path_mknod(&full, vfs::S_IFREG | (mode as u32 & 0o7777), 0)?;
             let c = cred::current();
             parent_writable(&c, &parent)?;
+            break_deleg(&parent)?;
             let ino = parent.create(&name, mode as u32 & 0o7777 & !umask(), NewNode::File)?;
             own_new(&c, &parent, &ino)?;
             vfs::remember_new(&full, &parent, &name, &ino);
@@ -1770,6 +1771,7 @@ pub fn mkdirat(dirfd: i64, pathp: usize, mode: u64) -> R {
     crate::security::path_mkdir(&full)?;
     let c = cred::current();
     parent_writable(&c, &parent)?;
+    break_deleg(&parent)?;
     // setuid と setgid は落とす (Linux の vfs_mkdir は S_IRWXUGO と S_ISVTX だけ。setgid は親が setgid なら own_new が)
     let ino = parent.create(&name, mode as u32 & 0o1777 & !umask(), NewNode::Dir)?;
     own_new(&c, &parent, &ino)?;
@@ -1803,6 +1805,7 @@ pub fn mknodat(dirfd: i64, pathp: usize, mode: u64, dev: u64) -> R {
         return Err(-EEXIST);
     }
     parent_writable(&c, &parent)?;
+    break_deleg(&parent)?;
     let ino = parent.create(&name, mode & 0o7777 & !umask(), node)?;
     own_new(&c, &parent, &ino)?;
     inotify::dir_event(&parent, &name, inotify::IN_CREATE, 0);
@@ -1823,6 +1826,7 @@ pub fn bind_sock(path: &str, mode: u32) -> Result<(InodeRef, InodeRef, String, S
     crate::security::path_mknod(&full, vfs::S_IFSOCK, 0)?;
     let c = cred::current();
     parent_writable(&c, &parent)?;
+    break_deleg(&parent)?;
     let ino = parent.create(&name, mode & 0o7777 & !umask(), NewNode::Sock)?;
     own_new(&c, &parent, &ino)?;
     inotify::dir_event(&parent, &name, inotify::IN_CREATE, 0);
@@ -1884,6 +1888,13 @@ pub fn unlinkat(dirfd: i64, pathp: usize, flags: u64) -> R {
         });
     }
     sticky_ok(&c, &parent, &name)?;
+    break_deleg(&parent)?;
+    if flags & AT_REMOVEDIR == 0
+        && file::LEASES.load(core::sync::atomic::Ordering::Relaxed) != 0
+        && let Ok(t) = parent.lookup(&name)
+    {
+        break_deleg(&t)?;
+    }
     // 消えたものへの inotify のため。見張っている人がいるときだけ持っておく (持っていると ext4 は、
     // 消したファイルをまだ使われているものとして orphan のリストに入れ、手を放したときに片づけることになる)
     let victim = if inotify::active() { parent.lookup(&name).ok() } else { None };
@@ -1921,6 +1932,7 @@ pub fn symlinkat(targetp: usize, dirfd: i64, pathp: usize) -> R {
     crate::security::path_symlink(&full)?;
     let c = cred::current();
     parent_writable(&c, &parent)?;
+    break_deleg(&parent)?;
     let ino = parent.create(&name, 0o777, NewNode::Symlink(target))?;
     own_new(&c, &parent, &ino)?;
     inotify::dir_event(&parent, &name, inotify::IN_CREATE, 0);
@@ -1956,6 +1968,8 @@ pub fn linkat(olddir: i64, oldp: usize, newdir: i64, newp: usize, flags: u64) ->
         crate::security::path_link(&src, &full, &ino)?;
     }
     parent_writable(&cred::current(), &parent)?;
+    break_deleg(&parent)?;
+    break_deleg(&ino)?;
     parent.link(&name, &ino)?;
     inotify::dir_event(&parent, &name, inotify::IN_CREATE, 0);
     inotify::self_event(&ino, inotify::IN_ATTRIB);
@@ -2052,6 +2066,19 @@ pub fn renameat(olddir: i64, oldp: usize, newdir: i64, newp: usize, flags: u64) 
         {
             c.check(&t.meta(), PW)?;
         }
+    }
+    // delegation をこわす (Linux の vfs_rename の try_break_deleg の順)
+    break_deleg(&op)?;
+    if odir != ndir {
+        break_deleg(&np)?;
+    }
+    if !moving.meta().is_dir() {
+        break_deleg(&moving)?;
+    }
+    if let Some(t) = &target
+        && !t.meta().is_dir()
+    {
+        break_deleg(t)?;
     }
     if flags & RENAME_EXCHANGE != 0 {
         op.exchange(&oname, &np, &nname)?;
@@ -2261,6 +2288,16 @@ pub fn truncate(pathp: usize, len: i64) -> R {
     Ok(0)
 }
 
+/// 名前や属性を変える前に、ino の delegation (F_SETDELEG) をこわし、持ち主が外すまで待つ (Linux の try_break_deleg と
+/// break_deleg_wait: ディレクトリなら中に作る・消す・名前を変える、ファイルなら消す・名前を変える・link・属性)。
+/// リースがどこにもなければ何もしない
+fn break_deleg(ino: &InodeRef) -> Result<(), i64> {
+    if file::LEASES.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+        return Ok(());
+    }
+    file::locks().break_deleg(ino.id())
+}
+
 /// 持ち主か root だけ。グループに入っていなければ setgid は落とす
 fn chmod(ino: &InodeRef, mode: u64) -> R {
     may_setattr(ino)?;
@@ -2273,6 +2310,7 @@ fn chmod(ino: &InodeRef, mode: u64) -> R {
     if !c.in_group(m.gid) && !c.capable(cred::CAP_FSETID) {
         mode &= !cred::S_ISGID;
     }
+    break_deleg(ino)?;
     ino.set_mode(mode)?;
     Ok(0)
 }
@@ -2400,6 +2438,7 @@ fn chown(ino: &InodeRef, uid: u64, gid: u64) -> R {
     let m = ino.meta();
     let (uid, gid) = chown_ids(uid, gid)?;
     let mode = chown_mode(&c, (m.uid, m.gid, m.mode), uid, gid)?;
+    break_deleg(ino)?;
     if uid.is_some() || gid.is_some() {
         ino.set_owner(uid, gid)?;
     }
@@ -2595,6 +2634,7 @@ pub fn utimensat(dirfd: i64, pathp: usize, times: usize, flags: u64) -> R {
             (sec, ns) => Some(sec.max(0) as u64 * 1_000_000_000 + ns as u64),
         },
     };
+    break_deleg(&ino)?;
     ino.set_times(when(0), when(1))?;
     if by_fd {
         attrib_fd(dirfd as u64);
@@ -4109,6 +4149,7 @@ pub fn setxattr(fd: Option<u64>, dirfd: i64, pathp: usize, at_flags: u64, namep:
     }
     xattr_permission(&ino, &name, true)?;
     xattr_security(&name)?;
+    break_deleg(&ino)?;
     ino.setxattr(&name, Some(&v), flags as u32)?;
     xattr_changed(fd, dirfd, pathp);
     Ok(0)
@@ -4160,6 +4201,7 @@ pub fn removexattr(fd: Option<u64>, dirfd: i64, pathp: usize, at_flags: u64, nam
     let ino = xattr_target(fd, dirfd, pathp, at_flags, true)?;
     xattr_permission(&ino, &name, true)?;
     xattr_security(&name)?;
+    break_deleg(&ino)?;
     ino.setxattr(&name, None, 2)?;
     xattr_changed(fd, dirfd, pathp);
     Ok(0)

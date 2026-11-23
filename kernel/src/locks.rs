@@ -44,7 +44,10 @@ impl crate::file::FileLocks for Locks {
         getlease(f, deleg)
     }
     fn break_lease(&self, key: Key, write: bool, nonblock: bool) -> Result<(), i64> {
-        break_lease(key, write, nonblock)
+        break_lease(key, write, nonblock, false)
+    }
+    fn break_deleg(&self, key: Key) -> Result<(), i64> {
+        break_lease(key, true, false, true)
     }
 }
 
@@ -473,7 +476,10 @@ fn flock(fd: u64, op: u64) -> Result<i64, i64> {
 // ふつうのファイルの開いたもの (OpenFile) ごとに 1 つ。読むリース (F_RDLCK) は、書く口がどこにもないとき。書くリース
 // (F_WRLCK) は、ほかに開いたものがないとき。ほかの人が開く (書く口か、書くリースなら読む口も) か truncate すると、リースを
 // 持つものに F_SETSIG のシグナル (POLL_MSG、si_fd: fasync.rs) を送り、外すか下げるまで (lease-break-time 秒まで) 待つ
-// (O_NONBLOCK なら EWOULDBLOCK)。時間が来たら、外すものは外し、下げるものは下げる。閉じたら外れる
+// (O_NONBLOCK なら EWOULDBLOCK)。時間が来たら、外すものは外し、下げるものは下げる。閉じたら外れる。
+// delegation (F_SETDELEG) はディレクトリにも (読むものだけ: Linux の generic_setlease)。delegation は、名前と属性を変える
+// もの (中に作る・消す・名前を変える、link、chmod、chown、utimes、xattr: sysfile.rs の break_deleg) でもこわれる
+// (Linux の try_break_deleg。F_SETLEASE のリースはこわれない)
 
 /// lease-break-time (秒) と leases-enable (sysctl.rs)
 pub static LEASE_BREAK_TIME: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(45);
@@ -612,8 +618,8 @@ fn setlease(fd: i32, f: &FileRef, arg: i64, deleg: bool) -> Result<i64, i64> {
         };
         (key(&b), ptr_of(&b), dir, uid.or_else(|| Some(b.stat().uid)), inode, b.writable())
     };
-    // ディレクトリには置けない (fcntl_setlease。aios はディレクトリの F_SETDELEG もない)
-    if is_dir {
+    // リースはディレクトリには置けない (fcntl_setlease)。delegation は置ける (generic_setlease: 読むものだけ)
+    if is_dir && !deleg {
         return Err(-EINVAL);
     }
     // 型 (lease_init の assign_type)、持ち主か CAP_LEASE (vfs_setlease)、ふつうのファイル (generic_setlease)
@@ -626,6 +632,9 @@ fn setlease(fd: i32, f: &FileRef, arg: i64, deleg: bool) -> Result<i64, i64> {
     }
     let Some(k) = k.filter(|_| ok_kind) else { return Err(-EINVAL) };
     let arg = arg as i16;
+    if is_dir && arg == F_WRLCK {
+        return Err(-EINVAL);
+    }
     if arg == F_UNLCK {
         let Some(v) = leases().get_mut(&k) else { return Err(-EAGAIN) };
         let Some(i) = v.iter().position(|l| l.ptr == me) else { return Err(-EAGAIN) };
@@ -686,11 +695,12 @@ fn setlease(fd: i32, f: &FileRef, arg: i64, deleg: bool) -> Result<i64, i64> {
     Ok(0)
 }
 
-/// 開く・切りつめる前に、ぶつかるリースをこわす (Linux の __break_lease)。write は書く口 (truncate も)
-fn break_lease(k: Key, write: bool, nonblock: bool) -> Result<(), i64> {
+/// 開く・切りつめる前に、ぶつかるリースをこわす (Linux の __break_lease)。write は書く口 (truncate も)。deleg なら
+/// delegation だけ (Linux の break_deleg: 名前と属性を変えるもの)
+fn break_lease(k: Key, write: bool, nonblock: bool, deleg: bool) -> Result<(), i64> {
     const EWOULDBLOCK: i64 = 11;
     time_out_leases(k);
-    let conflict = |l: &Lease| write || l.typ == F_WRLCK;
+    let conflict = |l: &Lease| (!deleg || l.deleg) && (write || l.typ == F_WRLCK);
     let Some(v) = leases().get_mut(&k) else { return Ok(()) };
     if !v.iter().any(|l| conflict(l)) {
         return Ok(());
@@ -721,7 +731,7 @@ fn break_lease(k: Key, write: bool, nonblock: bool) -> Result<(), i64> {
     }
     loop {
         // まだぶつかるもの (外すのを待っているものの、締め切り)
-        let wait = leases().get(&k).and_then(|v| v.iter().find(|l| write || l.typ == F_WRLCK).map(|l| l.unlock.or(l.downgrade).unwrap_or(0)));
+        let wait = leases().get(&k).and_then(|v| v.iter().find(|l| conflict(l)).map(|l| l.unlock.or(l.downgrade).unwrap_or(0)));
         let Some(deadline) = wait else { return Ok(()) };
         if nonblock {
             return Err(-EWOULDBLOCK);

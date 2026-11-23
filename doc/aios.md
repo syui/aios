@@ -986,7 +986,7 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   F_GETLEASE と F_SETDELEG / F_GETDELEG (struct delegation。d_flags と __pad は 0 でないと EINVAL)。開いたファイルごとに 1 つ。
   読むリースは書く口がどこにもないとき (自分も読むだけの口で)、書くリースはほかに開いた口がないとき (Linux の
   lease_open_conflict: 生きているプロセスの fd の表を見て数える)、ほかにリースがあれば書くリースはだめ、外すのを待っている
-  ものがあれば新しいものもだめ (EAGAIN)。ディレクトリは EINVAL (aios はディレクトリの F_SETDELEG もない)、ふつうのファイル
+  ものがあれば新しいものもだめ (EAGAIN)。ディレクトリのリースは EINVAL (delegation は下)、ふつうのファイル
   でないもの (パイプ ...) とまちがった型も EINVAL、持ち主か CAP_LEASE でなければ EACCES、ないものを外すのは EAGAIN。つけると
   O_ASYNC の印がつき (知らせの表に入る)、持ち主がまだなければ自分のプロセスに (Linux の lease_setup)。外すと持ち主と
   F_SETSIG も消える (lease_modify)。ほかの人が開く (sysfile::open_found: 書く口はみな、読む口は書くリースと) か truncate
@@ -995,6 +995,16 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   は外し、下げるものは下げる。leases-enable が 0 なら新しいリースは EINVAL。閉じたら (最後の参照) 外れる。リースがあるあいだ
   は、ロックなしの open (file::fast_open) をしない (file::LEASES)。aios とちがうところ: exec で開くプログラムは書くリースを
   こわさない
+- delegation (test/deleg.c、tmpfs と ext4 で Linux 7.4-rc3 と 24 行同じ): 前は F_SETDELEG もディレクトリは EINVAL、
+  delegation をこわすのは開くと truncate だけだった。いまはディレクトリにも読む delegation を置ける (書くものは EINVAL、
+  F_SETLEASE はいまも EINVAL: Linux の generic_setlease と fcntl_setlease)。名前と属性を変えるものは、その前に delegation
+  をこわし、持ち主に POLL_MSG を送って外すまで待つ (Linux の try_break_deleg と break_deleg_wait。locks.rs の break_lease
+  の delegation だけのもの、sysfile.rs の break_deleg): ディレクトリの中に作る (open の O_CREAT、mkdir、mknod、mkfifo、
+  symlink、link、unix ソケットの bind)、消す (unlink、rmdir)、名前を変える (元と先のディレクトリ、動くものと上書きされる
+  もの: ディレクトリでなければ)、link のつなぐもの、属性 (chmod、chown、utimes、setxattr と removexattr)。見るだけ (stat、
+  readdir、中のファイルを読む・書く) と、下のディレクトリの中を変えるのはこわさない。F_SETLEASE のリースはこれではこわれ
+  ない (Linux の break_deleg は FL_DELEG だけ)。リースがあるあいだは、ロックなしの作る・消す (fastdir の fast_create と
+  fast_unlink) もしない
 - dnotify (test/dnotify.c、Linux 7.4-rc3 と 20 行同じ。手本の Linux に CONFIG_DNOTIFY を足した): inotify.rs (Linux の
   fs/notify/dnotify)。fcntl の F_NOTIFY をディレクトリの fd に (ほかは ENOTDIR、0 か DN_MULTISHOT だけなら外す、
   dir-notify-enable が 0 なら EINVAL)。持ち主がまだなければ自分のプロセスに。同じ表の同じファイルにもう一度なら DN_* を
