@@ -890,6 +890,33 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   SIGSEGV などは si_addr でなく si_pid と si_uid。カーネルの SIGTRAP でも番地がなく pid があればそちら: 共用体)、
   ptrace の知らせの止まり (PTRACE_EVENT_*、システムコールの入口と出口、グループの止まり) の si_pid と si_uid も
   Linux の ptrace_do_notify と同じく入れる。のこりは todo.json の syscall-gaps
+- perf_event_open (241。test/perf.c、Linux 7.4-rc3 と 15 行同じ。手本の Linux は PERF_EVENTS を入れ、PMU (ARM_PMU) は
+  aios にまだないので切ってくらべる): perf.rs (extra)。ソフトウェアの数 (task-clock、cpu-clock、page-faults、
+  page-faults-min / maj、context-switches、cpu-migrations、alignment-faults、emulation-faults、dummy、bpf-output) を
+  数える。数はイベントごとに数えず、スレッドの数 (proc.rs の cpu_ns、pgfault と min_flt と maj_flt (EL0 からの
+  フォルト: すべてと片づいたもの。大きなロックなしの道も)、nvcsw + nivcsw、nr_migrations) を読んだときの差で出す:
+  動いている (有効で、グループならリーダーも有効) あいだの差を足し、変わるたびに写しなおす。時間 (time_enabled と
+  time_running) は Linux のタスクの文脈と同じく、そのスレッドが走った時間。exclude_user ならフォルトは 0、
+  exclude_kernel なら切りかえと移りは 0 (カーネルの中で起きる: Linux と同じく、paranoid 2 のふつうの人には
+  コンテキストスイッチが見えない)。attr は Linux の perf_copy_attr のとおり (size 0 は VER0、64 より小さいか 4096
+  より大きいと size に 176 を書いて E2BIG、知らない先が 0 でなければ E2BIG、予約のビット、sample_type、read_format、
+  inherit_thread、remove_on_exec と enable_on_exec、sigtrap)、perf_event_open の順 (flags、paranoid 2 で
+  exclude_kernel がなければ EACCES、freq と period、group_fd は perf の fd でなければ EBADF、pid はスレッドの番号で
+  いなければ ESRCH、cpu、種類: ソフトウェアだけで、ハードウェア・キャッシュ・RAW・トレースポイントと知らない種類は
+  ENOENT、config が 12 から先も ENOENT、ほかのスレッドは CAP_PERFMON か ptrace の READ で読めるときだけ (EACCES)、
+  CPU ごとのもの (pid -1) は paranoid で EACCES)。fd は anon_inode:[perf_event] (O_RDWR、PERF_FLAG_FD_CLOEXEC)。
+  read は Linux の形 (値、TOTAL_TIME_ENABLED、RUNNING、ID、LOST。GROUP なら数とリーダーの時間とメンバーごとの値と
+  ID) で、足りなければ ENOSPC、write は EINVAL、lseek は ESPIPE。ioctl は ENABLE、DISABLE、RESET (PERF_IOC_FLAG_GROUP
+  でグループのみな)、ID、REFRESH と PERIOD (サンプリングのものだけ)、SET_OUTPUT、SET_FILTER と SET_BPF と
+  PAUSE_OUTPUT と QUERY_BPF (EINVAL)、MODIFY_ATTRIBUTES (ソフトウェアは EOPNOTSUPP)、ほかは ENOTTY。グループの
+  メンバーはリーダーが有効なときだけ数え、リーダーを閉じるとひとりだちする。inherit なら fork した子も数え (proc.rs の
+  フック: fork で足し、スレッドの終わりで数をまとめる。inherit_thread ならスレッドだけ)、enable_on_exec は exec で
+  1 度だけ有効に、remove_on_exec はもう数えない。prctl の PR_TASK_PERF_EVENTS_DISABLE / ENABLE は自分が開いたものを
+  みな。/proc/sys/kernel の perf_event_paranoid (2)、perf_event_max_sample_rate、perf_event_mlock_kb (516)、
+  perf_event_max_stack、perf_cpu_time_max_percent、perf_event_max_contexts_per_stack と、/sys/bus/event_source
+  (devices の breakpoint と software は /sys/devices/NAME へのリンク: type、perf_event_mux_interval_ms、subsystem、
+  uevent)。まだないもの (todo.json の syscall-gaps): PMU のハードウェアの数、ブレークポイントの数 (EOPNOTSUPP)、
+  サンプリング (mmap の輪、オーバーフローのシグナル)、CPU ごとのもの (root でも EOPNOTSUPP)
 - atime (test/atime.c、root で ext4 と tmpfs とマウントの印で Linux と 5 行同じ): 前は持たなかった (stat の atime は mtime、
   utimensat の atime は捨てていた)。いまは ext4 は inode の i_atime (秒)、tmpfs は自分の属性に持ち、stat と statx に出す。
   utimensat は atime も決め、ctime をいまに (Linux の notify_change。前は ctime を変えなかった)。読んだら (read、pread、

@@ -291,6 +291,7 @@ nrs! {
     GET_MEMPOLICY = 236,
     SET_MEMPOLICY = 237,
     RT_TGSIGQUEUEINFO = 240,
+    PERF_EVENT_OPEN = 241,
     // System V の共有メモリ (shm.rs)
     MSGGET = 186,
     MSGCTL = 187,
@@ -3050,6 +3051,8 @@ fn sys_prctl(op: u64, arg: usize, arg3: usize, arg4: u64, arg5: u64) -> R {
     const PR_GET_SPECULATION_CTRL: u64 = 52;
     const PR_SET_SPECULATION_CTRL: u64 = 53;
     const PR_GET_SECCOMP: u64 = 21;
+    const PR_TASK_PERF_EVENTS_DISABLE: u64 = 31;
+    const PR_TASK_PERF_EVENTS_ENABLE: u64 = 32;
     const PR_SET_SECCOMP: u64 = 22;
     const PR_SET_NAME: u64 = 15;
     const PR_GET_NAME: u64 = 16;
@@ -3237,6 +3240,10 @@ fn sys_prctl(op: u64, arg: usize, arg3: usize, arg4: u64, arg5: u64) -> R {
         }
         PR_GET_NO_NEW_PRIVS => return Ok(p.cred.no_new_privs as i64),
         PR_GET_SECCOMP => return Ok(crate::security::prctl_get_seccomp(&p.cred)),
+        // 自分が開いた perf のものをみな止める / 動かす (perf.rs。なければ PERF_EVENTS のない Linux と同じ EINVAL)
+        PR_TASK_PERF_EVENTS_DISABLE | PR_TASK_PERF_EVENTS_ENABLE => {
+            return crate::proc::perf().map(|h| h.task_enable(op == PR_TASK_PERF_EVENTS_ENABLE)).ok_or_else(crate::why::inval);
+        }
         // seccomp を切っていれば (aios.off=seccomp)、入れずに作った Linux と同じ EINVAL
         PR_SET_SECCOMP if crate::parts::off(crate::parts::Part::Seccomp) => return Err(crate::why::inval()),
         PR_SET_SECCOMP => return crate::security::prctl_set_seccomp(arg as u64, arg3),

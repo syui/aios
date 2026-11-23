@@ -146,6 +146,13 @@ pub static TABLE: &[Entry] = &[
         set: Some(|s| Ok(crate::kmsg::set_dmesg_restrict(num(s, 0, 1)? == 1))),
     },
     Entry { path: "kernel/osrelease", get: crate::ns::release, set: None },
+    // perf (perf.rs): paranoid ほか
+    Entry { path: "kernel/perf_event_paranoid", get: || crate::perf::knob_get(0), set: Some(|s| crate::perf::knob_set(0, s)) },
+    Entry { path: "kernel/perf_event_max_sample_rate", get: || crate::perf::knob_get(1), set: Some(|s| crate::perf::knob_set(1, s)) },
+    Entry { path: "kernel/perf_event_mlock_kb", get: || crate::perf::knob_get(2), set: Some(|s| crate::perf::knob_set(2, s)) },
+    Entry { path: "kernel/perf_event_max_stack", get: || crate::perf::knob_get(3), set: Some(|s| crate::perf::knob_set(3, s)) },
+    Entry { path: "kernel/perf_cpu_time_max_percent", get: || crate::perf::knob_get(4), set: Some(|s| crate::perf::knob_set(4, s)) },
+    Entry { path: "kernel/perf_event_max_contexts_per_stack", get: || crate::perf::knob_get(5), set: Some(|s| crate::perf::knob_set(5, s)) },
     Entry {
         path: "kernel/uname",
         get: || match crate::ns::uname() {

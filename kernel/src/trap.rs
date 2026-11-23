@@ -430,6 +430,9 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
         if (ec == EC_DABT_LOW || ec == EC_IABT_LOW) && (4..=15).contains(&(esr & 0x3f)) {
             let write = ec == EC_DABT_LOW && esr & (1 << 6) != 0 && esr & (1 << 8) == 0;
             if proc::current().pt().fast_fault(far() as usize, write, ec == EC_IABT_LOW) {
+                let p = proc::current();
+                p.pgfault += 1;
+                p.min_flt += 1;
                 crate::smp::FAST_FAULTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 crate::smp::FAULTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 return;
@@ -615,6 +618,7 @@ fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>, esr: u64) {
                         let cm = ec == EC_DABT_LOW && esr & (1 << 8) != 0;
                         let write = ec == EC_DABT_LOW && esr & (1 << 6) != 0 && !cm;
                         crate::smp::FAULTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        proc::current().pgfault += 1;
                         let mut r = proc::current().pt().fault(far as usize, write, ec == EC_IABT_LOW);
                         // 足りなければ自分のページもスワップへ追い出して、もう一度
                         if matches!(r, Err(crate::vm::FaultErr::NoMem)) && crate::vm::reclaim(crate::vm::RECLAIM_BATCH, 0) > 0 {
@@ -630,6 +634,7 @@ fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>, esr: u64) {
                         }
                         match r {
                             Ok(()) => {
+                                proc::current().min_flt += 1;
                                 proc::check_killed();
                                 signal::deliver(tf, None);
                                 return;

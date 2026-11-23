@@ -563,6 +563,12 @@ pub struct Proc {
     /// CPU をゆずった数: 眠った (自分から) と、走れるままゆずった (Linux の nvcsw と nivcsw: /proc/PID/sched)
     pub nvcsw: u64,
     pub nivcsw: u64,
+    /// ページフォルト (EL0 からのもの: すべて、片づいた小さいもの、大きいもの。Linux の PERF_COUNT_SW_PAGE_FAULTS と
+    /// min_flt、maj_flt) と、ほかの CPU へ移った数 (nr_migrations)。perf.rs が読む
+    pub pgfault: u64,
+    pub min_flt: u64,
+    pub maj_flt: u64,
+    pub nr_migrations: u64,
     /// 走れるようになってから走るまで待った時間 (ns) と、走れるようになった時刻 (Linux の sched_info.run_delay と
     /// last_queued: /proc/PID/schedstat)
     pub run_delay: u64,
@@ -785,6 +791,10 @@ impl Proc {
         mce_kill: 0,
         nvcsw: 0,
         nivcsw: 0,
+        pgfault: 0,
+        min_flt: 0,
+        maj_flt: 0,
+        nr_migrations: 0,
         run_delay: 0,
         queued_at: 0,
         pcount: 0,
@@ -1934,6 +1944,10 @@ pub fn scheduler() -> ! {
             p.slice = 0;
             // 前の印は、選びなおしたので要らない
             take_resched();
+            // ほかの CPU から移った (Linux の set_task_cpu の nr_migrations。はじめて走るときは数えない)
+            if p.nrun > 1 && p.cpu != crate::smp::id() {
+                p.nr_migrations += 1;
+            }
             p.cpu = crate::smp::id();
             unsafe {
                 set_cur(Some(i));
@@ -2275,6 +2289,24 @@ pub fn exit(code: i32) -> ! {
     exit_status(exited(code))
 }
 
+/// perf (perf.rs: なくてもよい部分) に知らせること: fork した子 (inherit で数える相手に)、スレッドの終わり (数を
+/// まとめる)、exec (enable_on_exec)、prctl の PR_TASK_PERF_EVENTS_DISABLE / ENABLE
+pub trait PerfHooks: Sync {
+    fn fork(&self, parent: &Proc, child: &Proc, thread: bool);
+    fn exit(&self, p: &Proc);
+    fn exec(&self, p: &Proc);
+    fn task_enable(&self, on: bool) -> i64;
+}
+static PERF: crate::cell::Early<Option<&'static dyn PerfHooks>> = crate::cell::Early::new(None);
+
+pub fn register_perf(h: &'static dyn PerfHooks) {
+    PERF.set(Some(h));
+}
+
+pub fn perf() -> Option<&'static dyn PerfHooks> {
+    *PERF.get()
+}
+
 /// プロセス (スレッドグループ) が終わるときに呼ぶもの (なくてもよい部分が main.rs で置く)
 static EXIT_HOOK: crate::cell::Early<Option<fn(u32)>> = crate::cell::Early::new(None);
 
@@ -2290,6 +2322,10 @@ fn exit_status(status: i32) -> ! {
     }
     let p = current();
     crate::debug::trace_exit(p.pid, status as i64);
+    // perf: このスレッドの数をまとめる (Linux の perf_event_exit_task)
+    if let Some(h) = perf() {
+        h.exit(p);
+    }
     // 監査: exit や exit_group の中なら、その記録 (__audit_free)
     if p.audit.is_some() {
         crate::security::audit_free();
@@ -2629,6 +2665,10 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
         }
         parent.pt_event = Some((event, crate::ns::to_local(tid).unwrap_or(tid) as u64));
     }
+    // perf の inherit: 子も数える (Linux の perf_event_init_task)
+    if let Some(h) = perf() {
+        h.fork(current(), child, thread);
+    }
     drop(_p);
     let _p = crate::debug::span("proc:fork_run");
     make_runnable(child);
@@ -2757,6 +2797,10 @@ fn finish_exec(p: &mut Proc, img: Image, comm: &str) {
     p.load_image(img);
     // ハードウェアのブレークポイントとウォッチポイントは消える (Linux の flush_thread の flush_ptrace_hw_breakpoint)
     p.hwdbg = None;
+    // perf の enable_on_exec (Linux の perf_event_exec)
+    if let Some(h) = perf() {
+        h.exec(p);
+    }
     // 前のアドレス空間から受けつぐ印: PR_SET_THP_DISABLE (MMF_DISABLE_THP) と coredump_filter (Linux の mmf_init_flags。
     // 前は load_image が外したあとの self.mm を見ていて、どちらも exec で既定にもどっていた)
     if let Some(o) = old.as_ref() {

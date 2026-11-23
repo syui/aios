@@ -7,6 +7,7 @@ mod aiproc;
 mod apparmor;
 mod audit;
 mod auditfilter;
+mod perf;
 mod ptrace;
 mod securityfs;
 mod efirt;
@@ -207,6 +208,9 @@ pub extern "C" fn kmain() -> ! {
     syscall::register_fast_splice(splice::fast);
     // ptrace (止まるところは signal.rs と proc.rs)
     syscall::register(ptrace::SYSCALLS, ptrace::sys);
+    // perf_event_open (ソフトウェアの数) と、fork / exit / exec / prctl で知らせてもらうもの
+    syscall::register(perf::SYSCALLS, perf::sys);
+    proc::register_perf(&perf::HOOKS);
     // ファイルの出来事の知らせ (Linux の fsnotify: vfs::notify) を inotify へ
     vfs::notify::register(&inotify::OPS);
     // AF_UNIX: fd を閉じたあとの gc (システムコールの終わり) と、大きなロックなしの read / write (syscall::fast)

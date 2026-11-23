@@ -104,6 +104,15 @@ enum Node {
     /// /sys/bus と /sys/bus/platform
     Bus,
     BusPlatform,
+    /// /sys/bus/event_source (perf の種類: perf.rs の SOURCES) と devices、drivers (空)、ファイル (EV_BUS_FILES)、
+    /// devices の中のリンク。/sys/devices/NAME と、そのファイル (EV_DEV_FILES)
+    EvBus,
+    EvBusDevs,
+    EvBusDrivers,
+    EvBusFile(u8),
+    EvBusLink(u8),
+    EvDev(u8),
+    EvDevFile(u8, u8),
     /// /sys/devices/platform と、その中の装置 (その装置をつなぐ CHRDEVS のはじめの番号)
     Platform,
     PlatDev(u8),
@@ -155,6 +164,10 @@ enum Node {
 /// pci_bus の番号でルートのバスを表すもの (装置は 255 より少ない: pci.rs)
 const ROOT_BUS: u8 = 255;
 /// DTB のホストブリッジの platform の装置のファイル (Linux の driver と of_node のリンクはない: その先を見せていない)
+/// /sys/bus/event_source のファイル (名前、mode): Linux の bus_attrs と uevent
+const EV_BUS_FILES: [(&str, u32); 3] = [("drivers_autoprobe", 0o644), ("drivers_probe", 0o200), ("uevent", 0o200)];
+/// /sys/devices/NAME (perf の種類) のもの: perf_event_mux_interval_ms、subsystem (リンク)、type、uevent
+const EV_DEV_FILES: [(&str, u32); 4] = [("perf_event_mux_interval_ms", 0o644), ("subsystem", 0o777), ("type", 0o444), ("uevent", 0o644)];
 const HOST_FILES: [(&str, u32); 3] = [("driver_override", 0o644), ("modalias", 0o444), ("uevent", 0o644)];
 /// pci_bus/0000:BB のファイル (waiting_for_supplier は DTB のルートのバスだけ)
 const PCI_BUS_FILES: [(&str, u32); 5] = [("cpuaffinity", 0o444), ("cpulistaffinity", 0o444), ("rescan", 0o200), ("uevent", 0o644), ("waiting_for_supplier", 0o444)];
@@ -347,6 +360,13 @@ impl SysInode {
             Node::DevChar => 21,
             Node::Bus => 22,
             Node::BusPlatform => 23,
+            Node::EvBus => 0xa_0000,
+            Node::EvBusDevs => 0xa_0001,
+            Node::EvBusDrivers => 0xa_0002,
+            Node::EvBusFile(k) => 0xa_0004 + k as u64,
+            Node::EvBusLink(k) => 0xa_0010 + k as u64,
+            Node::EvDev(k) => 0xa_0100 + ((k as u64) << 4),
+            Node::EvDevFile(k, f) => 0xa_0100 + ((k as u64) << 4) + 1 + f as u64,
             Node::Platform => 24,
             Node::DevCharLink(i) => 0x6_0000 + ((i as u64) << 5),
             Node::PlatDev(i) => 0x6_0000 + ((i as u64) << 5) + 1,
@@ -391,6 +411,7 @@ impl SysInode {
             Node::Root | Node::Block | Node::Disk | Node::Queue | Node::Part(_) | Node::Class | Node::ClassNet | Node::Net(_) | Node::NetStats(_) | Node::Devices | Node::System | Node::Cpu | Node::Vulns | Node::CpuN(_) | Node::Kernel | Node::Security | Node::Module | Node::ModAa | Node::ModAaParams | Node::Firmware | Node::Efi | Node::EfiVars | Node::Acpi | Node::AcpiTables | Node::AcpiSub(_) | Node::AcpiHotplug | Node::AcpiHp(_)
                 | Node::Dev | Node::DevChar | Node::Bus | Node::BusPlatform | Node::Platform | Node::PlatDev(_) | Node::PlatClass(_) | Node::Chr(_) | Node::ClassOf(_)
                 | Node::BusPci | Node::BusPciDevs | Node::BusPciSub(_) | Node::PciHost | Node::PciRoot | Node::PciDev(_) | Node::PciLinkDir(_) | Node::PciBusDir(_) | Node::PciBus(_) | Node::ClassPciBus
+                | Node::EvBus | Node::EvBusDevs | Node::EvBusDrivers | Node::EvDev(_)
         )
     }
 
@@ -424,7 +445,11 @@ impl SysInode {
             Node::EfiFile(_) | Node::EfiVars => Node::Efi,
             Node::DevChar => Node::Dev,
             Node::DevCharLink(_) => Node::DevChar,
-            Node::BusPlatform => Node::Bus,
+            Node::BusPlatform | Node::EvBus => Node::Bus,
+            Node::EvBusDevs | Node::EvBusDrivers | Node::EvBusFile(_) => Node::EvBus,
+            Node::EvBusLink(_) => Node::EvBusDevs,
+            Node::EvDev(_) => Node::Devices,
+            Node::EvDevFile(k, _) => Node::EvDev(k),
             Node::PlatDev(_) => Node::Platform,
             Node::PlatUevent(i) | Node::PlatSubsys(i) => Node::PlatDev(i),
             Node::PlatClass(i) => {
@@ -469,6 +494,8 @@ impl SysInode {
         let up = |n: usize| "../".repeat(n);
         match self.node {
             Node::BusPciLink(i) => return Some(format!("../../../devices/{}", crate::pci::path(i as usize))),
+            Node::EvBusLink(k) => return Some(format!("../../../devices/{}", crate::perf::SOURCES[k as usize].0)),
+            Node::EvDevFile(_, 1) => return Some("../../bus/event_source".into()),
             Node::PciHostSubsys => return Some("../../../bus/platform".into()),
             // /sys/devices/ROOT/装置.../subsystem
             Node::PciSubsys(i) => return Some(format!("{}bus/pci", up(1 + pci_root_path().1 + crate::pci::depth(i as usize) + 1))),
@@ -499,6 +526,10 @@ impl SysInode {
             format!("{}:{}\n", ma, mi)
         };
         Ok(match self.node {
+            Node::EvBusFile(0) => "1\n".into(),
+            Node::EvBusFile(_) | Node::EvDevFile(_, 3) => String::new(),
+            Node::EvDevFile(_, 0) => format!("{}\n", crate::perf::mux_interval_ms()),
+            Node::EvDevFile(k, _) => format!("{}\n", crate::perf::SOURCES[k as usize].1),
             Node::DiskFile(i) => match DISK_FILES[i as usize] {
                 "size" => format!("{}\n", part(0).map_or(0, |p| p.len)),
                 "stat" => stat(0),
@@ -632,6 +663,8 @@ impl Inode for SysInode {
             Node::PciAspm(..) => S_IFREG | 0o644,
             Node::PciHostFile(k) => S_IFREG | HOST_FILES[k as usize].1,
             Node::PciBusFile(_, k) => S_IFREG | PCI_BUS_FILES[k as usize].1,
+            Node::EvBusFile(k) => S_IFREG | EV_BUS_FILES[k as usize].1,
+            Node::EvDevFile(_, f) => S_IFREG | EV_DEV_FILES[f as usize].1,
             _ => S_IFREG | 0o444,
         };
         let size = match &link {
@@ -704,6 +737,14 @@ impl Inode for SysInode {
             Node::PlatUevent(_) | Node::ChrUevent(_) | Node::PciRootFile(0) | Node::PciHostFile(2) | Node::PciBusFile(_, 3) => Ok(b.len()),
             // /sys/bus/pci の uevent と rescan、pci_bus と装置の rescan (たどりなおしても同じものしかない: 受けとるだけ)
             Node::BusPciFile(2 | 4) | Node::PciBusFile(_, 2) => Ok(b.len()),
+            // /sys/bus/event_source の drivers_autoprobe、drivers_probe、uevent と装置の uevent: 受けとるだけ
+            Node::EvBusFile(_) | Node::EvDevFile(_, 3) => Ok(b.len()),
+            // perf_event_mux_interval_ms (Linux の perf_event_mux_interval_ms_store: 1 より小さいと EINVAL。まわす
+            // ものがないので覚えない)
+            Node::EvDevFile(_, 0) => match core::str::from_utf8(b).ok().and_then(|s| s.trim().parse::<i32>().ok()) {
+                Some(v) if v >= 1 => Ok(b.len()),
+                _ => Err(-EINVAL),
+            },
             Node::PciBar(i, k) => {
                 let mut v = b.to_vec();
                 crate::pci::bar_rw(pci_dev(i)?, k as usize, off, &mut v, true)
@@ -769,6 +810,15 @@ impl Inode for SysInode {
                 Node::DevCharLink(i as u8)
             }
             Node::Bus if name == "platform" => Node::BusPlatform,
+            Node::Bus if name == "event_source" => Node::EvBus,
+            Node::EvBus => match name {
+                "devices" => Node::EvBusDevs,
+                "drivers" => Node::EvBusDrivers,
+                _ => Node::EvBusFile(EV_BUS_FILES.iter().position(|f| f.0 == name).ok_or(-ENOENT)? as u8),
+            },
+            Node::EvBusDevs => Node::EvBusLink(crate::perf::SOURCES.iter().position(|s| s.0 == name).ok_or(-ENOENT)? as u8),
+            Node::Devices if crate::perf::SOURCES.iter().any(|s| s.0 == name) => Node::EvDev(crate::perf::SOURCES.iter().position(|s| s.0 == name).unwrap() as u8),
+            Node::EvDev(k) => Node::EvDevFile(k, EV_DEV_FILES.iter().position(|f| f.0 == name).ok_or(-ENOENT)? as u8),
             Node::Bus if name == "pci" => Node::BusPci,
             Node::BusPci => match name {
                 "devices" => Node::BusPciDevs,
@@ -1026,8 +1076,27 @@ impl Inode for SysInode {
                 }
             }
             Node::Bus => {
+                add("event_source".into(), Node::EvBus);
                 add("pci".into(), Node::BusPci);
                 add("platform".into(), Node::BusPlatform);
+            }
+            Node::EvBus => {
+                add("devices".into(), Node::EvBusDevs);
+                add("drivers".into(), Node::EvBusDrivers);
+                for (k, f) in EV_BUS_FILES.iter().enumerate() {
+                    add(f.0.into(), Node::EvBusFile(k as u8));
+                }
+            }
+            Node::EvBusDrivers => {}
+            Node::EvBusDevs => {
+                for (k, s) in crate::perf::SOURCES.iter().enumerate() {
+                    add(s.0.into(), Node::EvBusLink(k as u8));
+                }
+            }
+            Node::EvDev(k) => {
+                for (f, e) in EV_DEV_FILES.iter().enumerate() {
+                    add(e.0.into(), Node::EvDevFile(k, f as u8));
+                }
             }
             Node::BusPlatform | Node::BusPciSub(_) => {}
             Node::PciLinkDir(i) => {
@@ -1164,6 +1233,10 @@ impl Inode for SysInode {
                 }
             }
             Node::Devices => {
+                // perf の種類 (Linux の perf_pmu_register が /sys/devices/NAME を作る)
+                for (k, s) in crate::perf::SOURCES.iter().enumerate() {
+                    add(s.0.into(), Node::EvDev(k as u8));
+                }
                 if !chrdevs().is_empty() || crate::pci::host().is_some() {
                     add("platform".into(), Node::Platform);
                 }
