@@ -3230,9 +3230,10 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
         let n = match &f.kind {
             Kind::PipeRead(p) | Kind::PipeWrite(p) | Kind::PipeRw(p) => Some(p.borrow().len()),
             Kind::Ops(o) => o.fionread().transpose()?,
-            // ふつうのファイルは大きさ - 位置 (終わりより先なら負: Linux の do_vfs_ioctl)
+            // ふつうのファイルは大きさ - 位置 (終わりより先なら負。int に入らなければ INT_MIN か INT_MAX: Linux の
+            // do_vfs_ioctl の clamp_t)
             Kind::Inode(ino, _) if ino.meta().mode & S_IFMT == vfs::S_IFREG => {
-                let n = ino.meta().size as i64 - f.offset as i64;
+                let n = (ino.meta().size as i64 - f.offset as i64).clamp(i32::MIN as i64, i32::MAX as i64);
                 return out(arg, &(n as i32).to_le_bytes()).map(|_| 0);
             }
             _ => None,

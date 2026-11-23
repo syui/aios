@@ -216,6 +216,9 @@ pub struct Inet {
     /// unhashed_state)。つながろうとしたもの・つながったものは、もう listen できない (EINVAL)。listen していたものは、
     /// もう connect できない (EINVAL)。accept した子は新しく (None)
     unhashed: Option<St>,
+    /// TCP: 一度つながった (ESTABLISHED になった)。AF_UNSPEC の connect で切ると、つながったことのないものにもどる。
+    /// aios がえらんだちがい send-notconn: つながったことのないものへ書くと ENOTCONN (Linux は EPIPE)
+    was_conn: bool,
     /// SO_PROTOCOL
     protocol: u8,
     /// 分けた NET (なければ 0)
@@ -483,6 +486,7 @@ fn new_sock_as(tcp: bool, protocol: u8, uid: u32, gid: u32, netns: u64) -> InetR
     let u = Rc::new(RefCell::new(Inet {
         tcp,
         unhashed: None,
+        was_conn: false,
         protocol,
         net: netns,
         state: St::Close,
@@ -1392,6 +1396,7 @@ fn lookup_listener6(netns: u64, daddr: u128, dport: u16) -> Option<InetRef> {
 /// 半分) と、入れ物を広げる (Linux の tcp_sndbuf_expand: 2 × cwnd 10 × MSS の skb の大きさ。決めたものはそのまま)
 fn established(s: &mut Inet, peer_mss: i32, half_wnd: i32) {
     s.state = St::Established;
+    s.was_conn = true;
     let mut clamp = peer_mss;
     if s.user_mss != 0 && s.user_mss < clamp {
         clamp = s.user_mss;
@@ -2354,11 +2359,6 @@ fn tcp_reset(u: &InetRef) {
     };
     u.borrow_mut().err = -err;
     tcp_done(u);
-    // connect にしくじった (SYN_SENT で RST): 一度もつないでいないものにもどす (相手のポートを 0 に。aios がえらんだ
-    // ちがい send-notconn: そのあと書くと ENOTCONN。Linux は tcp_disconnect を通らないと dport が残り EPIPE)
-    if st == St::SynSent {
-        u.borrow_mut().dport = 0;
-    }
     // O_ASYNC: エラー (Linux の tcp_done_with_error の sk_error_report)
     if !u.borrow().dead {
         wake_async(u, crate::fasync::POLL_ERR);
@@ -2444,6 +2444,7 @@ fn close_state(s: &mut Inet) -> bool {
 fn tcp_disconnect(u: &InetRef) -> Result<(), i64> {
     let old = u.borrow().state;
     let lock_port = u.borrow().lock_port;
+    u.borrow_mut().was_conn = false;
     if old != St::Close {
         unhash(&mut u.borrow_mut());
         u.borrow_mut().state = St::Close;
@@ -3048,9 +3049,9 @@ fn tcp_send(u: &InetRef, src: &Src, len: usize, ctl: &[u8], flags: u64, nonblock
             return Err(stream_error(u, flags, e));
         }
         if !matches!(st, St::SynSent | St::SynRecv) {
-            // 相手のポートは connect で決まり、しくじる (connect のときでも、あとで RST や時間切れでも) か切ると 0 に
-            // もどる (つながってから閉じられたものは残る)
-            if u.borrow().dport == 0 {
+            // つながったことがなければ (connect にしくじったもの、listen しているもの、AF_UNSPEC で切ったもの)。
+            // つながってから閉じられたものは、bind しなおしても (相手のポートが 0 にもどっても) EPIPE
+            if !u.borrow().was_conn {
                 return Err(-ENOTCONN);
             }
             return Err(stream_error(u, flags, -EPIPE));
@@ -5294,8 +5295,6 @@ pub fn tick() {
                 if tries >= syncnt {
                     u.borrow_mut().err = -ETIMEDOUT;
                     tcp_done(&u);
-                    // connect にしくじった: 一度もつないでいないものにもどす (tcp_reset と同じ)
-                    u.borrow_mut().dport = 0;
                 } else {
                     {
                         let mut s = u.borrow_mut();
@@ -5659,18 +5658,18 @@ fn ext_sync(u: &InetRef) {
         match (st, ts) {
             (St::SynSent, tcp::State::SynSent | tcp::State::SynReceived) => false,
             (St::SynSent, tcp::State::Closed) => {
-                // RST (ICMP のエラーで止めたものは、そのエラーのまま)。一度もつないでいないものにもどす (tcp_reset と同じ)
+                // RST (ICMP のエラーで止めたものは、そのエラーのまま)
                 if s.err == 0 {
                     s.err = -ECONNREFUSED;
                 }
                 unhash(&mut s);
                 s.state = St::Close;
                 s.shutdown = BOTH;
-                s.dport = 0;
                 true
             }
             (St::SynSent, _) => {
                 s.state = St::Established;
+                s.was_conn = true;
                 s.mss_cache = if s.v6 { 1440 } else { 1460 } - 12;
                 if !s.lock_sndbuf {
                     s.sndbuf = s.sndbuf.max(87040);
@@ -5982,6 +5981,7 @@ fn ext_accept(u: &InetRef) {
             x.ext = Some(h);
             x.ss = Ss::Connected;
             x.state = St::Established;
+            x.was_conn = true;
             x.mss_cache = 1460 - 12;
             x.sndbuf = 87040;
             x.nodelay = l.nodelay;

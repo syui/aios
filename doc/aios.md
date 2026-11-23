@@ -3194,6 +3194,30 @@ KEEPCAPS、seteuid と setfsuid、bounding、ambient、securebits、ファイル
 まだ: ユーザーの namespace の中の capability (Linux は新しいユーザーの namespace の中でみなを持ち、外の capability は
 使えない。aios はユーザーの namespace を作っても組を変えず、中で capability を見ないところを決めている)。
 
+### 長い並び (op 150) で見つけた 4 つ (2026-11-23)
+
+sysdiff を 7.4-rc4 で、ext4 の種 10301〜10600 と tmpfs の種 10001〜10300 (どちらも op 150) にのばして見つけたもの:
+
+- tmpfs のディレクトリを lseek で DIR_OFFSET_EOD (S32_MAX) より先 (2^40 など) にして getdents64 すると、Linux は 0 (終わり。
+  offset_readdir は ctx->pos が EOD より小さいときだけたどる)。aios は EOD ちょうどのときだけ終わりとしていたので、先頭から
+  みな返した。EOD かその先は読まない
+- ふつうのファイルの FIONREAD (大きさ - 位置) が int に入らないとき、Linux は INT_MIN か INT_MAX にする (do_vfs_ioctl の
+  clamp_t)。aios は下の 32 ビットを返していた (2^40 の先では 0 になった)
+- 一度つながった TCP が RST で閉じたあと bind しなおす (相手のポートが 0 にもどる: Linux の __inet_bind も) と、aios は
+  そこへの send を ENOTCONN (aios がえらんだちがい send-notconn の「一度もつないでいない」) にしていた。Linux はつながった
+  ことのあるものは EPIPE。aios は「つながったことがあるか」を相手のポートで見ていたのを、ソケットの印 (ESTABLISHED になったら
+  立て、AF_UNSPEC の connect で下ろす) にした。connect にしくじったときに相手のポートを 0 にもどすこと (前にそのためだけに
+  入れた、Linux とちがうところ) もやめた
+- 手本の Linux のまちがい udp-cork-dst (下の表): つないだ UDP で、ほかのあて先へ MSG_MORE でためはじめると、それを出した
+  あとも、あて先なしの write や send がためたときのあて先へ行く (Linux の udp_sendmsg は、つないだものの近道で
+  inet->cork.fl をそのまま使い、cork.fl はためはじめたときのあて先のまま)。Linux で、つないだ UDP の q に MSG_MORE で z へ
+  1 バイト、つづけて 4096 バイト (ここで出る)、そのあと write で 5000 バイト送ると、z が 4097 と 5000 を受け、つないだ相手は
+  なにも受けない。aios はつないだ相手が 5000 を受ける
+
+あわせて sysdiff.c は、case の終わりに開いている TCP を SO_LINGER 0 (RST) で閉じる: TIME_WAIT (60 秒) がのこると、あとの
+case が乱数の口 (UDP がもらった口) へ TCP を bind したときに、たまたま EADDRINUSE になる (300 case を続けて動かすと 1 つ
+出た。その case だけ動かすと同じ)。これで ext4 の 10301〜10600 と tmpfs の 10001〜10300 (op 150) は 300 case が同じ。
+
 ### マウントの番号と st_dev (/proc/PID/mountinfo、statx の STATX_MNT_ID)
 
 systemd、findmnt、psutil、コンテナの道具は、マウントを /proc/self/mountinfo で知り、statx の stx_mnt_id と
@@ -4383,7 +4407,7 @@ Linux の中では Linux がまだちがうか (`test/linux-vm.sh exec latest` �
 | select-ebadf | select と pselect6 で、nfds までに開いていない fd のビットがあれば、どの番号でも EBADF | fd の表の大きさ (はじめは 64、開いた数で増える) より先のビットは見ずにすてる (fd 40 は EBADF、fd 1000 は 0) | POSIX は、開いていない fd があれば EBADF と決めている。答えが fd の表の大きさ (いままでに開いた数) で変わらない。select(2) の BUGS にある。ロボットは select を使わないので test/chosen.c が確かめる |
 | lock-deadlock | fcntl のレコードロック (POSIX どうし) の行きどまりを、輪の長さによらず EDEADLK にする (待っているものの数だけたどる) | 11 たどるとやめる (MAX_DEADLK_ITERATIONS)。13 より多い持ち主の輪は見のがし、みないつまでも待つ | 行きどまりを見つけるのに、長さの決まりはいらない (待っているものは 1 つずつしか待たないので、数だけたどれば止まる)。fcntl(2) の BUGS にある。aios は前は 10 までで、Linux より 1 つ短かった。test/chosen.c が 13 のプロセスの輪で確かめる |
 | recvmmsg-timeout | recvmmsg の timeout は呼び出しの締め切り: 受けとりで眠るのはそこまで (ソケットの SO_RCVTIMEO と早いほう)。時間切れで、受けたものがあればその数、なければ EAGAIN。待つのは Linux と同じく 1 つずつ (MSG_WAITFORONE なら 2 つ目から待たない)、残りの時間を timeout に書きもどすのも同じ | datagram を受けたあとにしか timeout を見ない。vlen より少なければシグナルが来るまで待つ (timeout 0.3 秒で 1 つも来なくても) | timeout を渡すのは、そこまでで返ってほしいから。recvmmsg(2) の BUGS にある。前の aios は timeout を見ず、2 つ目からいつも待たなかった (Linux とちがう)。test/chosen.c が 3 つのうち 2 つで確かめる |
-| send-notconn | 一度もつないでいない TCP (listen しているもの、connect にしくじったもの、AF_UNSPEC で切ったものも) へ send / write すると ENOTCONN (SIGPIPE はなし)。つないだあとで閉じられたものは Linux と同じ EPIPE と SIGPIPE | どちらも EPIPE と SIGPIPE (sk_stream_wait_connect) | POSIX は、つながっていないソケットは ENOTCONN、もうつながっていないものは EPIPE と分けている。Linux でも AF_UNIX の stream は ENOTCONN で、TCP だけがちがう (send(2) の BUGS)。FreeBSD も ENOTCONN。つないでいないソケットに書くまちがいで、プロセスが SIGPIPE で落ちない。ロボットは Linux で、EPIPE のとき TCP_INFO の送った segment の数 (tcpi_segs_out。dport と同じく、connect にしくじるか AF_UNSPEC で切ると 0 にもどる) が 0 なら ENOTCONN にしてまねる。ノンブロッキングの connect が RST でしくじり、そのエラーをあとの send や recv が受けとったものは tcp_disconnect を通らず segs_out が 0 にもどらないので、CLOSE で受けた segment が 1 つまで (RST だけ) のものも (2026-11-23。aios も、SYN_SENT で RST や時間切れを受けたら dport を 0 にもどす: 前は connect でしくじったときだけで、あとで知ったものは EPIPE だった)。書く前からソケットにエラーが残っていた (POLLERR) ものはまねない: つながっていたものが RST を受けて CLOSE になったあと AF_UNSPEC で切っても、エラー (CLOSE_WAIT で受けた RST の EPIPE など) は残り、Linux も aios もまずそれを返す。inetpair と accept で作ったもの (一度
+| send-notconn | 一度もつないでいない TCP (listen しているもの、connect にしくじったもの、AF_UNSPEC で切ったものも) へ send / write すると ENOTCONN (SIGPIPE はなし)。つないだあとで閉じられたものは Linux と同じ EPIPE と SIGPIPE | どちらも EPIPE と SIGPIPE (sk_stream_wait_connect) | POSIX は、つながっていないソケットは ENOTCONN、もうつながっていないものは EPIPE と分けている。Linux でも AF_UNIX の stream は ENOTCONN で、TCP だけがちがう (send(2) の BUGS)。FreeBSD も ENOTCONN。つないでいないソケットに書くまちがいで、プロセスが SIGPIPE で落ちない。ロボットは Linux で、EPIPE のとき TCP_INFO の送った segment の数 (tcpi_segs_out。AF_UNSPEC で切ると 0 にもどる) が 0 なら ENOTCONN にしてまねる。ノンブロッキングの connect が RST でしくじり、そのエラーをあとの send や recv が受けとったものは tcp_disconnect を通らず segs_out が 0 にもどらないので、CLOSE で受けた segment が 1 つまで (RST だけ) のものも (2026-11-23。aios は「一度つながったか」をソケットの印で見る: ESTABLISHED になったら立て、AF_UNSPEC の connect で下ろす。前は相手のポートで見ていたので、つながったあと RST で閉じて bind しなおしたもの (相手のポートが 0 にもどる) も ENOTCONN だった)。書く前からソケットにエラーが残っていた (POLLERR) ものはまねない: つながっていたものが RST を受けて CLOSE になったあと AF_UNSPEC で切っても、エラー (CLOSE_WAIT で受けた RST の EPIPE など) は残り、Linux も aios もまずそれを返す。inetpair と accept で作ったもの (一度
 つないだもの。AF_UNSPEC の connect で外す) もまねない: accept した側は何も送らずにつながるので、RST で閉じたあとも
 segs_out が 0 のまま (2026-11-23、種 10151)。test/chosen.c も確かめる |
 | apparmor-inet | AppArmor の network_v9 の af_inet を名のり、`network inet stream ip=127.0.0.1 port=8080,` や `peer=(ip=... port=...)` の番地の決まりを効かせる (読みかたは apparmor_parser の決まりの形と Ubuntu のカーネルの af_inet.c と同じ。特権の port、deny の決まり、自分の番地の条件のない peer の決まりの 3 つは、Ubuntu の読みかたのまちがいをなおした: 上の「AF_INET」) | af_inet を名のらないので、apparmor_parser が ip= と port= を落として (inet, type) の決まりにする (allow は広く許し、deny は広く止める)。af_inet.c は番地を記録に書くだけ | 書いた決まりのとおりに効く (書いたよりも多く許さない、多く止めない)。パーサも Ubuntu のカーネルもこの決まりを持っていて、Linux の本体にまだ入っていないだけ。ロボットは AppArmor を見ないので、test/apparmor.c が両方でたしかめる (aios は番地の答え、Linux は広がった決まりの答えと、features に af_inet がないこと) |
@@ -4404,6 +4428,7 @@ segs_out が 0 のまま (2026-11-23、種 10151)。test/chosen.c も確かめ�
 | zero-range-eof | ext4 の fallocate ZERO_RANGE で、範囲がファイルの終わりをこえ、終わりのブロックがもうディスクにあると、そのブロックの中 (ファイルの終わりまで) が 0 にならない。7.2.11 の ext4_alloc_file_blocks が、大きさをのばすときに ext4_block_zero_eof で終わりのブロックの残りを 0 にするが、それが ZERO_RANGE で落としたばかりのページを読みもどす。7.3 にもある。6.18 にはない (delalloc でまだディスクにないブロックなら 0 になる。ロボットの並びではめったに起きず、ブロックにそろった ZERO_RANGE を fsync と fadvise DONTNEED のあとにすると出る) | ZERO_RANGE がうまくいったら、範囲のうちファイルの終わりまでを PUNCH_HOLE で 0 にする |
 | efault-extend | ファイルの終わりより先への write / pwrite / pwritev2 がさわれない入れ物で EFAULT になっても、ファイルがその位置まで伸びる (ext4 も tmpfs も: generic_perform_write が write_begin のあとに写し、0 バイトでも write_end が i_size を pos にする) | 6.18、7.2.11、7.3 | なにも書けなかったのだから伸びない (aios はそう) |
 | unix-oob-inq | AF_UNIX の stream で、MSG_OOB の 1 バイトを SO_OOBINLINE なしに読みとばす (ふつうの read や recv が、印のところの OOB の skb を読まずに捨てる) と、FIONREAD (SIOCINQ) の数がそのぶん多いままになる (manage_oob が skb を外して捨てるが、unix_inq_len が使う inq_len を減らさない) | 7.3 と 7.4 | 読めないバイトを数えるのはまちがい (aios は減らす)。読む op の前に印 (SIOCATMARK) にいて、あとで印でなくなったら読みとばした数をソケットごとに覚え、FIONREAD の数から引く (印は両方で) |
+| udp-cork-dst | つないだ UDP で、ほかのあて先へ MSG_MORE でためはじめる (sendto や sendmsg であて先をつけて) と、それを出したあとも、あて先なしの送り (write、send) がつないだ相手でなく、そのためたときのあて先へ行く (udp_sendmsg のつないだものの近道は、経路の覚え (sk_dst_check) があると inet->cork.fl をそのまま使い、cork.fl はためはじめたときのあて先のまま。つなぎなおすまで続く) | 7.4-rc4 | あて先なしの送りは、つないだ相手へ行くのが正しい (connect(2))。UDP のソケットごとに、ためているかと、ためはじめたときのあて先を覚え (両方で)、ためていないときにあて先なしで送る op の前に、あて先がつないだ相手とちがえば、Linux ではつなぎなおして cork.fl を相手にもどす (つなぎなおしは cork.fl を書きかえるだけ) |
 | tmpfs-extend | tmpfs で、写し (mmap) でファイルの終わりの先 (同じページの中) に書いたものが、ファイルを伸ばすと (ftruncate、fallocate、終わりより先への write) そのまま中身になる (shmem_setattr と shmem_write_end はページの終わりの先を 0 にしない。ext4 は pagecache_isize_extended で 0 にする) | 7.2.11 と 7.3 | POSIX は伸ばしたところは 0 と読めると決めている (ftruncate(2)、write(2))。伸ばした op のあとで、前の終わりからそのページの終わり (op が書いたところの手前) までに 0 を書く (aios は ext4 でも tmpfs でも 0) |
 
 #### Linux よりよくできそうなところ (候補)

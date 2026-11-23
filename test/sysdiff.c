@@ -311,6 +311,7 @@ static const struct {
     {"zero-range-eof", "ext4 の fallocate ZERO_RANGE で、範囲がファイルの終わりをこえ、終わりのブロックがもうディスクにあると、そのブロックの中 (ファイルの終わりまで) が 0 にならない (7.2.11 と 7.3: ext4_alloc_file_blocks の ext4_block_zero_eof が、落としたばかりのページを読みもどす。6.18 は 0 になる)"},
     {"efault-extend", "ファイルの終わりより先への書きこみがさわれない入れ物で EFAULT になっても、ファイルがその位置まで伸びる (ext4 も tmpfs も。6.18、7.2.11、7.3: generic_perform_write が write_begin のあとに写し、0 バイトでも write_end (ext4_da_do_write_end、shmem_write_end) が i_size を pos にする)。なにも書けなかったのだから伸びないのが正しい"},
     {"unix-oob-inq", "AF_UNIX の stream で、MSG_OOB の 1 バイトを SO_OOBINLINE なしに読みとばす (ふつうの read や recv が読まずに捨てる) と、FIONREAD の数がそのぶん多いままになる (7.3 と 7.4: manage_oob が skb を外すが inq_len を減らさない)。読めないバイトを数えるのはまちがい"},
+    {"udp-cork-dst", "つないだ UDP で、ほかのあて先へ MSG_MORE でためはじめる (sendto や sendmsg であて先をつけて) と、それを出したあとも、あて先なしの送り (write、send) がつないだ相手でなく、そのためたときのあて先へ行く (7.4-rc4: udp_sendmsg のつないだものの近道は、経路の覚え (sk_dst_check) があると inet->cork.fl をそのまま使い、cork.fl はためはじめたときのあて先のまま)。あて先なしの送りは、つないだ相手へ行くのが正しい (connect(2))"},
     {"tmpfs-extend", "tmpfs で、写し (mmap) でファイルの終わりの先 (同じページの中) に書いたものが、ファイルを伸ばすと (ftruncate、fallocate、終わりより先への write) そのまま中身になる (7.2.11 と 7.3: shmem_setattr と shmem_write_end はページの終わりの先を 0 にしない。ext4 は pagecache_isize_extended で 0 にする)。POSIX は、伸ばしたところは 0 と読めると決めている"},
 };
 
@@ -320,6 +321,42 @@ static struct {
     ino_t ino;
     int n;
 } oobskip[16];
+
+// linuxbug udp-cork-dst: UDP のソケット (inode ごと) で、ためているか (MSG_MORE: Linux の up->pending) と、cork の流れ
+// (Linux の inet->cork.fl) のあて先 (sin_family 0 ならつないだ相手のまま)。両方で、op の答えから
+struct ucork {
+    ino_t ino;
+    int pending;
+    struct sockaddr_in dst;
+};
+static struct ucork ucork[16];
+
+static ino_t udp_ino(int fd) {
+    struct stat st;
+    int dom = 0, typ = 0;
+    socklen_t l = sizeof dom;
+    if (fd < 0 || fstat(fd, &st) != 0 || !S_ISSOCK(st.st_mode) || getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &dom, &l) != 0 || dom != AF_INET)
+        return 0;
+    l = sizeof typ;
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &typ, &l) != 0 || typ != SOCK_DGRAM)
+        return 0;
+    return st.st_ino;
+}
+
+static struct ucork *ucork_of(ino_t ino, int add) {
+    if (!ino)
+        return NULL;
+    for (int k = 0; k < 16; k++)
+        if (ucork[k].ino == ino)
+            return &ucork[k];
+    for (int k = 0; add && k < 16; k++)
+        if (ucork[k].ino == 0) {
+            memset(&ucork[k], 0, sizeof ucork[k]);
+            ucork[k].ino = ino;
+            return &ucork[k];
+        }
+    return NULL;
+}
 
 static ino_t unix_stream_ino(int fd) {
     struct stat st;
@@ -369,8 +406,8 @@ static int wfd = -1;
 // 先に返す (つながっていたものが RST を受けて CLOSE になり、AF_UNSPEC で切ってもエラーは残る: EPIPE はそのエラー)
 static int wfd_err;
 
-// fd が一度もつないでいない TCP か: aios は dport が 0 のもの (connect していない、listen しているもの、connect に
-// しくじったもの、AF_UNSPEC で切ったもの: Linux の inet_dport と同じ)。Linux では、それと同じく 0 にもどる TCP_INFO の
+// fd が一度もつないでいない TCP か: aios はつながったことのないもの (connect していない、listen しているもの、connect に
+// しくじったもの、AF_UNSPEC で切ったもの)。Linux では、tcp_disconnect で 0 にもどる TCP_INFO の
 // 送った segment の数 (tcpi_segs_out。SYN も送っていない) で見る。ノンブロッキングの connect が RST だけを受けて
 // しくじり、そのエラーを後の send や recv が持っていったものは tcp_disconnect を通らず segs_out が 0 にもどらないので、
 // CLOSE で受けた segment が 1 つまで (tcpi_segs_in: RST だけ。つながったものは SYN-ACK と RST で 2 つ) のものも
@@ -431,10 +468,18 @@ static void tcp_disconnected(int fd) {
         tcp_was[k] = 0;
 }
 
+// op の答え (ret が覚える。linuxbug udp-cork-dst が op のあとで見る)
+static int ret_set;
+static long ret_r;
+static int ret_e;
+
 static void ret(long r) {
     // chosen send-notconn: 一度もつないでいない TCP へ書くと、aios は ENOTCONN。Linux は EPIPE なので ENOTCONN にしてまねる。
     // しらべる getsockopt が errno を変えないように (書く先がソケットでなければ ENOTSOCK になる)
     int e = errno;
+    ret_set = 1;
+    ret_r = r;
+    ret_e = e;
     if (r < 0 && wfd >= 0 && !wfd_err && e == (on_aios ? ENOTCONN : EPIPE) && fresh_tcp(wfd) && tcp_slot(wfd, 0) < 0) {
         errno = ENOTCONN;
         say(" = ENOTCONN [chosen send-notconn]");
@@ -2927,6 +2972,12 @@ static void sockexec(int i, const struct op *o, int fd) {
         ret(r);
         if (o->kind == CONNECT && r == 0 && ((struct sockaddr *)&a)->sa_family == AF_UNSPEC)
             tcp_disconnected(fd);
+        // linuxbug udp-cork-dst: つなぐと cork の流れは新しい相手に (Linux の ip4_datagram_connect)
+        if (o->kind == CONNECT && r == 0) {
+            struct ucork *u = ucork_of(udp_ino(fd), 0);
+            if (u)
+                u->dst.sin_family = 0;
+        }
         break;
     }
     case LISTEN:
@@ -3158,6 +3209,47 @@ static void sockexec(int i, const struct op *o, int fd) {
     }
 }
 
+// linuxbug udp-cork-dst: つないだ UDP へ、あて先なし・ためずに・cmsg なしで送る op の前に、cork の流れのあて先が
+// つないだ相手とちがうままか (見たら、流れは相手にもどったことにする)
+static int udp_cork_stale(int fd, const struct op *o) {
+    if (o->kind == SEND && (o->d1 >= 0 || o->x == 1 || o->mode || (sflv[o->y] & (MSG_MORE | MSG_OOB))))
+        return 0;
+    struct ucork *u = ucork_of(udp_ino(fd), 0);
+    struct sockaddr_in p;
+    socklen_t pl = sizeof p;
+    if (!u || u->pending || u->dst.sin_family != AF_INET || getpeername(fd, (struct sockaddr *)&p, &pl) != 0)
+        return 0;
+    u->dst.sin_family = 0;
+    return p.sin_addr.s_addr != u->dst.sin_addr.s_addr || p.sin_port != u->dst.sin_port;
+}
+
+// linuxbug udp-cork-dst: 書く op のあと、ためはじめたか (そのときのあて先も)、ためたものを出したか捨てたか
+static void udp_cork_after(int fd, const struct op *o, long r, int e) {
+    int more = o->kind == SEND && (sflv[o->y] & MSG_MORE);
+    struct ucork *u = ucork_of(udp_ino(fd), more && r >= 0);
+    if (!u)
+        return;
+    if (u->pending) {
+        // 足して出した (MSG_MORE ならためたまま)。足せなければ捨てる (Linux の udp_flush_pending_frames)。足す前に返す
+        // もの (64 KiB をこえる、MSG_OOB) はためたまま
+        if (r >= 0)
+            u->pending = more;
+        else if ((o->kind == SEND || o->kind == WRITE || o->kind == WRITEV) && e != EOPNOTSUPP && !(e == EMSGSIZE && o->len > 0xffff))
+            u->pending = 0;
+    } else if (more && r >= 0) {
+        // ためはじめた: 流れのあて先はつけたもの (0.0.0.0 は 127.0.0.1 に)、なければつないだ相手
+        u->pending = 1;
+        u->dst.sin_family = 0;
+        if (o->d1 >= 0) {
+            struct sockaddr_un a;
+            mkaddr(o->d1, 0, &a);
+            memcpy(&u->dst, &a, sizeof u->dst);
+            if (u->dst.sin_addr.s_addr == 0)
+                u->dst.sin_addr.s_addr = htonl(0x7f000001);
+        }
+    }
+}
+
 static void exec(int i, const struct op *o) {
     long r = 0;
     struct stat st;
@@ -3190,6 +3282,17 @@ static void exec(int i, const struct op *o) {
         struct pollfd q = {.fd = wfd};
         wfd_err = poll(&q, 1, 0) == 1 && (q.revents & POLLERR);
     }
+    // linuxbug udp-cork-dst: Linux は、つないだ UDP へあて先なしに (ためずに) 送ると、前に MSG_MORE でためはじめたときの
+    // あて先へ送ってしまう (cork の流れのまま)。そうなる op の前に (印は両方で)、Linux ではつなぎなおして流れを相手にもどす
+    // (ためていないときだけ: つなぎなおしは流れを書きかえるだけで、ほかに見えるものはない)
+    int ucfix = wfd >= 0 && udp_cork_stale(wfd, o);
+    if (ucfix && !on_aios && !raw) {
+        struct sockaddr_in p;
+        socklen_t pl = sizeof p;
+        if (getpeername(wfd, (struct sockaddr *)&p, &pl) == 0)
+            connect(wfd, (struct sockaddr *)&p, pl);
+    }
+    ret_set = 0;
     switch (o->kind) {
     case SOCKET:
     case SOCKPAIR:
@@ -4329,6 +4432,10 @@ static void exec(int i, const struct op *o) {
     }
     if (o->kind == TRUNCATE && xfd >= 0)
         close(xfd);
+    if (wfd >= 0 && ret_set)
+        udp_cork_after(wfd, o, ret_r, ret_e);
+    if (ucfix)
+        say(" [linuxbug udp-cork-dst]");
     // linuxbug unix-oob-inq: 印にいたのに、読んだあと印でなくなった (MSG_OOB の 1 バイトを読みとばした)
     if (umark && !at_mark(fd)) {
         int *sk = oobskip_of(uino, 1);
@@ -4471,6 +4578,22 @@ static void setup(void) {
         _exit(2);
 }
 
+// 終わりに開いている TCP は RST で閉じる (SO_LINGER 0): TIME_WAIT (60 秒) をのこさない。のこると、あとの case が乱数の口
+// (UDP がもらった口など) へ TCP を bind したとき、たまたま EADDRINUSE になる (その case だけ動かしても出ない)
+static void tcp_abort_all(void) {
+    for (int f = 3; f < 1024; f++) {
+        int typ = 0, dom = 0;
+        socklen_t l = sizeof typ;
+        if (getsockopt(f, SOL_SOCKET, SO_TYPE, &typ, &l) != 0 || typ != SOCK_STREAM)
+            continue;
+        l = sizeof dom;
+        if (getsockopt(f, SOL_SOCKET, SO_DOMAIN, &dom, &l) != 0 || (dom != AF_INET && dom != AF_INET6))
+            continue;
+        struct linger lg = {1, 0};
+        setsockopt(f, SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+    }
+}
+
 static void child(const char *w, int n, const unsigned char *keep) {
     // 自分のセッションを作り、op はその中の別のグループの子が動かす: 孤児のプロセスグループの決まり (止めるシグナルを
     // 捨てるか) が、ロボットを動かすところ (端末、init) によらず同じになるように。子の終わりかたをそのまま伝える
@@ -4525,6 +4648,7 @@ static void child(const char *w, int n, const unsigned char *keep) {
     say("world");
     flush();
     listdir(".", 0);
+    tcp_abort_all();
     _exit(0);
 }
 

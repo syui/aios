@@ -371,7 +371,8 @@ static void inherit(void) {
   read(fd, &v1, 8);
   printf(", without inherit %d", v1 - v0 < 30000000);
   close(fd);
-  // enable_on_exec: 子は exec の前に 30 ms 走り、exec したプログラムで 40 ms 走る
+  // enable_on_exec: 子は exec の前に 100 ms 走り、exec したプログラムで 40 ms 走る (前のものが入れば 140 ms をこえる。
+  // ほかのテストといっしょで遅い VM でも、exec と 40 ms は 100 ms より下)
   int pp[2];
   pipe(pp);
   c = fork();
@@ -379,7 +380,7 @@ static void inherit(void) {
     char b;
     close(pp[1]);
     read(pp[0], &b, 1);
-    spin(30);
+    spin(100);
     execl("/proc/self/exe", "perf", "--spin", (char *)0);
     _exit(9);
   }
@@ -394,8 +395,8 @@ static void inherit(void) {
   waitpid(c, &st, 0);
   uint64_t r[2] = {0};
   long n = read(fd, r, sizeof r);
-  printf(", enable_on_exec: open %s, read %ld, counted after exec %d (not before %d), exit %d\n", fd >= 0 ? "ok" : "no", n, r[0] >= 35000000, r[0] < 65000000, WEXITSTATUS(st));
-  bad |= !(r[0] >= 35000000 && r[0] < 65000000);
+  printf(", enable_on_exec: open %s, read %ld, counted after exec %d (not before %d), exit %d\n", fd >= 0 ? "ok" : "no", n, r[0] >= 35000000, r[0] < 100000000, WEXITSTATUS(st));
+  bad |= !(r[0] >= 35000000 && r[0] < 100000000);
   close(fd);
 }
 

@@ -1825,7 +1825,8 @@ impl OpenFile {
                 pos = 2;
             }
         }
-        if !full && pos != DIR_OFFSET_EOD {
+        // 終わりの位置かその先 (lseek で) は読まない (Linux の offset_readdir: ctx->pos < DIR_OFFSET_EOD のときだけ)
+        if !full && pos < DIR_OFFSET_EOD {
             let r = dir.readdir_offsets(pos, &mut |off, name, ino, mode| {
                 pos = off;
                 if put(out, ino, name, mode, off) {
