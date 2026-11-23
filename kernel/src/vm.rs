@@ -2399,10 +2399,10 @@ impl PageTable {
             if at.is_some_and(|a| a < s || a >= v.end) {
                 continue;
             }
-            let (pgoff, dev, ino) = match &v.back {
-                Backing::File { off, ino, .. } => (*off as u64, crate::vfs::fs_dev(ino.id().0), ino.meta().ino),
-                Backing::Pages { off, .. } => (*off as u64, (0, 0), 0),
-                Backing::Anon => (s as u64, (0, 0), 0),
+            let (pgoff, dev, ino, file) = match &v.back {
+                Backing::File { off, ino, .. } => (*off as u64, crate::vfs::fs_dev(ino.id().0), ino.meta().ino, Some(ino.clone())),
+                Backing::Pages { off, .. } => (*off as u64, (0, 0), 0, None),
+                Backing::Anon => (s as u64, (0, 0), 0, None),
             };
             let name = match v.name.as_deref() {
                 Some(f) => alloc::format!("/{}", f.trim_start_matches('/')),
@@ -2412,7 +2412,7 @@ impl PageTable {
                 None if s == n.vvar && n.vvar != 0 => "[vvar]".into(),
                 None => "//anon".into(),
             };
-            out.push(MapRec { start: s, end: v.end, prot: v.prot, shared: v.shared, pgoff, name, dev, ino });
+            out.push(MapRec { start: s, end: v.end, prot: v.prot, shared: v.shared, pgoff, name, dev, ino, file });
         }
         out
     }
@@ -4375,6 +4375,8 @@ pub struct MapRec {
     pub name: alloc::string::String,
     pub dev: (u32, u32),
     pub ino: u64,
+    /// 写したファイル (perf の build id を読む)
+    pub file: Option<crate::vfs::InodeRef>,
 }
 
 /// ページ表のテーブルのページの数 (根もふくむ。/proc/meminfo の PageTables)

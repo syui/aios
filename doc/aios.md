@@ -1008,6 +1008,12 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   動かし、あふれるたびに 1 減らして、0 になったら止めて POLL_HUP (Linux の __perf_event_overflow)。数えるだけのものと inherit
   のものは EINVAL。テストはページフォルトで (ブレークポイントは、シグナルで 1 命令越えが切れて同じところでまた当たる: arm64
   の Linux も同じ)
+- perf の MMAP2 の build id (test/perf6.c、Linux 7.4-rc3 と 10 行同じ): attr.build_id と mmap2 なら、写したファイルが ELF
+  (実行ファイルか共有ライブラリ) で NT_GNU_BUILD_ID があれば、maj / min / ino / ino_generation のかわりに build id の大きさ
+  (1 バイトと 3 バイトの 0) と 20 バイト (のこりは 0)、PERF_RECORD_MISC_MMAP_BUILD_ID (0x4000) の印 (Linux の
+  perf_event_mmap_output と lib/buildid.c)。ファイルのはじめの ELF ヘッダからプログラムヘッダの PT_NOTE を読む (写した
+  ところがはじめでなくても)。無名のもの、ELF でないものはふつうの maj / min / ino。mmap2 なしの build_id は何もしない
+  (vm::MapRec に写したファイル)
 - atime (test/atime.c、root で ext4 と tmpfs とマウントの印で Linux と 5 行同じ): 前は持たなかった (stat の atime は mtime、
   utimensat の atime は捨てていた)。いまは ext4 は inode の i_atime (秒)、tmpfs は自分の属性に持ち、stat と statx に出す。
   utimensat は atime も決め、ctime をいまに (Linux の notify_change。前は ctime を変えなかった)。読んだら (read、pread、

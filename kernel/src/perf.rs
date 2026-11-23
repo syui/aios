@@ -128,6 +128,7 @@ const B_EXCLUDE_CALLCHAIN_KERNEL: u32 = 21;
 const B_USE_CLOCKID: u32 = 25;
 const B_NAMESPACES: u32 = 28;
 const B_TEXT_POKE: u32 = 33;
+const B_BUILD_ID: u32 = 34;
 const B_INHERIT_THREAD: u32 = 35;
 const B_REMOVE_ON_EXEC: u32 = 36;
 const B_SIGTRAP: u32 = 37;
@@ -974,7 +975,9 @@ fn mmap_record(ev: &Event, r: &crate::vm::MapRec, name: &str) {
     let Some(rb) = rb else { return };
     let me = proc::current();
     let l = crate::ns::local_or_0;
-    let misc = MISC_USER | if exec { 0 } else { MISC_MMAP_DATA };
+    // build id (attr.build_id と mmap2: Linux の build_id_parse。あれば maj / min / ino のかわりに)
+    let bid = if ev.bit(B_MMAP2) && ev.bit(B_BUILD_ID) { r.file.as_ref().and_then(build_id) } else { None };
+    let misc = MISC_USER | if exec { 0 } else { MISC_MMAP_DATA } | if bid.is_some() { MISC_MMAP_BUILD_ID } else { 0 };
     let mut v = header(if ev.bit(B_MMAP2) { REC_MMAP2 } else { REC_MMAP }, misc);
     put32(&mut v, l(me.tgid));
     put32(&mut v, l(me.pid));
@@ -982,10 +985,15 @@ fn mmap_record(ev: &Event, r: &crate::vm::MapRec, name: &str) {
     put64(&mut v, (r.end - r.start) as u64);
     put64(&mut v, r.pgoff);
     if ev.bit(B_MMAP2) {
-        put32(&mut v, r.dev.0);
-        put32(&mut v, r.dev.1);
-        put64(&mut v, r.ino);
-        put64(&mut v, 0);
+        if let Some((n, id)) = bid {
+            v.extend_from_slice(&[n, 0, 0, 0]);
+            v.extend_from_slice(&id);
+        } else {
+            put32(&mut v, r.dev.0);
+            put32(&mut v, r.dev.1);
+            put64(&mut v, r.ino);
+            put64(&mut v, 0);
+        }
         put32(&mut v, r.prot as u32);
         put32(&mut v, if r.shared { 1 } else { 2 });
     }
@@ -999,6 +1007,49 @@ fn mmap_record(ev: &Event, r: &crate::vm::MapRec, name: &str) {
     }
     fix_size(&mut v);
     rb.output(ev, &v, false, Rc::as_ptr(&read_event(ev)) as usize + 1);
+}
+
+/// MMAP2 の印: maj / min / ino のかわりに build id (Linux の PERF_RECORD_MISC_MMAP_BUILD_ID)
+const MISC_MMAP_BUILD_ID: u16 = 0x4000;
+
+/// ELF の NT_GNU_BUILD_ID (Linux の lib/buildid.c: ファイルのはじめの ELF ヘッダから、プログラムヘッダの PT_NOTE を見る。
+/// 実行ファイルか共有ライブラリだけ)。(大きさ, 20 バイト (のこりは 0))
+fn build_id(ino: &crate::vfs::InodeRef) -> Option<(u8, [u8; 20])> {
+    let rd = |off: usize, n: usize| -> Option<Vec<u8>> {
+        let mut b = alloc::vec![0u8; n];
+        (ino.read_at(off, &mut b).ok()? == n).then_some(b)
+    };
+    let eh = rd(0, 64)?;
+    // \x7fELF、64 ビット、ET_EXEC か ET_DYN
+    if eh[..4] != *b"\x7fELF" || eh[4] != 2 || !matches!(u16::from_le_bytes([eh[16], eh[17]]), 2 | 3) {
+        return None;
+    }
+    let phoff = le64(&eh, 32) as usize;
+    let phentsize = u16::from_le_bytes([eh[54], eh[55]]) as usize;
+    let phnum = u16::from_le_bytes([eh[56], eh[57]]) as usize;
+    for i in 0..phnum.min(64) {
+        let ph = rd(phoff + i * phentsize, 56)?;
+        // PT_NOTE
+        if u32::from_le_bytes(ph[..4].try_into().ok()?) != 4 {
+            continue;
+        }
+        let (off, size) = (le64(&ph, 8) as usize, (le64(&ph, 32) as usize).min(4096));
+        let notes = rd(off, size)?;
+        let mut o = 0;
+        while o + 12 <= notes.len() {
+            let w = |k: usize| u32::from_le_bytes(notes[o + k..o + k + 4].try_into().unwrap()) as usize;
+            let (namesz, descsz, typ) = (w(0), w(4), w(8));
+            let desc = o + 12 + namesz.next_multiple_of(4);
+            // NT_GNU_BUILD_ID (3)、名前は "GNU"
+            if typ == 3 && namesz == 4 && notes.get(o + 12..o + 16) == Some(b"GNU\0") && descsz > 0 && descsz <= 20 && desc + descsz <= notes.len() {
+                let mut id = [0u8; 20];
+                id[..descsz].copy_from_slice(&notes[desc..desc + descsz]);
+                return Some((descsz as u8, id));
+            }
+            o = desc + descsz.next_multiple_of(4);
+        }
+    }
+    None
 }
 
 // ---- 輪とサンプル (Linux の kernel/events/ring_buffer.c と perf_output_sample) ----
