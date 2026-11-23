@@ -1763,7 +1763,8 @@ fn stream_recv(u: &UnixRef, max: usize, flags: u64, nonblock: bool) -> Result<Re
 }
 
 /// MSG_OOB で受ける (Linux の unix_stream_recv_urg): OOB の 1 バイト。なければ (と SO_OOBINLINE なら) EINVAL。
-/// 名前も付帯データもない。入れ物がなければ、読んだうえで EFAULT
+/// 名前も付帯データもない。入れ物の長さが 0 なら、読んで (なくして) 1 を返す (Linux の __skb_datagram_iter の short_copy:
+/// 入れ物がいっぱいなのはまちがいではない)。さわれない入れ物は、読んだうえで EFAULT (写すときに)
 fn recv_urg(u: &UnixRef, max: usize, flags: u64) -> Result<Recv, i64> {
     let peek = flags & MSG_PEEK != 0;
     let mut dropped = Freed::default();
@@ -1790,12 +1791,10 @@ fn recv_urg(u: &UnixRef, max: usize, flags: u64) -> Result<Recv, i64> {
     if !peek {
         notify(u);
     }
-    if max == 0 {
-        return Err(-EFAULT);
-    }
     let mut out = Recv::new();
     out.data = byte.map(|b| alloc::vec![b]).unwrap_or_default();
     out.ret = out.data.len();
+    out.data.truncate(max);
     out.scm = false;
     out.flags = MSG_OOB as u32;
     Ok(out)
