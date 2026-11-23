@@ -1187,7 +1187,7 @@ pub fn rt_sigtimedwait(set: usize, info: usize, timeout: usize) -> R {
         let mut b = [0u8; 16];
         proc::current().pt().copy_in(&mut b, timeout).ok_or(-EFAULT)?;
         let ns = u64::from_le_bytes(b[..8].try_into().unwrap()) * 1_000_000_000 + u64::from_le_bytes(b[8..].try_into().unwrap());
-        crate::timer::ticks_after(ns)
+        crate::timer::uptime_ns().saturating_add(ns).max(1)
     };
     loop {
         let p = proc::current();
@@ -1197,11 +1197,11 @@ pub fn rt_sigtimedwait(set: usize, info: usize, timeout: usize) -> R {
             }
             return Ok(sig as i64);
         }
-        if timeout != 0 && crate::timer::ticks() >= deadline {
+        if timeout != 0 && crate::timer::uptime_ns() >= deadline {
             return Err(-EAGAIN_);
         }
         p.sigwait = set;
-        let r = proc::sleep_until(0, deadline);
+        let r = proc::sleep_until_ns(0, deadline);
         proc::current().sigwait = 0;
         r?;
     }

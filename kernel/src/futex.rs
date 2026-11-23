@@ -345,7 +345,7 @@ fn begin_wait() {
 fn sleep(ids: &[Ticket], deadline: u64) -> Result<u32, i64> {
     let me = my_slot();
     let r = loop {
-        let r = proc::sleep_until(chan(me), deadline);
+        let r = proc::sleep_until_ns(chan(me), deadline);
         let w = t().woken[me];
         if w != 0 {
             break Ok(w - 1);
@@ -366,7 +366,7 @@ fn sleep(ids: &[Ticket], deadline: u64) -> Result<u32, i64> {
 // ---- 時間 ----
 
 /// 待つ時間 (Linux の futex_init_timeout): FUTEX_WAIT は相対、LOCK_PI は CLOCK_REALTIME の時刻、ほかは時刻
-/// (CLOCK_REALTIME の印がなければ CLOCK_MONOTONIC)。tick の期限 (0 は過ぎている) にして返す
+/// (CLOCK_REALTIME の印がなければ CLOCK_MONOTONIC)。起動からの ns の期限 (0 は過ぎている) にして返す
 fn deadline(cmd: u64, op: u64, ts: usize) -> Result<Option<u64>, i64> {
     if ts == 0 {
         return Ok(None);
@@ -391,7 +391,7 @@ fn deadline(cmd: u64, op: u64, ts: usize) -> Result<Option<u64>, i64> {
     if rel == 0 {
         return Ok(Some(0));
     }
-    Ok(Some(crate::timer::ticks_after(rel)))
+    Ok(Some(crate::timer::uptime_ns().saturating_add(rel).max(1)))
 }
 
 // ---- システムコール ----

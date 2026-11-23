@@ -1169,11 +1169,11 @@ fn sys_clock_gettime(clk: u64, ts: usize) -> R {
     Ok(0)
 }
 
-/// clock_getres: 壁と起動からの時計は tick、CPU の時計 (SCHED) は 1 ns。ts は NULL でもよい
+/// clock_getres: 壁と起動からの時計と CPU の時計 (SCHED) は 1 ns、COARSE は tick。ts は NULL でもよい
 fn sys_clock_getres(clk: u64, ts: usize) -> R {
     let c = timer::clock_of(clk as i32, false)?;
     if ts != 0 {
-        out(ts, &timespec(timer::clock_res(c)))?;
+        out(ts, &timespec(timer::clock_res(c, clk as i32)))?;
     }
     Ok(0)
 }
@@ -2712,13 +2712,13 @@ fn sys_nanosleep(clock: u64, flags: u64, req: usize, rem: usize) -> R {
     let want = read_valid_timespec(req)?;
     let now_ns = || if matches!(clock as i32, 0 | 8 | 11) { timer::epoch_ns() } else { timer::uptime_ns() };
     let rel = if flags & TIMER_ABSTIME != 0 { want.saturating_sub(now_ns()) } else { want };
-    let until = timer::ticks_after(rel);
-    while timer::ticks() < until {
+    // 期限は起動からの ns (tick の境めでなく、そのときに起きる: proc::sleep_until_ns)
+    let until = timer::uptime_ns().saturating_add(rel).max(1);
+    while timer::uptime_ns() < until {
         // chan 0 は誰も起こさないので、期限まで眠る
-        if let Err(e) = proc::sleep_until(0, until) {
+        if let Err(e) = proc::sleep_until_ns(0, until) {
             if rem != 0 && flags & TIMER_ABSTIME == 0 {
-                let left = (until - timer::ticks().min(until)) * 1_000_000_000 / timer::HZ;
-                out(rem, &timespec(left))?;
+                out(rem, &timespec(until.saturating_sub(timer::uptime_ns())))?;
             }
             return Err(e);
         }

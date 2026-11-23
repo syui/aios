@@ -242,10 +242,12 @@ pub fn clock_ns(c: Clock) -> Result<u64, i64> {
     })
 }
 
-/// 時計の細かさ (ns): CPU の SCHED は 1、ほかは tick (Linux も高精度タイマがなければ tick)
-pub fn clock_res(c: Clock) -> u64 {
+/// 時計の細かさ (ns: Linux の hrtimer_resolution と LOW_RES_NSEC): 壁と起動からの時計は 1 (眠りの期限は timer::hr_arm で
+/// その時刻に鳴らす)、COARSE (clk 5、6) は tick、CPU の SCHED は 1、ほかの CPU の時計は tick
+pub fn clock_res(c: Clock, clk: i32) -> u64 {
     match c {
         Clock::Cpu { which: 2, .. } => 1,
+        Clock::Real | Clock::Mono if !matches!(clk, 5 | 6) => 1,
         _ => TICK_NS,
     }
 }
@@ -273,7 +275,17 @@ pub fn idle(on: bool) {
         return;
     }
     if on {
-        HR[crate::smp::id()].store(0, Ordering::Relaxed);
+        // 精しい期限 (眠りの期限や perf) が先にあれば、tick は止めてもそのときだけ鳴らす
+        let cpu = crate::smp::id();
+        let h = HR[cpu].load(Ordering::Relaxed);
+        if h != 0 && h > counter() {
+            unsafe {
+                core::arch::asm!("msr cntv_cval_el0, {}", in(reg) h);
+                core::arch::asm!("msr cntv_ctl_el0, {}", in(reg) 1u64);
+            }
+            return;
+        }
+        HR[cpu].store(0, Ordering::Relaxed);
         unsafe { core::arch::asm!("msr cntv_ctl_el0, {}", in(reg) 0u64) };
     } else {
         rearm();

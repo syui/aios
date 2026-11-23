@@ -713,7 +713,11 @@ fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>, esr: u64) {
             let mut real_tick = false;
             let mut pmu = false;
             match id {
-                timer::IRQ => real_tick = timer::tick(),
+                timer::IRQ => {
+                    real_tick = timer::tick();
+                    // 精しい期限の眠り (nanosleep など): tick でも期限だけのものでも
+                    proc::wake_expired_ns(timer::uptime_ns());
+                }
                 // CPU の PMU のあふれ (PPI: pmu.rs が番号を置く)
                 id if id != 0 && id == proc::PMU_IRQ.load(core::sync::atomic::Ordering::Relaxed) => pmu = true,
                 // ほかの CPU から: EL0 へ戻る前に、殺されたか、シグナルが来たかを見るだけ

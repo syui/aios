@@ -3754,7 +3754,7 @@ pub fn ppoll(fds: usize, nfds: usize, tmo: usize) -> R {
         let mut ts = [0u8; 16];
         proc::current().pt().copy_in(&mut ts, tmo).ok_or(-EFAULT)?;
         let ns = u64::from_le_bytes(ts[..8].try_into().unwrap()) * 1_000_000_000 + u64::from_le_bytes(ts[8..].try_into().unwrap());
-        Some(crate::timer::ticks_after(ns))
+        Some(crate::timer::uptime_ns().saturating_add(ns))
     };
     // 見張るものの印 (どれかわからないものがあれば、何でも起こしてもらう)
     let mut keys = Some(alloc::vec::Vec::new());
@@ -3769,7 +3769,7 @@ pub fn ppoll(fds: usize, nfds: usize, tmo: usize) -> R {
         }
     }
     // 待つかもしれないなら、見ているパイプに印 (タイムアウト 0 のぞき見はつけない)
-    let _watch = (!deadline.is_some_and(|d| d <= crate::timer::ticks())).then(|| {
+    let _watch = (!deadline.is_some_and(|d| d <= crate::timer::uptime_ns())).then(|| {
         let files = proc::current().files();
         let fs: alloc::vec::Vec<FileRef> = (0..nfds)
             .filter_map(|i| {
@@ -3819,12 +3819,12 @@ pub fn ppoll(fds: usize, nfds: usize, tmo: usize) -> R {
                 count += 1;
             }
         }
-        let expired = deadline.is_some_and(|d| crate::timer::ticks() >= d);
+        let expired = deadline.is_some_and(|d| crate::timer::uptime_ns() >= d);
         if count > 0 || expired {
             out(fds, &raw)?;
             return Ok(count);
         }
-        proc::poll_sleep(keys.clone(), deadline.unwrap_or(0))?;
+        proc::poll_sleep_ns(keys.clone(), deadline.unwrap_or(0))?;
     }
 }
 
@@ -3853,7 +3853,7 @@ pub fn pselect6(nfds: usize, rd: usize, wr: usize, ex: usize, tmo: usize) -> R {
         let mut ts = [0u8; 16];
         proc::current().pt().copy_in(&mut ts, tmo).ok_or(-EFAULT)?;
         let ns = u64::from_le_bytes(ts[..8].try_into().unwrap()) * 1_000_000_000 + u64::from_le_bytes(ts[8..].try_into().unwrap());
-        Some(crate::timer::ticks_after(ns))
+        Some(crate::timer::uptime_ns().saturating_add(ns))
     };
     let mut keys = Some(alloc::vec::Vec::new());
     for i in 0..nfds {
@@ -3865,7 +3865,7 @@ pub fn pselect6(nfds: usize, rd: usize, wr: usize, ex: usize, tmo: usize) -> R {
             }
         }
     }
-    let _watch = (!deadline.is_some_and(|d| d <= crate::timer::ticks())).then(|| {
+    let _watch = (!deadline.is_some_and(|d| d <= crate::timer::uptime_ns())).then(|| {
         let files = proc::current().files();
         let fs: alloc::vec::Vec<FileRef> = (0..nfds).filter(|&i| bit(&want_r, i) || bit(&want_w, i) || bit(&want_e, i)).filter_map(|i| files.get(i as u64).cloned()).collect();
         file::PollWatch::new(fs.iter())
@@ -3907,7 +3907,7 @@ pub fn pselect6(nfds: usize, rd: usize, wr: usize, ex: usize, tmo: usize) -> R {
                 count += 1;
             }
         }
-        let expired = deadline.is_some_and(|d| crate::timer::ticks() >= d);
+        let expired = deadline.is_some_and(|d| crate::timer::uptime_ns() >= d);
         if count > 0 || expired {
             for (va, b) in [(rd, &got_r), (wr, &got_w), (ex, &got_e)] {
                 if va != 0 {
@@ -3916,7 +3916,7 @@ pub fn pselect6(nfds: usize, rd: usize, wr: usize, ex: usize, tmo: usize) -> R {
             }
             return Ok(count);
         }
-        proc::poll_sleep(keys.clone(), deadline.unwrap_or(0))?;
+        proc::poll_sleep_ns(keys.clone(), deadline.unwrap_or(0))?;
     }
 }
 

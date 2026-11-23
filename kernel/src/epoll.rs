@@ -234,7 +234,8 @@ pub fn pwait(epfd: i64, events: usize, max: i64, timeout_ns: Option<u64>) -> Res
         return Err(crate::why::inval());
     }
     let ep = epoll_of(epfd)?;
-    let deadline = timeout_ns.map(crate::timer::ticks_after);
+    // 期限は起動からの ns (proc::sleep_until_ns: tick の境めでなく、そのときに起きる)
+    let deadline = timeout_ns.map(|ns| crate::timer::uptime_ns().saturating_add(ns));
     loop {
         let got = {
             let _p = crate::prof::span("epoll:collect");
@@ -249,7 +250,7 @@ pub fn pwait(epfd: i64, events: usize, max: i64, timeout_ns: Option<u64>) -> Res
             proc::current().pt().copy_out(events, &buf).ok_or(-EFAULT)?;
             return Ok(got.len() as i64);
         }
-        if deadline.is_some_and(|d| crate::timer::ticks() >= d) {
+        if deadline.is_some_and(|d| crate::timer::uptime_ns() >= d) {
             return Ok(0);
         }
         // 見張っているものの印 (と、epoll_ctl で起こしなおすためのこの epoll の場所) で眠る。
@@ -258,7 +259,7 @@ pub fn pwait(epfd: i64, events: usize, max: i64, timeout_ns: Option<u64>) -> Res
         // (借りたまま眠らないように、印は先に)
         let _p = crate::prof::span("epoll:sleep");
         let keys = ep.borrow().keys(Rc::as_ptr(&ep) as usize);
-        proc::poll_sleep(keys, deadline.unwrap_or(0))?;
+        proc::poll_sleep_ns(keys, deadline.unwrap_or(0))?;
     }
 }
 

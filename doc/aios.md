@@ -1075,6 +1075,15 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   time_short、time_mult と time_shift、57 ビットの time_mask: Linux の arch_perf_update_userpage) も。
   まだないもの: CPU ごとの (pid -1) PMU のもの、カウンタが足りないときの回し (multiplex)、rdpmc (ユーザーから読む)、
   ACPI の機械の PMU (armv8_pmuv3_0)
+- tick より細かい眠り (test/hrsleep.c、Linux 7.4-rc3 (HIGH_RES_TIMERS) と 12 行同じ。test/cpuclock.c も 47 行同じに):
+  前は眠りの期限がみな tick (10 ms) で、nanosleep(300 us) も poll(1 ms) も 10 ms 待っていた。いまは nanosleep、
+  clock_nanosleep (TIMER_ABSTIME も)、poll、ppoll、select、epoll_wait、epoll_pwait2、futex の待ち (と PI ロック)、
+  sigtimedwait の期限を起動からの ns で持ち (proc::sleep_until_ns: Proc::wake_ns。wake_at は切り上げた tick で念の
+  ため)、眠る CPU のタイマをその時刻にも鳴らす (timer::hr_arm)。タイマの割り込みのたびに (tick でも期限だけのもの
+  でも、どの CPU でも) 期限の来たものを起こし、まだのもののいちばん近いもので鳴らしなおす (proc::wake_expired_ns。
+  精しい期限で眠るものがなければ見ない)。仕事のない CPU も、期限があればタイマを止めずにそのときだけ鳴らす。
+  clock_getres は REALTIME、MONOTONIC、MONOTONIC_RAW、BOOTTIME、TAI が 1 ns (Linux の hrtimer_resolution)、COARSE は
+  tick。まだ tick のもの: timerfd、POSIX タイマー、itimer、ソケットの SO_RCVTIMEO、端末の VTIME ほか
 - atime (test/atime.c、root で ext4 と tmpfs とマウントの印で Linux と 5 行同じ): 前は持たなかった (stat の atime は mtime、
   utimensat の atime は捨てていた)。いまは ext4 は inode の i_atime (秒)、tmpfs は自分の属性に持ち、stat と statx に出す。
   utimensat は atime も決め、ctime をいまに (Linux の notify_change。前は ctime を変えなかった)。読んだら (read、pread、

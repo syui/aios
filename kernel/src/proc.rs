@@ -731,6 +731,8 @@ pub struct Proc {
     pub last_sp: u64,
     /// この tick になったら起こす (0 なら無し)
     pub wake_at: u64,
+    /// 精しい期限 (起動からの ns。0 は無し: sleep_until_ns。wake_at はそれを切り上げた tick で、念のため)
+    pub wake_ns: u64,
     /// ソケットの受けとりで眠るときの締め切り (tick、0 なら無し。recvmmsg の timeout: socket::mmsg がおく)
     pub recv_deadline: u64,
     /// 眠りの待ち行列のつなぎ (chan のもの、期限つきのもの)
@@ -881,6 +883,7 @@ impl Proc {
         last_regs: [0; 3],
         last_sp: 0,
         wake_at: 0,
+        wake_ns: 0,
         recv_deadline: 0,
         wq: Link::NONE,
         tm: Link::NONE,
@@ -2201,6 +2204,74 @@ pub fn sleep_until(chan: usize, deadline: u64) -> Result<bool, i64> {
     Ok(!timed_out)
 }
 
+/// 精しい期限で眠っているものの数 (0 ならタイマの割り込みで見ない)
+pub static HR_SLEEPERS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// chan で起こされるか、起動からの deadline ns (0 なら無し) まで眠る。時間切れなら Ok(false)。tick の境めでなく、
+/// この CPU のタイマを期限にも鳴らして起きる (Linux の hrtimer: nanosleep、poll、select、epoll、futex、sigtimedwait)
+pub fn sleep_until_ns(chan: usize, deadline: u64) -> Result<bool, i64> {
+    if deadline == 0 {
+        return sleep_until(chan, 0);
+    }
+    let p = current();
+    if p.killed || crate::signal::deliverable(p) {
+        return Err(-EINTR);
+    }
+    p.chan = chan;
+    p.wake_at = deadline.div_ceil(crate::timer::TICK_NS).max(1);
+    p.wake_ns = deadline;
+    p.state = State::Sleeping;
+    p.slept_at = crate::timer::ticks();
+    crate::debug::trace_sleep(chan);
+    wq_enter();
+    HR_SLEEPERS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let now = crate::timer::uptime_ns();
+    if deadline > now {
+        crate::timer::hr_arm(deadline - now);
+    }
+    sched();
+    wq_exit();
+    HR_SLEEPERS.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+    let p = current();
+    p.chan = 0;
+    let timed_out = crate::timer::uptime_ns() >= p.wake_ns;
+    (p.wake_at, p.wake_ns) = (0, 0);
+    if p.killed || crate::signal::deliverable(p) {
+        return Err(-EINTR);
+    }
+    Ok(!timed_out)
+}
+
+/// poll / select / epoll で眠る: keys (見張っているものの印) のどれかが poll_wake されるか、何でも起こす
+/// wakeup(poll_chan) か、起動からの deadline ns (0 は無し) まで
+pub fn poll_sleep_ns(keys: Option<Vec<usize>>, deadline: u64) -> Result<bool, i64> {
+    current().poll_keys = keys;
+    let r = sleep_until_ns(poll_chan(), deadline);
+    current().poll_keys = None;
+    r
+}
+
+/// タイマの割り込みから (どの CPU でも): 精しい期限の来たものを起こし、まだのもののいちばん近いものでこの CPU の
+/// タイマを鳴らす (tick より前なら)
+pub fn wake_expired_ns(now: u64) {
+    if HR_SLEEPERS.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+        return;
+    }
+    wake_list(TIMED, |p| &mut p.tm, |p| p.wake_ns != 0 && p.wake_ns <= now);
+    let mut next = u64::MAX;
+    let mut i = HEADS.get()[TIMED];
+    while i != NONE {
+        let p = &procs()[i as usize];
+        if p.state == State::Sleeping && p.wake_ns > now {
+            next = next.min(p.wake_ns);
+        }
+        i = p.tm.next;
+    }
+    if next != u64::MAX && next - now < crate::timer::TICK_NS {
+        crate::timer::hr_arm(next - now);
+    }
+}
+
 /// ソケットの受けとりで眠るときの期限: d (tick、0 は無し。SO_RCVTIMEO から) と、いまのスレッドの受けとりの締め切り
 /// (recv_deadline) の早いほう
 pub fn recv_deadline(d: u64) -> u64 {
@@ -2293,15 +2364,6 @@ static POLL: u8 = 0;
 /// poll で待っている人が眠る channel。何かの状態が変わったらここを起こす
 pub fn poll_chan() -> usize {
     (&raw const POLL) as usize
-}
-
-/// poll / select で眠る: keys (見張っているものの印) のどれかが poll_wake されるか、
-/// 何でも起こす wakeup(poll_chan) か、deadline まで
-pub fn poll_sleep(keys: Option<Vec<usize>>, deadline: u64) -> Result<bool, i64> {
-    current().poll_keys = keys;
-    let r = sleep_until(poll_chan(), deadline);
-    current().poll_keys = None;
-    r
 }
 
 /// pidfd を poll で見張るときの印: どれかのプロセスが終わると起こす
