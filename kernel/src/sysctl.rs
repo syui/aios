@@ -174,6 +174,7 @@ pub static TABLE: &[Entry] = &[
     Entry { path: "kernel/perf_event_max_stack", get: || crate::perf::knob_get(3), set: Some(|s| crate::perf::knob_set(3, s)) },
     Entry { path: "kernel/perf_cpu_time_max_percent", get: || crate::perf::knob_get(4), set: Some(|s| crate::perf::knob_set(4, s)) },
     Entry { path: "kernel/perf_event_max_contexts_per_stack", get: || crate::perf::knob_get(5), set: Some(|s| crate::perf::knob_set(5, s)) },
+    Entry { path: "kernel/perf_user_access", get: || crate::perf::knob_get(6), set: Some(|s| crate::perf::knob_set(6, s)) },
     Entry {
         path: "kernel/uname",
         get: || match crate::ns::uname() {

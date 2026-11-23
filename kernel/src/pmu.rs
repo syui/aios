@@ -297,6 +297,27 @@ fn write_raw(idx: u32, v: u64) {
     }
 }
 
+/// ユーザー (EL0) からカウンタを読ませるか (PMUSERENR_EL0 の ER と CR: Linux の armv8pmu_enable_user_access)。読ませる
+/// ときは、used にないカウンタを 0 にする (ほかのスレッドの数を見せない)
+pub fn user_access(on: bool, used: u64) {
+    const ER: u64 = 1 << 3;
+    const CR: u64 = 1 << 2;
+    if !present() {
+        return;
+    }
+    if on {
+        let mask = counters_mask() & !used;
+        for i in 0..64 {
+            if mask >> i & 1 != 0 {
+                write_raw(i, 0);
+            }
+        }
+        msr!("pmuserenr_el0", ER | CR);
+    } else {
+        msr!("pmuserenr_el0", 0);
+    }
+}
+
 /// カウンタの値 (Linux の armv8pmu_read_counter: つないだものは上と下、bias は下の 32 ビット)
 pub fn read(idx: u32, hw: &Hw) -> u64 {
     if hw.chained(idx) {

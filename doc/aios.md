@@ -1073,7 +1073,22 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   ものはカウンタの半分)、あふれは PMU の割り込み (EL0 で鳴ったらすぐサンプル、EL1 なら次に EL0 の tick か止まった
   ところで)。QEMU (TCG) の cycles は 1 ns に 1。mmap の頭のページには arm64 の時刻の変換 (cap_user_time、time_zero、
   time_short、time_mult と time_shift、57 ビットの time_mask: Linux の arch_perf_update_userpage) も。
-  まだないもの: CPU ごとの (pid -1) PMU のもの、rdpmc (ユーザーから読む)、ACPI の機械の PMU (armv8_pmuv3_0)
+  まだないもの: ACPI の機械の PMU (armv8_pmuv3_0)
+- rdpmc (ユーザーから PMU のカウンタを読む。test/rdpmc.c、root で Linux 7.4-rc3 と 6 行同じ): /proc/sys/kernel/perf_user_access
+  (0 か 1。Linux の arm64 と同じく既定 0)。config1:1 (rdpmc) のもの (スレッドのものだけ: CPU ごとのものは EINVAL) は、mmap
+  のページの cap_user_rdpmc を 1、pmc_width を 64 ビットのものは 64、ほかは 32 に (perf_user_access によらない: Linux の
+  arch_perf_update_userpage)。カウンタに入れたときと出したときに、ページの lock を 2 つ進めるあいだに index (カウンタの
+  番号 + 1。PMCCNTR は 32) と offset (ユーザーは offset とカウンタを pmc_width で符号をのばして足す: 32 ビットのものの
+  bias も) を書く (Linux の perf_event_update_userpage)。perf_user_access が 1 で rdpmc のものがカウンタにいるあいだは
+  PMUSERENR_EL0 の ER と CR を立て、使わないカウンタは 0 にする (Linux の armv8pmu_enable_user_access: ほかのスレッドの
+  数を見せない)。出すときは外す
+- CPU ごとの PMU のもの (pid -1、cpu >= 0: perf stat -a と perf record -a の cycles。test/pmucpu.c、root で Linux 7.4-rc3 と
+  7 行同じ): 前は CPU ごとのものはソフトウェアのものだけで、PMU のものは 0 のままだった。いまはその CPU でスレッドが走る
+  あいだ、スレッドのものより先にカウンタに入れ (Linux の順: CPU の pinned、タスクの pinned、CPU の flexible、タスクの
+  flexible)、スレッドが切りかわるたびに読んで足す (HW_RUNS の鍵はスレッドの番号のかわりに CPU: cpu_key)。読むときは、
+  その CPU なら、いまのカウンタの差も (ほかの CPU のものは、その CPU で前に切りかわったときまで: Linux は IPI でその CPU に
+  読ませる)。あふれはその CPU のものとして、走っているスレッドのサンプルに (perf record -a)。開いたとき・有効にしたときは、
+  いまの CPU のものならすぐカウンタに。ちがい: 仕事のない CPU (idle) では数えない (exclude_kernel なら Linux も同じ)
 - PMU のカウンタが足りないときの回し (multiplex。test/perfmux.c、Linux 7.4-rc3 と 6 行同じ): 前はスレッドが走りはじめる
   ときにイベントを 1 つずつ空いたカウンタに入れ、入らないものは数えないまま time_running は time_enabled と同じだった
   (perf stat の見積もりがくるう)。グループのメンバーも、入ったものだけ数えていた。いまは Linux の merge_sched_in と

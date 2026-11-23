@@ -189,15 +189,18 @@ static MLOCK_KB: AtomicI32 = AtomicI32::new(516);
 static MAX_STACK: AtomicI32 = AtomicI32::new(127);
 static CPU_TIME_MAX_PERCENT: AtomicI32 = AtomicI32::new(25);
 static MAX_CONTEXTS_PER_STACK: AtomicI32 = AtomicI32::new(8);
+/// PMU のカウンタをユーザーから読ませるか (Linux の arm64 の perf_user_access: 1 なら rdpmc のもののスレッドに PMUSERENR)
+static USER_ACCESS: AtomicI32 = AtomicI32::new(0);
 
 /// sysctl.rs の表から: (名前、値)
-pub static KNOBS: [(&str, &AtomicI32, i32, i32); 6] = [
+pub static KNOBS: [(&str, &AtomicI32, i32, i32); 7] = [
     ("perf_event_paranoid", &PARANOID, i32::MIN, i32::MAX),
     ("perf_event_max_sample_rate", &MAX_SAMPLE_RATE, 1, i32::MAX),
     ("perf_event_mlock_kb", &MLOCK_KB, i32::MIN, i32::MAX),
     ("perf_event_max_stack", &MAX_STACK, 0, 640 * 1024),
     ("perf_cpu_time_max_percent", &CPU_TIME_MAX_PERCENT, 0, 100),
     ("perf_event_max_contexts_per_stack", &MAX_CONTEXTS_PER_STACK, 0, 1000),
+    ("perf_user_access", &USER_ACCESS, 0, 1),
 ];
 
 pub fn knob_get(i: usize) -> alloc::string::String {
@@ -375,6 +378,9 @@ impl Event {
 
     /// CPU ごとのものの、その CPU の今の数 (時計のものは now: 経った時間)
     fn source_cpu(&self, now: u64) -> u64 {
+        if let Some(hw) = &self.hw {
+            return hw_count_cpu(self.id, hw, self.cpu as usize);
+        }
         let user = !self.bit(B_EXCLUDE_USER);
         let kernel = !self.bit(B_EXCLUDE_KERNEL);
         let n = |k: usize| proc::CPU_SW[self.cpu as usize][k].load(Relaxed);
@@ -458,7 +464,8 @@ impl Event {
         let members = self.members();
         // PMU のもので、いまのスレッドのもの: 先にカウンタを読んで止める (グループのものを同じ時刻で写す)。あとで入れなおす
         let me = proc::current();
-        let hw = (self.hw.is_some() || members.iter().any(|m| m.hw.is_some())) && (self.tracks(me.pid) || members.iter().any(|m| m.tracks(me.pid))) && !me.kthread;
+        let here = |e: &Event| e.tracks(me.pid) || (e.per_cpu() && e.cpu as usize == crate::smp::id());
+        let hw = (self.hw.is_some() || members.iter().any(|m| m.hw.is_some())) && (here(self) || members.iter().any(|m| here(m))) && !me.kthread;
         if hw {
             hw_sched_out(me);
         }
@@ -845,9 +852,12 @@ impl PerfFile {
         // arm64 の時刻 (Linux の arch_perf_update_userpage: sched_clock は CPU のタイマ): cap_user_time、time_zero、
         // time_short と、カウンタの値を ns にする mult と shift (time_zero は 0: uptime_ns はカウンタ 0 から)、time_mask
         // (57 ビット: Linux の arch_counter_get_width)、time_offset
+        // rdpmc (config1:1) のものは cap_user_rdpmc と pmc_width (64 ビットのものは 64、ほかは 32: Linux の
+        // arch_perf_update_userpage。ユーザーが読めるかは perf_user_access で、走るときに決まる)
         let (mult, shift) = clock_mult_shift(crate::timer::freq());
-        rb.put_hdr(40, 2 | 1 << 3 | 1 << 4 | 1 << 5);
-        rb.put_hdr(48, (shift as u64) << 16 | (mult as u64) << 32);
+        let width = ev.hw.filter(|h| h.rdpmc).map_or(0, |h| if h.long { 64 } else { 32 });
+        rb.put_hdr(40, 2 | ((width != 0) as u64) << 2 | 1 << 3 | 1 << 4 | 1 << 5);
+        rb.put_hdr(48, width | (shift as u64) << 16 | (mult as u64) << 32);
         rb.put_hdr(56, 0u64.wrapping_sub(crate::timer::uptime_ns()));
         rb.put_hdr(64, 0);
         rb.put_hdr32(72, 96);
@@ -857,6 +867,10 @@ impl PerfFile {
         rb.put_hdr(1048, size);
         let pages = rb.pages.clone();
         *ev.rb.borrow_mut() = Some(rb);
+        // いまカウンタにいれば、その番号と offset も
+        if let Some(r) = HW_RUNS.get().get(&(ev.id, proc::current().pid)) {
+            hw_userpage(ev, r);
+        }
         Ok(crate::vm::Backing::Pages { pages, off: 0, hold: Some(fr.clone()) })
     }
 
@@ -1248,7 +1262,7 @@ fn open(uattr: usize, pid: i32, cpu: i32, group_fd: i32, flags: u64) -> R {
     }
     if ev.hw.is_some() {
         proc::PERF_HW.fetch_add(1, Relaxed);
-        if ev.active() && ev.tracks(me.pid) {
+        if ev.active() && (ev.tracks(me.pid) || (ev.per_cpu() && ev.cpu as usize == crate::smp::id())) {
             hw_reload();
         }
     }
@@ -1766,6 +1780,41 @@ fn hw_count(id: u64, hw: &crate::pmu::Hw, t: &Proc) -> u64 {
     }
 }
 
+/// rdpmc のもののユーザーのページ (Linux の perf_event_update_userpage): lock を 2 つ進めるあいだに、index (カウンタの番号 + 1。
+/// カウンタにいなければ 0) と offset (ユーザーは offset とカウンタを pmc_width で符号をのばして足す)
+fn hw_userpage(ev: &Event, r: &HwRun) {
+    let Some(hw) = ev.hw.filter(|h| h.rdpmc) else { return };
+    let rb = ev.rb.borrow();
+    let Some(rb) = rb.as_ref() else { return };
+    let width = if hw.long { 64 } else { 32 };
+    let sext = |v: u64| if width == 64 { v } else { v as u32 as i32 as i64 as u64 };
+    let (index, offset) = match r.idx {
+        Some(idx) => (idx + 1, r.acc.wrapping_sub(sext(r.prev))),
+        None => (0, r.acc),
+    };
+    let lock = rb.hdr(8) as u32;
+    rb.put_hdr32(8, lock.wrapping_add(1));
+    rb.put_hdr32(12, index);
+    rb.put_hdr(16, offset);
+    rb.put_hdr32(8, lock.wrapping_add(2));
+}
+
+/// CPU ごとの PMU のもの (pid -1、cpu >= 0) の HW_RUNS の鍵 (スレッドの番号のかわり)
+fn cpu_key(cpu: usize) -> u32 {
+    0x8000_0000 | cpu as u32
+}
+
+/// CPU ごとの PMU のものの数 (この CPU のものでいまカウンタにいれば、いまのカウンタの差も。ほかの CPU のものは、その CPU で
+/// 前にスレッドが切りかわったときまで: Linux は IPI でその CPU に読ませる)
+fn hw_count_cpu(id: u64, hw: &crate::pmu::Hw, cpu: usize) -> u64 {
+    let runs = HW_RUNS.get();
+    let Some(r) = runs.get(&(id, cpu_key(cpu))) else { return 0 };
+    match r.idx {
+        Some(idx) if r.cpu == crate::smp::id() => r.acc.wrapping_add(crate::pmu::read(idx, hw).wrapping_sub(r.prev) & hw.max_period()),
+        _ => r.acc,
+    }
+}
+
 /// カウンタを読んで足す (Linux の armpmu_event_update: のこりも減らす)
 fn hw_update(ev: &Event, hw: &crate::pmu::Hw, r: &mut HwRun, idx: u32) {
     let now = crate::pmu::read(idx, hw);
@@ -1811,11 +1860,24 @@ fn hw_sched_in(p: &Proc) {
     crate::pmu::stop();
     crate::pmu::disable_all();
     let cpu = crate::smp::id();
-    // このスレッドで数える PMU のもの (グループのリーダーごと。ソフトウェアのものはカウンタを使わない)
+    // このスレッドで数える PMU のもの (グループのリーダーごと。ソフトウェアのものはカウンタを使わない)。CPU ごとのもの
+    // (この CPU のもの) は先に (Linux の順: CPU の pinned、タスクの pinned、CPU の flexible、タスクの flexible)
     let mut pinned: Vec<Vec<Rc<Event>>> = Vec::new();
     let mut flexible: Vec<Vec<Rc<Event>>> = Vec::new();
+    let mut cpu_pinned: Vec<Vec<Rc<Event>>> = Vec::new();
+    let mut cpu_flexible: Vec<Vec<Rc<Event>>> = Vec::new();
     for ev in live() {
         if ev.leader().is_some() {
+            continue;
+        }
+        if ev.per_cpu() {
+            if ev.cpu as usize != cpu {
+                continue;
+            }
+            let g: Vec<Rc<Event>> = ev.group().into_iter().filter(|e| e.hw.is_some() && e.active() && e.interrupts.get() != MAX_INTERRUPTS).collect();
+            if !g.is_empty() {
+                if ev.bit(B_PINNED) { cpu_pinned.push(g) } else { cpu_flexible.push(g) }
+            }
             continue;
         }
         let g: Vec<Rc<Event>> = ev
@@ -1837,15 +1899,19 @@ fn hw_sched_in(p: &Proc) {
     let mut can_add = true;
     let mut mux = false;
     let mut any = false;
-    for g in pinned.iter().chain(flexible.iter()) {
+    let mut rdpmc = false;
+    for (g, on_cpu) in cpu_pinned.iter().map(|g| (g, true)).chain(pinned.iter().map(|g| (g, false))).chain(cpu_flexible.iter().map(|g| (g, true))).chain(flexible.iter().map(|g| (g, false))) {
+        let key = if on_cpu { cpu_key(cpu) } else { p.pid };
         let mut u = used;
         let idxs: Option<Vec<u32>> = if can_add { g.iter().map(|e| crate::pmu::get_idx(&mut u, e.hw.as_ref().unwrap())).collect() } else { None };
         let Some(idxs) = idxs else {
             // 入らない: 待つ (time_running は進まない)
             can_add = false;
             mux = true;
-            for ev in g {
-                HW_RUNS.get().entry((ev.id, p.pid)).or_default().off_at.get_or_insert(now);
+            if !on_cpu {
+                for ev in g {
+                    HW_RUNS.get().entry((ev.id, key)).or_default().off_at.get_or_insert(now);
+                }
             }
             continue;
         };
@@ -1854,10 +1920,14 @@ fn hw_sched_in(p: &Proc) {
             let hw = ev.hw.unwrap();
             let (_, v) = hw_set_period(ev, &hw, idx);
             let runs = HW_RUNS.get();
-            let r = runs.entry((ev.id, p.pid)).or_default();
+            let r = runs.entry((ev.id, key)).or_default();
             (r.idx, r.cpu, r.prev, r.on_at) = (Some(idx), cpu, v, now);
             if let Some(o) = r.off_at.take() {
                 r.missed += now.saturating_sub(o);
+            }
+            if hw.rdpmc {
+                rdpmc = true;
+                hw_userpage(ev, r);
             }
             crate::pmu::enable(idx, &hw);
             any = true;
@@ -1871,6 +1941,9 @@ fn hw_sched_in(p: &Proc) {
             HW_ROT.get().remove(&p.pid);
         }
     }
+    // ユーザーからカウンタを読ませる (perf_user_access が 1 で、rdpmc のものがカウンタにいるとき。使わないカウンタは
+    // 0 にする: Linux の armv8pmu_enable_user_access)
+    crate::pmu::user_access(rdpmc && USER_ACCESS.load(Relaxed) == 1, used);
     if any {
         crate::pmu::start();
     }
@@ -1900,7 +1973,8 @@ fn hw_sched_out(p: &Proc) {
     for ev in live() {
         let Some(hw) = ev.hw else { continue };
         let runs = HW_RUNS.get();
-        let Some(r) = runs.get_mut(&(ev.id, p.pid)) else { continue };
+        let key = if ev.per_cpu() { cpu_key(cpu) } else { p.pid };
+        let Some(r) = runs.get_mut(&(ev.id, key)) else { continue };
         if let Some(o) = r.off_at.take() {
             r.missed += now.saturating_sub(o);
         }
@@ -1909,8 +1983,10 @@ fn hw_sched_out(p: &Proc) {
             if r.cpu == cpu {
                 hw_update(&ev, &hw, r, idx);
             }
+            hw_userpage(&ev, r);
         }
     }
+    crate::pmu::user_access(false, 0);
     crate::pmu::disable_all();
 }
 
@@ -1936,7 +2012,8 @@ fn hw_overflow(pid: u32, tf: &crate::trap::TrapFrame) {
         let Some(hw) = ev.hw else { continue };
         let fire = {
             let runs = HW_RUNS.get();
-            let Some(r) = runs.get_mut(&(ev.id, pid)) else { continue };
+            let key = if ev.per_cpu() { cpu_key(cpu) } else { pid };
+            let Some(r) = runs.get_mut(&(ev.id, key)) else { continue };
             let Some(idx) = r.idx.filter(|&i| r.cpu == cpu && bits >> i & 1 != 0) else { continue };
             hw_update(&ev, &hw, r, idx);
             let (ret, v) = hw_set_period(&ev, &hw, idx);
