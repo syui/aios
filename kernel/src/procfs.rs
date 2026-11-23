@@ -1021,9 +1021,8 @@ fn status_text(p: &Proc, threads: usize, sig: &str) -> String {
     s += &format!("NoNewPrivs:\t{}\nSeccomp:\t{}\nSeccomp_filters:\t{}\n", c.no_new_privs as u8, crate::seccomp::mode(c).0, crate::seccomp::mode(c).1);
     s += &format!("Landlock:\t{}\n", crate::landlock::layers(c));
     s += &spec_status(p.spec_ssb);
-    let mask = if cpus >= 64 { u64::MAX } else { (1u64 << cpus) - 1 };
-    let list = if cpus == 1 { "0".to_string() } else { format!("0-{}", cpus - 1) };
-    s += &format!("Cpus_allowed:\t{:x}\nCpus_allowed_list:\t{}\n", mask, list);
+    let mask = (if cpus >= 64 { u64::MAX } else { (1u64 << cpus) - 1 }) & p.affinity;
+    s += &format!("Cpus_allowed:\t{:x}\nCpus_allowed_list:\t{}\n", mask, cpu_list(mask));
     s += &format!("voluntary_ctxt_switches:\t{}\nnonvoluntary_ctxt_switches:\t{}\n", p.nvcsw, p.nivcsw);
     s
 }
@@ -2222,3 +2221,24 @@ fn spec_status(ssb: u8) -> String {
     alloc::format!("Speculation_Store_Bypass:\t{}\nSpeculationIndirectBranch:\tunknown\n", ssb_s)
 }
 
+/// CPU のビットを Linux の並べかたで (0-3,5)
+fn cpu_list(mask: u64) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    while i < 64 {
+        if mask >> i & 1 == 0 {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i + 1 < 64 && mask >> (i + 1) & 1 != 0 {
+            i += 1;
+        }
+        if !out.is_empty() {
+            out.push(',');
+        }
+        out += &if start == i { format!("{}", start) } else { format!("{}-{}", start, i) };
+        i += 1;
+    }
+    out
+}

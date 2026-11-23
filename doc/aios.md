@@ -690,6 +690,15 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   進める (CFS の vruntime と同じ考え): CPU より多い忙しいループで nice 0 と nice 19 は 2435 対 40 tick (Linux の重みは
   1024 対 15)。FIFO / RR / DEADLINE は覚えて答えるだけで、回し方は CFS のまま。/proc/PID/stat の priority・nice・
   rt_priority・policy と /proc/PID/sched の se.load.weight・policy・prio・se.slice も
+- CPU の割りあて (test/affinity.c、4 CPU の Linux 7.4-rc3 と 10 行同じ): sched_setaffinity は前は何もせず 0、
+  sched_getaffinity は pid を見ずに動いている CPU みなを返していた。いまは Proc::affinity (走ってよい CPU のビット。Linux の
+  cpus_mask。fork とスレッドで受けつぎ、exec でも変えない)。get は len が CPU の数より少ないか 8 の倍数でなければ EINVAL、
+  答えは走ってよいもののうち動いている CPU で 8 (cpumask の大きさ)。set は Linux の順 (いないスレッドは ESRCH、持ち主か
+  CAP_SYS_NICE でなければ EPERM、len が短ければその分だけ、動いている CPU がなければ EINVAL)。スケジューラは走れる列が
+  ひとつなので、pick がこの CPU で走ってはいけないものをとばす (idle の CPU も、走ってよいものがなければ眠る)。起こすときは
+  走ってよい CPU のうち眠っているものを (smp::wake_idle_in)、なければ走ってよい CPU のうち一番使っているものにゆずらせる。
+  自分をいまの CPU から外したら、ゆずって走ってよい CPU を起こし、ほかの CPU で走っているスレッドなら、その CPU に
+  EL0 へ戻るときにゆずる印 (Linux の migration_cpu_stop のかわり)。/proc/PID/status の Cpus_allowed と Cpus_allowed_list も
 - 時計を合わせる (test/settime.c、Linux と root でない形 9 行、root の形 15 行同じ): settimeofday、clock_settime、adjtimex、
   clock_adjtime と gettimeofday の tz。Linux と同じ順 (時刻がおかしければ EINVAL、それから CAP_SYS_TIME: tz だけでも
   EPERM、tz は ±15 時間、合わせられるのは CLOCK_REALTIME だけ、CPU の時計は EPERM か EINVAL、clock_adjtime のほかの時計は
@@ -1014,6 +1023,12 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   perf_event_mmap_output と lib/buildid.c)。ファイルのはじめの ELF ヘッダからプログラムヘッダの PT_NOTE を読む (写した
   ところがはじめでなくても)。無名のもの、ELF でないものはふつうの maj / min / ino。mmap2 なしの build_id は何もしない
   (vm::MapRec に写したファイル)
+- perf の CPU ごとのイベント (test/perf7.c、root で Linux 7.4-rc3 と 8 行同じ): pid -1 と cpu >= 0 (perf stat -a、perf top)
+  は、その CPU のみなの数 (proc::CPU_SW: ページフォルト、小さい / 大きいフォルト、切りかえ、ほかの CPU からの移り。自分の
+  CPU のものだけを足す) と、時計 (cpu-clock、task-clock) は有効だった時間。paranoid が 0 より上なら CAP_PERFMON (でなければ
+  EACCES)、ない CPU と pid も cpu も -1 は EINVAL。グループのリーダーは同じ相手 (スレッドか CPU)。CPU ごとのものは相手が
+  終わらない (POLLHUP にならない)。サンプリングは、その CPU で EL0 で鳴った tick とフォルトで。pid と cpu の両方なら、その
+  スレッドがその CPU にいるあいだの差だけ。テストは sched_setaffinity で CPU 0 に固定して (CPU の割りあてが要った)
 - atime (test/atime.c、root で ext4 と tmpfs とマウントの印で Linux と 5 行同じ): 前は持たなかった (stat の atime は mtime、
   utimensat の atime は捨てていた)。いまは ext4 は inode の i_atime (秒)、tmpfs は自分の属性に持ち、stat と statx に出す。
   utimensat は atime も決め、ctime をいまに (Linux の notify_change。前は ctime を変えなかった)。読んだら (read、pread、

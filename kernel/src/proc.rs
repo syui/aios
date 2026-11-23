@@ -557,6 +557,8 @@ pub struct Proc {
     /// CFS のように回す (覚えて答えるだけ)。rt_priority は FIFO / RR の優先度。reset_on_fork は SCHED_RESET_ON_FORK、
     /// slice_ns は sched_setattr の sched_runtime (0 は既定: /proc/PID/sched の se.slice)
     pub nice: i8,
+    /// 走ってよい CPU (sched_setaffinity。ビットごと。fork とスレッドと exec で受けつぐ: Linux の cpus_mask)
+    pub affinity: u64,
     pub policy: u8,
     pub rt_priority: u8,
     pub reset_on_fork: bool,
@@ -779,6 +781,7 @@ impl Proc {
         oom_score_adj_min: 0,
         personality: 0,
         nice: 0,
+        affinity: u64::MAX,
         policy: 0,
         rt_priority: 0,
         reset_on_fork: false,
@@ -1849,10 +1852,15 @@ fn pick(start: usize) -> Option<usize> {
     // (recent, start からの順, 添字)
     let mut best: Option<(u32, usize, usize)> = None;
     let mut i = HEADS.get()[RUNQ];
+    let cpu = crate::smp::id();
     while i != NONE {
         let k = i as usize;
         let p = &procs()[k];
         i = p.rq.next;
+        // この CPU で走ってよいもの (sched_setaffinity)
+        if p.affinity >> cpu & 1 == 0 {
+            continue;
+        }
         // ゆずったものは 1 秒ぶん後ろに (スピンして待つ相手を先に走らせる)
         let key = p.recent + if p.yielded { crate::timer::HZ as u32 } else { 0 };
         let order = (k + NPROC - start) % NPROC;
@@ -1950,6 +1958,7 @@ pub fn scheduler() -> ! {
             // ほかの CPU から移った (Linux の set_task_cpu の nr_migrations。はじめて走るときは数えない)
             if p.nrun > 1 && p.cpu != crate::smp::id() {
                 p.nr_migrations += 1;
+                cpu_sw(4);
             }
             p.cpu = crate::smp::id();
             unsafe {
@@ -2021,7 +2030,7 @@ pub fn scheduler() -> ! {
             }
             // 眠ると印をつけてから確かめる (そのあとに起こす CPU は、印を見て割り込みを送る)
             crate::smp::set_idle(true);
-            if HEADS.get()[RUNQ] != NONE {
+            if runnable_here() {
                 crate::smp::set_idle(false);
                 continue;
             }
@@ -2045,6 +2054,15 @@ pub fn scheduler() -> ! {
     }
 }
 
+/// CPU ごとのソフトウェアの数 (perf の CPU ごとのイベント: 0 ページフォルト、1 小さいフォルト、2 大きいフォルト、
+/// 3 切りかえ、4 ほかの CPU からの移り)。自分の CPU のものだけを足す
+pub static CPU_SW: [[core::sync::atomic::AtomicU64; 5]; crate::smp::MAXCPU] = [const { [const { core::sync::atomic::AtomicU64::new(0) }; 5] }; crate::smp::MAXCPU];
+
+#[inline]
+pub fn cpu_sw(kind: usize) {
+    CPU_SW[crate::smp::id()][kind].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// スケジューラへ戻る。state は呼ぶ側が変えておく
 fn sched() {
     debug_assert!(crate::smp::holding(), "sched without the big kernel lock");
@@ -2055,6 +2073,7 @@ fn sched() {
     } else {
         p.nvcsw += 1;
     }
+    cpu_sw(3);
     let seg = crate::smp::seg_pause();
     let off = crate::debug::prof_off_cpu();
     // ext4 のロックは眠るあいだ手放す (大きなロックと同じく、ほかがそのあいだに ext4 に入れるように)
@@ -2070,8 +2089,36 @@ fn sched() {
 }
 
 pub fn yield_now() {
-    make_runnable(current());
+    let p = current();
+    make_runnable(p);
+    // この CPU で走ってはいけなくなった (sched_setaffinity): 走ってよい CPU を起こす
+    if p.affinity >> crate::smp::id() & 1 == 0 {
+        crate::smp::wake_idle_in(1, p.affinity);
+    }
     sched();
+}
+
+/// RUNQ にこの CPU で走ってよいものがあるか (sched_setaffinity)
+fn runnable_here() -> bool {
+    let cpu = crate::smp::id();
+    let mut i = HEADS.get()[RUNQ];
+    while i != NONE {
+        let p = &procs()[i as usize];
+        if p.affinity >> cpu & 1 != 0 {
+            return true;
+        }
+        i = p.rq.next;
+    }
+    false
+}
+
+/// t の走ってよい CPU が変わった (sched_setaffinity)。ほかの CPU で走っていて、そこがだめになったなら、EL0 へ戻るときに
+/// ゆずらせる (yield_now が走ってよい CPU を起こす。Linux の __set_cpus_allowed_ptr の migration_cpu_stop)
+pub fn affinity_changed(t: &Proc) {
+    if t.state == State::Running && t.affinity >> t.cpu & 1 == 0 && t.cpu != crate::smp::id() {
+        RESCHED.fetch_or(1 << t.cpu, core::sync::atomic::Ordering::AcqRel);
+        crate::smp::kick(t.cpu);
+    }
 }
 
 /// chan で起こされるまで眠る。killed なら Err(-EINTR)
@@ -2170,6 +2217,8 @@ fn wake_chan(chan: usize, f: impl Fn(&Proc) -> bool) -> usize {
 fn wake_list(head: usize, l: fn(&mut Proc) -> &mut Link, f: impl Fn(&Proc) -> bool) -> usize {
     let mut n = 0;
     let mut woken = u32::MAX;
+    // 起こしたものが走ってよい CPU (sched_setaffinity)
+    let mut cpus = 0u64;
     let mut i = HEADS.get()[head];
     while i != NONE {
         let p = &mut procs()[i as usize];
@@ -2180,15 +2229,16 @@ fn wake_list(head: usize, l: fn(&mut Proc) -> &mut Link, f: impl Fn(&Proc) -> bo
             p.woken_ns = crate::timer::uptime_ns();
             crate::debug::trace_wake(p.pid, p.chan);
             woken = woken.min(p.recent);
+            cpus |= p.affinity;
             n += 1;
         }
     }
-    if n > 0 && !crate::smp::wake_idle_n(n) {
+    if n > 0 && !crate::smp::wake_idle_in(n, cpus) {
         // 走っているもの (CPU ごとに 1 つ) のうち一番 CPU を使っているもの
         let mut busiest: Option<(u32, usize)> = None;
         for (cpu, on) in ON_CPU.iter().enumerate().take(crate::smp::online()) {
             let k = on.load(core::sync::atomic::Ordering::Relaxed);
-            if k != 0 {
+            if k != 0 && cpus >> cpu & 1 != 0 {
                 let p = &procs()[k - 1];
                 if p.state == State::Running && busiest.is_none_or(|(r, _)| p.recent > r) {
                     busiest = Some((p.recent, cpu));
@@ -2610,6 +2660,7 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
     // nice と決まりは受けつぐ。SCHED_RESET_ON_FORK なら、実時間は SCHED_OTHER に、負の nice は 0 に、slice は既定に
     // (Linux の sched_fork)
     child.nice = parent.nice;
+    child.affinity = parent.affinity;
     child.policy = parent.policy;
     child.rt_priority = parent.rt_priority;
     child.slice_ns = parent.slice_ns;
@@ -2697,7 +2748,7 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
     drop(_p);
     let _p = crate::debug::span("proc:fork_run");
     make_runnable(child);
-    crate::smp::wake_idle();
+    crate::smp::wake_idle_in(1, child.affinity);
     drop(_p);
     if vfork {
         // PTRACE_EVENT_VFORK は待つ前に (Linux の kernel_clone: ptrace_event_pid のあとで wait_for_vfork_done)
@@ -3215,7 +3266,7 @@ pub fn interrupt(t: &mut Proc) {
     match t.state {
         State::Sleeping if !t.nointr && (!t.killable || t.killed) => {
             make_runnable(t);
-            crate::smp::wake_idle();
+            crate::smp::wake_idle_in(1, t.affinity);
         }
         // ほかの CPU のユーザーモードで走っている: すぐに戻ってきてもらう
         State::Running => crate::smp::kick(t.cpu),

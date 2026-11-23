@@ -16,8 +16,10 @@
 // PERF_RECORD_FORK、EXIT、COMM も。
 // attr.mmap (と mmap2、mmap_data) なら PERF_RECORD_MMAP / MMAP2 (mmap、実行できるようにした mprotect、exec の
 // プログラムの領域: Linux の perf_event_mmap)。
-// まだないもの (todo.json の syscall-gaps): PMU (ハードウェアの数: ENOENT)、MMAP2 の build_id、CPU ごとのもの
-// (cpu >= 0: EOPNOTSUPP。root でないなら Linux と同じ EACCES)
+// CPU ごとのもの (pid -1、cpu >= 0: perf stat -a、perf top。paranoid が 0 より上なら CAP_PERFMON): その CPU のみなの
+// フォルト、切りかえ、移り (proc::CPU_SW) と、時計は有効だった時間。cpu-clock と task-clock とフォルトのサンプリングは、
+// その CPU で EL0 で鳴った tick とフォルトで。pid と cpu の両方なら、そのスレッドがいまその CPU にいるときの差だけ。
+// まだないもの (todo.json の syscall-gaps): PMU (ハードウェアの数: ENOENT)
 use crate::cell::Bkl;
 use crate::file::{self, Kind};
 use crate::hwdebug;
@@ -212,6 +214,9 @@ struct Task {
 struct St {
     /// 有効 (Linux の state >= INACTIVE)
     on: bool,
+    /// CPU ごとのもの: 前に写したときの CPU の数と時刻
+    cpu_c: u64,
+    cpu_t: u64,
     /// 写したところまでの数、有効だった時間、動いた時間
     cnt: u64,
     en: u64,
@@ -244,6 +249,8 @@ pub struct Event {
     rb: RefCell<Option<Rc<Rb>>>,
     /// 数える相手 (はじめのスレッドの本当の番号) と、開いたスレッド (prctl の PR_TASK_PERF_EVENTS_*)
     target: u32,
+    /// CPU (-1 はどこでも)。target が 0 なら CPU ごとのもの
+    cpu: i32,
     owner: u32,
     enable_on_exec: Cell<bool>,
     /// PERF_EVENT_IOC_REFRESH の残り (0 はかぎりなし。0 になったら止まる: Linux の event_limit)
@@ -295,16 +302,52 @@ impl Event {
         }
     }
 
+    /// CPU ごとのものか (数える相手のスレッドがない)
+    fn per_cpu(&self) -> bool {
+        self.target == 0
+    }
+
+    /// CPU ごとのものの、その CPU の今の数 (時計のものは now: 経った時間)
+    fn source_cpu(&self, now: u64) -> u64 {
+        let user = !self.bit(B_EXCLUDE_USER);
+        let kernel = !self.bit(B_EXCLUDE_KERNEL);
+        let n = |k: usize| proc::CPU_SW[self.cpu as usize][k].load(Relaxed);
+        match self.config {
+            SW_CPU_CLOCK | SW_TASK_CLOCK if self.ty == TYPE_SOFTWARE => now,
+            _ if self.ty != TYPE_SOFTWARE => 0,
+            SW_PAGE_FAULTS if user => n(0),
+            SW_PAGE_FAULTS_MIN if user => n(1),
+            SW_PAGE_FAULTS_MAJ if user => n(2),
+            SW_CONTEXT_SWITCHES if kernel => n(3),
+            SW_CPU_MIGRATIONS if kernel => n(4),
+            _ => 0,
+        }
+    }
+
     /// (数、有効だった時間、動いた時間): 写したところまでと、そこからの差
     fn values(&self) -> (u64, u64, u64) {
         let act = self.active();
         let st = self.st.borrow();
         let (mut c, mut e, mut r) = (st.cnt, st.en, st.run);
+        if self.per_cpu() {
+            let now = crate::timer::uptime_ns();
+            let (dc, dt) = (self.source_cpu(now).wrapping_sub(st.cpu_c), now.wrapping_sub(st.cpu_t));
+            if act {
+                c = c.wrapping_add(dc);
+                r += dt;
+            }
+            if st.on {
+                e += dt;
+            }
+            return (c, e, r);
+        }
         for k in &st.tasks {
             let Some(t) = proc::find_thread(k.tid) else { continue };
             let now = proc::cpu_ns(t);
             let (dc, dt) = (self.source(t, now).wrapping_sub(k.c), now.wrapping_sub(k.t));
-            if act {
+            // CPU を決めたもの: スレッドがいまその CPU にいるときの差だけ
+            let here = self.cpu < 0 || t.cpu == self.cpu as usize;
+            if act && here {
                 c = c.wrapping_add(dc);
                 r += dt;
             }
@@ -320,6 +363,11 @@ impl Event {
         let (c, e, r) = self.values();
         let mut st = self.st.borrow_mut();
         (st.cnt, st.en, st.run) = (c, e, r);
+        if self.per_cpu() {
+            let now = crate::timer::uptime_ns();
+            (st.cpu_c, st.cpu_t) = (self.source_cpu(now), now);
+            return;
+        }
         for k in st.tasks.iter_mut() {
             if let Some(t) = proc::find_thread(k.tid) {
                 let now = proc::cpu_ns(t);
@@ -642,7 +690,7 @@ impl file::FileOps for PerfFile {
     /// Linux の perf_poll: 数える相手がもういなければ POLLHUP。輪があれば、起こしの印 (POLLIN) をとって返す。なければ POLLHUP
     fn poll_mask(&self) -> Option<u32> {
         let ev = &self.0;
-        if ev.st.borrow().tasks.is_empty() {
+        if !ev.per_cpu() && ev.st.borrow().tasks.is_empty() {
             return Some(file::POLLHUP);
         }
         Some(ev.rb.borrow().as_ref().map_or(file::POLLHUP, |rb| rb.poll.replace(0)))
@@ -810,8 +858,8 @@ fn open(uattr: usize, pid: i32, cpu: i32, group_fd: i32, flags: u64) -> R {
     if group_fd != -1 {
         let f = me.files().get(group_fd as u32 as u64).cloned().ok_or(-EBADF)?;
         let l = f.borrow().kind.ops::<PerfFile>().ok_or(-EBADF)?;
-        // 数える相手が終わったもの (Linux の PERF_EVENT_STATE_EXIT)
-        if l.0.st.borrow().tasks.is_empty() {
+        // 数える相手が終わったもの (Linux の PERF_EVENT_STATE_EXIT。CPU ごとのものは終わらない)
+        if !l.0.per_cpu() && l.0.st.borrow().tasks.is_empty() {
             return Err(-ENODEV);
         }
         if flags & FLAG_FD_NO_GROUP == 0 {
@@ -888,13 +936,10 @@ fn open(uattr: usize, pid: i32, cpu: i32, group_fd: i32, flags: u64) -> R {
     } else {
         allow_cpu()?;
     }
-    // CPU ごとのものは、まだ
-    if cpu != -1 {
-        return Err(-EOPNOTSUPP);
-    }
-    let task = task.unwrap();
+    // グループのリーダーは、同じ相手 (スレッドか CPU) を数えるもの
+    let target = task.as_ref().map_or(0, |t| t.pid);
     if let Some(l) = &leader {
-        if l.leader().is_some() || l.target != task.pid || b(B_EXCLUSIVE) || b(B_PINNED) {
+        if l.leader().is_some() || l.target != target || (target == 0 && l.cpu != cpu) || b(B_EXCLUSIVE) || b(B_PINNED) {
             return Err(-EINVAL);
         }
         if read_size(read_format, l.members().len() + 1) > 16 * 1024 {
@@ -933,18 +978,23 @@ fn open(uattr: usize, pid: i32, cpu: i32, group_fd: i32, flags: u64) -> R {
         },
         bp_addr,
         rb: RefCell::new(None),
-        target: task.pid,
+        target,
+        cpu,
         owner: me.pid,
         enable_on_exec: Cell::new(b(B_ENABLE_ON_EXEC)),
         limit: Cell::new(0),
-        st: RefCell::new(St { on: false, cnt: 0, en: 0, run: 0, tasks: Vec::new() }),
+        st: RefCell::new(St { on: false, cpu_c: 0, cpu_t: 0, cnt: 0, en: 0, run: 0, tasks: Vec::new() }),
         leader: RefCell::new(leader.as_ref().map(Rc::downgrade)),
         siblings: RefCell::new(Vec::new()),
     });
-    ev.install(task)?;
-    let t = proc::cpu_ns(task);
-    let c = ev.source(task, t);
-    ev.st.borrow_mut().tasks.push(Task { tid: task.pid, c, t });
+    if let Some(task) = task {
+        ev.install(task)?;
+        let t = proc::cpu_ns(task);
+        let c = ev.source(task, t);
+        ev.st.borrow_mut().tasks.push(Task { tid: task.pid, c, t });
+    } else {
+        ev.sync();
+    }
     if !b(B_DISABLED) {
         ev.st.borrow_mut().on = true;
     }
@@ -1517,8 +1567,10 @@ impl proc::PerfHooks for Hooks {
     /// ページフォルト (EL0 から): そのフォルトを数えるサンプリングのもの (ユーザーを数えるもの)
     fn sw_event(&self, config: u64, tf: &crate::trap::TrapFrame, addr: u64) {
         let me = proc::current().pid;
+        let cpu = crate::smp::id() as i32;
         for ev in live() {
-            if ev.period != 0 && ev.ty == TYPE_SOFTWARE && ev.config == config && !ev.bit(B_EXCLUDE_USER) && ev.active() && ev.tracks(me) {
+            let mine = if ev.per_cpu() { ev.cpu == cpu } else { ev.tracks(me) && (ev.cpu < 0 || ev.cpu == cpu) };
+            if ev.period != 0 && ev.ty == TYPE_SOFTWARE && ev.config == config && !ev.bit(B_EXCLUDE_USER) && ev.active() && mine {
                 tick_count(&ev, tf, addr);
             }
         }
@@ -1527,9 +1579,11 @@ impl proc::PerfHooks for Hooks {
     /// EL0 で鳴った tick: task-clock と cpu-clock のサンプリングのものは、前のサンプルから間だけ走ったらあふれる
     fn tick(&self, tf: &crate::trap::TrapFrame) {
         let p = proc::current();
-        let now = proc::cpu_ns(p);
+        let cpu = crate::smp::id() as i32;
         for ev in live() {
-            if ev.period != 0 && ev.ty == TYPE_SOFTWARE && matches!(ev.config, SW_CPU_CLOCK | SW_TASK_CLOCK) && !ev.bit(B_EXCLUDE_USER) && ev.active() && ev.tracks(p.pid) {
+            // CPU ごとのものは、その CPU で経った時間 (Linux の cpu-clock の hrtimer)
+            let (mine, now) = if ev.per_cpu() { (ev.cpu == cpu, crate::timer::uptime_ns()) } else { (ev.tracks(p.pid) && (ev.cpu < 0 || ev.cpu == cpu), proc::cpu_ns(p)) };
+            if ev.period != 0 && ev.ty == TYPE_SOFTWARE && matches!(ev.config, SW_CPU_CLOCK | SW_TASK_CLOCK) && !ev.bit(B_EXCLUDE_USER) && ev.active() && mine {
                 let last = ev.last_clock.get();
                 if last == 0 || now < last {
                     ev.last_clock.set(now);

@@ -434,6 +434,8 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
                 let p = proc::current();
                 p.pgfault += 1;
                 p.min_flt += 1;
+                proc::cpu_sw(0);
+                proc::cpu_sw(1);
                 crate::smp::FAST_FAULTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 crate::smp::FAULTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 return;
@@ -620,6 +622,7 @@ fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>, esr: u64) {
                         let write = ec == EC_DABT_LOW && esr & (1 << 6) != 0 && !cm;
                         crate::smp::FAULTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                         proc::current().pgfault += 1;
+                        proc::cpu_sw(0);
                         let sampling = proc::PERF_SAMPLING.load(core::sync::atomic::Ordering::Relaxed) != 0;
                         if sampling && let Some(h) = proc::perf() {
                             h.sw_event(2, tf, far);
@@ -640,6 +643,7 @@ fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>, esr: u64) {
                         match r {
                             Ok(()) => {
                                 proc::current().min_flt += 1;
+                                proc::cpu_sw(1);
                                 if sampling && let Some(h) = proc::perf() {
                                     h.sw_event(5, tf, far);
                                 }

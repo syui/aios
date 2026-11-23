@@ -45,17 +45,13 @@ pub fn set_idle(on: bool) {
 }
 
 /// 眠っている CPU を起こす (動けるプロセスができた)。sev ではなく割り込みで:
-/// Mac の Hypervisor.framework (HVF) では wfe が眠らず sev も届かないので、ひまな CPU は wfi で眠っている
-/// 眠っている CPU を 1 つ起こす。起こしたものがあれば true
-pub fn wake_idle() -> bool {
-    wake_idle_n(1)
-}
-
-/// 眠っている CPU を n まで起こす (動けるようになったものの数だけ)。起こしたものがあれば true。
+/// Mac の Hypervisor.framework (HVF) では wfe が眠らず sev も届かないので、ひまな CPU は wfi で眠っている。
+/// 眠っている CPU のうち mask にあるもの (走れるようになったものが走ってよい CPU: sched_setaffinity) を n まで
+/// (動けるようになったものの数だけ) 起こす。起こしたものがあれば true。
 /// みな起こすと、起きた CPU がいっせいに大きなロックを取りあい、1 つずつ表を見て「仕事がない」と眠りなおす
 /// あいだ、起こしたものが待たされる (QEMU の TCG で、起こしてから走るまでが 2.4 ms だった)
-pub fn wake_idle_n(n: usize) -> bool {
-    let idle = IDLE.load(Ordering::Acquire) & !(1 << id());
+pub fn wake_idle_in(n: usize, mask: u64) -> bool {
+    let idle = IDLE.load(Ordering::Acquire) & !(1 << id()) & mask as usize;
     let mut sent = 0;
     for cpu in 0..online() {
         if sent >= n {

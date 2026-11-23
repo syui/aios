@@ -734,9 +734,8 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
             proc::yield_voluntary();
             Ok(0)
         }
-        SCHED_GETAFFINITY => sys_sched_getaffinity(a[1] as usize, a[2] as usize),
-        // スケジューラはひとつ (SCHED_OTHER、優先度 0) だけ。CPU を選ぶこともしない (どれでも動く)
-        SCHED_SETAFFINITY => Ok(0),
+        SCHED_GETAFFINITY => sys_sched_getaffinity(int(a[0]), a[1] as usize, a[2] as usize),
+        SCHED_SETAFFINITY => sys_sched_setaffinity(int(a[0]), a[1] as usize, a[2] as usize),
         SCHED_GETSCHEDULER if (a[0] as i32) < 0 => Err(crate::why::inval()),
         SCHED_GETSCHEDULER => sched_target(a[0] as i32).map(|t| t.policy as i64 | if t.reset_on_fork { SCHED_RESET_ON_FORK } else { 0 }),
         SCHED_GETPARAM if a[1] == 0 || (a[0] as i32) < 0 => Err(crate::why::inval()),
@@ -1894,14 +1893,56 @@ fn sys_sched_getattr(pid: i32, uattr: usize, usize_: u32, flags: u32) -> R {
     out(uattr, &b[..size]).map(|_| 0)
 }
 
-fn sys_sched_getaffinity(len: usize, mask: usize) -> R {
-    if len < 8 {
+/// 動いている CPU みな (ビットごと)
+fn online_mask() -> u64 {
+    let n = crate::smp::online();
+    if n >= 64 { u64::MAX } else { (1u64 << n) - 1 }
+}
+
+/// sched_*affinity の相手のスレッド (0 は自分。いなければ ESRCH)
+fn affinity_target(pid: i64) -> Result<&'static mut proc::Proc, i64> {
+    if pid == 0 {
+        return Ok(proc::current());
+    }
+    let g = crate::ns::to_global(u32::try_from(pid).map_err(|_| -ESRCH)?).ok_or(-ESRCH)?;
+    proc::find_thread(g).ok_or(-ESRCH)
+}
+
+/// sched_getaffinity (Linux の順: len は CPU の数より多く 8 の倍数 (EINVAL)、いないスレッドは ESRCH。答えは走ってよい
+/// CPU のうち動いているもの、大きさは cpumask の大きさ (8))
+fn sys_sched_getaffinity(pid: i64, len: usize, mask: usize) -> R {
+    if len * 8 < crate::smp::online() || len & 7 != 0 {
         return Err(crate::why::inval());
     }
-    // 動いている CPU すべて
-    let bits = (1u64 << crate::smp::online()) - 1;
-    out(mask, &bits.to_le_bytes())?;
+    let t = affinity_target(pid)?;
+    out(mask, &(t.affinity & online_mask()).to_le_bytes())?;
     Ok(8)
+}
+
+/// sched_setaffinity (Linux の順: いないスレッドは ESRCH、持ち主か CAP_SYS_NICE でなければ EPERM、len が 8 より短ければ
+/// その分だけ読み、動いている CPU がひとつもなければ EINVAL)。自分がいまの CPU で走れなくなったら、ほかへゆずる
+fn sys_sched_setaffinity(pid: i64, len: usize, mask: usize) -> R {
+    let t = affinity_target(pid)?;
+    let c = cred::current();
+    if c.euid != t.cred.euid && c.euid != t.cred.uid && !c.capable(cred::CAP_SYS_NICE) {
+        return Err(-EPERM);
+    }
+    let mut b = [0u8; 8];
+    let n = len.min(8);
+    proc::current().pt().copy_in(&mut b[..n], mask).ok_or(-EFAULT)?;
+    let want = u64::from_le_bytes(b) & online_mask();
+    if want == 0 {
+        return Err(crate::why::inval());
+    }
+    t.affinity = want;
+    if t.pid == proc::current().pid {
+        if want >> crate::smp::id() & 1 == 0 {
+            proc::yield_now();
+        }
+    } else {
+        proc::affinity_changed(t);
+    }
+    Ok(0)
 }
 
 /// rlimit を読み、new があれば変える (Linux の do_prlimit): ない番号は EINVAL、ソフトがハードより上は EINVAL、NOFILE の
