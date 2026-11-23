@@ -124,17 +124,45 @@ impl Cred {
         self.fsgid == gid || self.groups.contains(&gid)
     }
 
-    /// その capability が effective にあるか (Linux の cap_capable。aios ではいつもはじめのユーザーの namespace で)
+    /// はじめのユーザーの namespace のものに、その capability を持つか (Linux の cap_capable(cred, &init_user_ns, cap)):
+    /// effective にあり、はじめの namespace にいるとき。ユーザーの namespace の中の capability (中ではみな持つ: enter_user_ns)
+    /// は、はじめの namespace のもの (時計、装置、ほかの人のプロセスなど) には効かない
     // [lockless]
     pub fn has_cap(&self, cap: u32) -> bool {
+        self.ns.user.is_none() && self.has_cap_own(cap)
+    }
+
+    /// 自分のユーザーの namespace のものに、その capability を持つか (Linux の cap_capable(cred, cred->user_ns, cap)):
+    /// effective にあるか
+    // [lockless]
+    pub fn has_cap_own(&self, cap: u32) -> bool {
         cap <= CAP_LAST && self.cap_eff >> cap & 1 != 0
     }
 
-    /// cap を持つか (Linux の capable): effective にあり、LSM (landlock の CAPABILITY_USE、AppArmor のプロファイルなど) も
-    /// 許すとき (記録する: security::capable)。要るときだけ呼ぶ (持ち主などで足りるなら先にそちらを: Linux と同じ順)
+    /// cap を持つか (Linux の capable: はじめのユーザーの namespace のもの): effective にあり、LSM (landlock の
+    /// CAPABILITY_USE、AppArmor のプロファイルなど) も許すとき (記録する: security::capable)。要るときだけ呼ぶ (持ち主など
+    /// で足りるなら先にそちらを: Linux と同じ順)
     // [lockless]
     pub fn capable(&self, cap: u32) -> bool {
         self.has_cap(cap) && self.lsm_capable(cap, true)
+    }
+
+    /// 自分のユーザーの namespace のものに cap を持つか (Linux の ns_capable(current_user_ns(), cap): set*uid、capset、
+    /// prctl の CAP_SETPCAP、chroot など)。はじめの namespace にいれば capable と同じ
+    pub fn ns_cap(&self, cap: u32) -> bool {
+        self.has_cap_own(cap) && self.lsm_capable(cap, true)
+    }
+
+    /// inode (m) に cap を持つか (Linux の capable_wrt_inode_uidgid): 自分のユーザーの namespace で cap を持ち、inode の
+    /// 持ち主と組がその namespace に写っているとき (はじめの namespace ならいつも)
+    pub fn capable_wrt(&self, m: &Meta, cap: u32) -> bool {
+        self.ns_cap(cap) && crate::ns::inode_mapped(self, m.uid, m.gid)
+    }
+
+    /// ユーザーの namespace に入った (作った、setns で入った): 中ではみな持つ (Linux の set_cred_user_ns: inheritable と
+    /// ambient は空、permitted、effective、bounding はみな、securebits は 0)
+    pub fn enter_user_ns(&mut self) {
+        (self.cap_inh, self.cap_prm, self.cap_eff, self.cap_bset, self.cap_amb, self.securebits) = (0, CAP_FULL, CAP_FULL, CAP_FULL, 0, 0);
     }
 
     /// capable と同じだが記録しない (ns_capable_noaudit: できなければほかのやりかたに回るもの)
@@ -167,11 +195,16 @@ impl Cred {
         // access(2) は実の id で、capability は実の uid が 0 なら permitted、ほかはなし (Linux の access_override_creds。
         // SECBIT_NO_SETUID_FIXUP ならそのまま)。ふつうは effective (fsuid を 0 でなくすとファイルのものは外れる)
         let caps = if real && self.securebits & SECBIT_NO_SETUID_FIXUP == 0 {
-            if uid == 0 { self.cap_prm } else { 0 }
+            if crate::ns::is_root_kuid(self, uid) { self.cap_prm } else { 0 }
         } else {
             self.cap_eff
         };
         if caps & CAP_FS_MASK == 0 {
+            return false;
+        }
+        // ユーザーの namespace の中では、持ち主と組がその namespace に写っている inode だけ (Linux の
+        // capable_wrt_inode_uidgid の privileged_wrt_inode_uidgid)
+        if !crate::ns::inode_mapped(self, m.uid, m.gid) {
             return false;
         }
         let cap = |c: u32| caps >> c & 1 != 0 && self.lsm_capable(c, true);
@@ -196,7 +229,7 @@ impl Cred {
     /// may の答えを決めた組: 0 持ち主、1 グループ、2 ほか、3 root (why.rs)
     pub fn class(&self, m: &Meta, real: bool) -> u8 {
         let (uid, gid) = if real { (self.uid, self.gid) } else { (self.fsuid, self.fsgid) };
-        if if real { uid == 0 } else { self.cap_eff & CAP_FS_MASK != 0 } {
+        if if real { crate::ns::is_root_kuid(self, uid) } else { self.cap_eff & CAP_FS_MASK != 0 } {
             3
         } else if m.uid == uid {
             0
@@ -207,9 +240,9 @@ impl Cred {
         }
     }
 
-    /// 持ち主か CAP_FOWNER か (inode_owner_or_capable)
+    /// 持ち主か CAP_FOWNER か (inode_owner_or_capable: ユーザーの namespace の中では、写っている inode だけ)
     pub fn owns(&self, m: &Meta) -> bool {
-        self.fsuid == m.uid || self.capable(CAP_FOWNER)
+        self.fsuid == m.uid || self.capable_wrt(m, CAP_FOWNER)
     }
 }
 
@@ -304,11 +337,13 @@ pub fn exec_caps(c: &Cred, euid: u32, egid: u32, file: Option<(u64, u64, bool)>,
     // root (Linux の handle_privileged_root): SECBIT_NOROOT でなければ、uid か euid が 0 なら permitted は bounding と
     // inheritable のみな、euid が 0 なら effective も。ファイルの capability のある setuid root のものを root でない人が
     // exec するときは、ファイルのもののまま
-    if c.securebits & SECBIT_NOROOT == 0 && !(file.is_some() && c.uid != 0 && euid == 0) {
-        if euid == 0 || c.uid == 0 {
+    // root は自分のユーザーの namespace の 0 (Linux の root_uid = make_kuid(new->user_ns, 0)。写していなければいない)
+    let root = |u: u32| crate::ns::is_root_kuid(c, u);
+    if c.securebits & SECBIT_NOROOT == 0 && !(file.is_some() && !root(c.uid) && root(euid)) {
+        if root(euid) || root(c.uid) {
             prm = c.cap_bset | c.cap_inh;
         }
-        if euid == 0 {
+        if root(euid) {
             effective = true;
         }
     }
@@ -322,7 +357,7 @@ pub fn exec_caps(c: &Cred, euid: u32, egid: u32, file: Option<(u64, u64, bool)>,
     let amb = if file.is_some() || setid { 0 } else { c.cap_amb };
     let prm = prm | amb;
     let eff = if effective { prm } else { amb };
-    let secure = setid || (c.uid != 0 && (effective || prm & !amb != 0));
+    let secure = setid || (!root(c.uid) && (effective || prm & !amb != 0));
     Ok(ExecCaps { prm, eff, amb, secure, downgrade })
 }
 
@@ -352,7 +387,8 @@ fn set_ids(uid: bool, f: impl FnOnce(&mut Cred) -> Result<(), i64>) -> Res {
         c.fsuid = c.euid;
         // capability を uid にあわせる (Linux の cap_emulate_setxuid。SECBIT_NO_SETUID_FIXUP なら何もしない)
         if o.securebits & SECBIT_NO_SETUID_FIXUP == 0 {
-            let (had, has) = (o.uid == 0 || o.euid == 0 || o.suid == 0, c.uid == 0 || c.euid == 0 || c.suid == 0);
+            let root = |u: u32| crate::ns::is_root_kuid(o, u);
+            let (had, has) = (root(o.uid) || root(o.euid) || root(o.suid), root(c.uid) || root(c.euid) || root(c.suid));
             // uid・euid・suid がみな 0 でなくなった: permitted と effective を空に (SECBIT_KEEP_CAPS なら残す)。ambient は
             // いつも空に (root でなくなったあとの exec で capability が残らないように)
             if had && !has {
@@ -362,10 +398,10 @@ fn set_ids(uid: bool, f: impl FnOnce(&mut Cred) -> Result<(), i64>) -> Res {
                 c.cap_amb = 0;
             }
             // euid が 0 からほかへ: effective を空に。ほかから 0 へ: effective を permitted に
-            if o.euid == 0 && c.euid != 0 {
+            if root(o.euid) && !root(c.euid) {
                 c.cap_eff = 0;
             }
-            if o.euid != 0 && c.euid == 0 {
+            if !root(o.euid) && root(c.euid) {
                 c.cap_eff = c.cap_prm;
             }
         }
@@ -399,7 +435,7 @@ fn arg(v: u64) -> Option<u32> {
 pub fn setuid(uid: u64) -> Res {
     let u = crate::ns::take_uid(uid as u32)?;
     set_ids(true, |c| {
-        if c.capable(CAP_SETUID) {
+        if c.ns_cap(CAP_SETUID) {
             (c.uid, c.euid, c.suid) = (u, u, u);
         } else if u == c.uid || u == c.suid {
             c.euid = u;
@@ -413,7 +449,7 @@ pub fn setuid(uid: u64) -> Res {
 pub fn setgid(gid: u64) -> Res {
     let g = crate::ns::take_gid(gid as u32)?;
     set_ids(false, |c| {
-        if c.capable(CAP_SETGID) {
+        if c.ns_cap(CAP_SETGID) {
             (c.gid, c.egid, c.sgid) = (g, g, g);
         } else if g == c.gid || g == c.sgid {
             c.egid = g;
@@ -451,7 +487,7 @@ fn setresuid_out(r: u64, e: u64, s: u64) -> Res {
     set_ids(true, |c| {
         // いまの番号のどれかへなら capability は問わない (Linux の __sys_setresuid)
         let ok = |v: u32| v == c.uid || v == c.euid || v == c.suid;
-        if ![r, e, s].iter().flatten().all(|&v| ok(v)) && !c.capable(CAP_SETUID) {
+        if ![r, e, s].iter().flatten().all(|&v| ok(v)) && !c.ns_cap(CAP_SETUID) {
             return Err(-EPERM);
         }
         if let Some(v) = r {
@@ -476,7 +512,7 @@ fn setresgid_out(r: u64, e: u64, s: u64) -> Res {
     set_ids(false, |c| {
         // いまの番号のどれかへなら capability は問わない (Linux の __sys_setresgid)
         let ok = |v: u32| v == c.gid || v == c.egid || v == c.sgid;
-        if ![r, e, s].iter().flatten().all(|&v| ok(v)) && !c.capable(CAP_SETGID) {
+        if ![r, e, s].iter().flatten().all(|&v| ok(v)) && !c.ns_cap(CAP_SETGID) {
             return Err(-EPERM);
         }
         if let Some(v) = r {
@@ -498,7 +534,7 @@ pub fn setreuid(r: u64, e: u64) -> Res {
     let (r, e) = (arg(take_u(r)?), arg(take_u(e)?));
     set_ids(true, |c| {
         let old = c.clone();
-        let cap = || old.capable(CAP_SETUID);
+        let cap = || old.ns_cap(CAP_SETUID);
         if let Some(v) = r {
             if v != old.uid && v != old.euid && !cap() {
                 return Err(-EPERM);
@@ -522,7 +558,7 @@ pub fn setregid(r: u64, e: u64) -> Res {
     let (r, e) = (arg(take_g(r)?), arg(take_g(e)?));
     set_ids(false, |c| {
         let old = c.clone();
-        let cap = || old.capable(CAP_SETGID);
+        let cap = || old.ns_cap(CAP_SETGID);
         if let Some(v) = r {
             if v != old.gid && v != old.egid && !cap() {
                 return Err(-EPERM);
@@ -605,7 +641,7 @@ pub fn setfsuid(uid: u64) -> Res {
     }
     let Ok(u) = crate::ns::take_uid(uid as u32) else { return Ok(ret) };
     let o = &p.cred;
-    if u == old || !(u == o.uid || u == o.euid || u == o.suid || o.capable(CAP_SETUID)) {
+    if u == old || !(u == o.uid || u == o.euid || u == o.suid || o.ns_cap(CAP_SETUID)) {
         return Ok(ret);
     }
     let mut c = p.cred.clone();
@@ -634,7 +670,7 @@ pub fn setfsgid(gid: u64) -> Res {
     }
     let Ok(g) = crate::ns::take_gid(gid as u32) else { return Ok(ret) };
     let o = &p.cred;
-    if g == old || !(g == o.gid || g == o.egid || g == o.sgid || o.capable(CAP_SETGID)) {
+    if g == old || !(g == o.gid || g == o.egid || g == o.sgid || o.ns_cap(CAP_SETGID)) {
         return Ok(ret);
     }
     let mut c = p.cred.clone();

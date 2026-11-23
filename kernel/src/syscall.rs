@@ -2651,7 +2651,7 @@ fn sys_capset(hdr: usize, data: usize) -> R {
     let get = |k: usize| (w(k, 0) | w(k, 1) << 32) & cred::CAP_FULL;
     let (eff, prm, inh) = (get(0), get(1), get(2));
     let o = &me.cred;
-    if inh & !(o.cap_inh | o.cap_prm) != 0 && !o.has_cap(cred::CAP_SETPCAP) {
+    if inh & !(o.cap_inh | o.cap_prm) != 0 && !o.has_cap_own(cred::CAP_SETPCAP) {
         return Err(-EPERM);
     }
     if inh & !(o.cap_inh | o.cap_bset) != 0 || prm & !o.cap_prm != 0 || eff & !prm != 0 {
@@ -3269,7 +3269,7 @@ fn sys_prctl(op: u64, arg: usize, arg3: usize, arg4: u64, arg5: u64) -> R {
                 return Err(-EPERM);
             }
             let changed = old ^ arg as u64;
-            if (changed == 0 || changed & !UNPRIV != 0) && !p.cred.capable(cred::CAP_SETPCAP) {
+            if (changed == 0 || changed & !UNPRIV != 0) && !p.cred.ns_cap(cred::CAP_SETPCAP) {
                 return Err(-EPERM);
             }
             p.cred.securebits = arg as u32;
@@ -3281,7 +3281,7 @@ fn sys_prctl(op: u64, arg: usize, arg3: usize, arg4: u64, arg5: u64) -> R {
             return Ok((p.cred.cap_bset >> arg & 1) as i64);
         }
         PR_CAPBSET_DROP => {
-            if !p.cred.capable(cred::CAP_SETPCAP) {
+            if !p.cred.ns_cap(cred::CAP_SETPCAP) {
                 return Err(-EPERM);
             }
             if arg as u64 > CAP_LAST {

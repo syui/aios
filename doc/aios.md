@@ -3191,8 +3191,27 @@ cap_bset、cap_amb) と securebits を Cred に持ち、使えるのは effectiv
 
 `test/caps.c` (root で ext4: `test/ldiff.sh --root caps @home`。142 行: status、capget、capset、DAC と chown、setuid と
 KEEPCAPS、seteuid と setfsuid、bounding、ambient、securebits、ファイルの capability) は Linux 7.4-rc4 と 1 バイトもちがわない。
-まだ: ユーザーの namespace の中の capability (Linux は新しいユーザーの namespace の中でみなを持ち、外の capability は
-使えない。aios はユーザーの namespace を作っても組を変えず、中で capability を見ないところを決めている)。
+ユーザーの namespace の中の capability も Linux と同じに (2026-11-23。前はユーザーの namespace を作っても組を変えず、中の
+もの (マウント、chroot、UTS の名前など) は capability を見ずに許していた: exec で root でなくなっても、capset で落としても
+できた)。
+
+- 作ると (unshare、clone の CLONE_NEWUSER、setns で入る) 中ではみな持つ (Linux の set_cred_user_ns: inheritable と ambient
+  は空、permitted・effective・bounding はみな、securebits は 0)。/proc/PID/status と capget もそれを見せる
+- `Cred::has_cap` / `capable` (Linux の capable: はじめのユーザーの namespace のもの) は、はじめの namespace にいるときだけ。
+  中の capability は、時計、装置の mknod、はじめの UTS の名前、ほかの人のプロセスなどには効かない。前に root だった人が
+  ユーザーの namespace に入っても同じ (Linux と同じく、はじめの namespace の力はなくなる)
+- 中のもの (`ns_cap`: Linux の ns_capable(current_user_ns())): set*uid と setfsuid、capset と prctl の CAP_SETPCAP
+  (CAPBSET_DROP、SECUREBITS)、chroot、中で作った namespace (マウント、UTS、NET の口) は、その namespace の組のビットを見る
+- ファイルの DAC を越える capability (CAP_DAC_OVERRIDE、CAP_DAC_READ_SEARCH、CAP_FOWNER) は、持ち主と組がその namespace に
+  写っている inode だけ (Linux の capable_wrt_inode_uidgid)。uid_map を書く前は、自分のファイルでも mode 000 なら読めない
+- exec と set*uid の「root」は、その namespace の 0 を写した外の uid (Linux の make_kuid(ns, 0))。写していなければ root は
+  いない (exec で何も持たない)。中の root が exec すると permitted は bounding と inheritable、SECBIT_NOROOT なら何も
+
+`test/capsns.c` (root でない人で: 作ったすぐあとの組、capget、写す前の DAC、はじめの namespace の sethostname /
+settimeofday / mknod、中の UTS、写したあとの DAC、capset と CAPBSET_DROP、中の root の exec、SECBIT_NOROOT の exec) は Linux
+7.4-rc4 と 15 行同じ。まだ: 中の setuid のビット (aios は中では見ない。Linux は持ち主が写っていれば効く)、版 3 のファイルの
+capability の rootid がその namespace の root のもの、入れ子のユーザーの namespace (aios はつくれない)、chown の CAP_CHOWN
+(写した別の uid へ)。
 
 ### 長い並び (op 150) で見つけた 4 つ (2026-11-23)
 

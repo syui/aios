@@ -3308,7 +3308,7 @@ pub fn chroot(pathp: usize) -> R {
 
 /// CAP_SYS_CHROOT があるか (いまのユーザーの namespace の中で: Linux の ns_capable(current_user_ns(), ...))
 fn may_chroot(c: &Cred) -> bool {
-    if c.ns.user.is_some() { crate::security::capable(c, cred::CAP_SYS_CHROOT, true) } else { c.capable(cred::CAP_SYS_CHROOT) }
+    c.ns_cap(cred::CAP_SYS_CHROOT)
 }
 
 /// fchroot(fd, flags) (Linux 7.4): 開いているディレクトリ (O_PATH でもよい) を根に。fd が FD_FAILFS_ROOT なら、なにも
@@ -3356,7 +3356,7 @@ pub fn fchroot(fd: i64, flags: u64) -> R {
 /// 砂場 (landlock) の中からはだめ (Linux と同じ)
 pub fn may_mount() -> Result<(), i64> {
     let c = cred::current();
-    let own = c.ns.mnt.as_ref().is_some_and(|m| c.no_new_privs || (c.ns.user.is_some() && m.owner == c.ns.user_id()));
+    let own = c.ns.mnt.as_ref().is_some_and(|m| c.no_new_privs || (c.ns.user.is_some() && m.owner == c.ns.user_id() && c.has_cap_own(cred::CAP_SYS_ADMIN)));
     if c.sandbox.is_some() || !((c.ns.user.is_none() && c.capable(cred::CAP_SYS_ADMIN)) || own) {
         return Err(-cred::EPERM);
     }

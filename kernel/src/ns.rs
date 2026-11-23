@@ -103,7 +103,7 @@ pub fn net_lo() -> Option<Lo> {
 pub fn net_admin() -> bool {
     let c = &crate::proc::current().cred;
     match &c.ns.net {
-        Some(_) => (c.ns.user.is_some() || c.no_new_privs) && crate::security::capable(c, crate::cred::CAP_NET_ADMIN, true),
+        Some(_) => ((c.ns.user.is_some() && c.has_cap_own(crate::cred::CAP_NET_ADMIN)) || c.no_new_privs) && crate::security::capable(c, crate::cred::CAP_NET_ADMIN, true),
         None => c.capable(crate::cred::CAP_NET_ADMIN),
     }
 }
@@ -228,11 +228,16 @@ pub fn renew(c: &mut crate::cred::Cred, flags: u64) -> Result<(), i64> {
         let u = Rc::new(User { id: next_id(), owner: c.euid, owner_gid: c.egid, maps: RefCell::new(Maps::default()) });
         USERS.get().insert(u.id, Rc::downgrade(&u));
         c.ns.user = Some(u);
+        c.enter_user_ns();
     }
     if flags & !CLONE_NEWUSER & SUPPORTED != 0 {
         // Linux の ns_capable(CAP_SYS_ADMIN): capability と LSM みな (landlock の CAPABILITY_USE、AppArmor の capability)。
-        // ユーザーの namespace の中 (CAP_SYS_ADMIN を持つ) と no_new_privs のときも、LSM は聞く
-        if c.ns.user.is_none() && !c.no_new_privs {
+        // ユーザーの namespace の中は、その中の CAP_SYS_ADMIN (exec で落としたものはだめ)。no_new_privs のときも、LSM は聞く
+        if c.ns.user.is_some() {
+            if !c.ns_cap(crate::cred::CAP_SYS_ADMIN) {
+                return Err(-EPERM);
+            }
+        } else if !c.no_new_privs {
             if !c.capable(crate::cred::CAP_SYS_ADMIN) {
                 return Err(-EPERM);
             }
@@ -535,6 +540,7 @@ fn inside(map: &Option<Vec<(u32, u32, u32)>>, out: u32) -> u32 {
     map.iter().flatten().find(|&&(_, o, n)| out >= o && out - o < n).map_or(OVERFLOW, |&(i, o, _)| i + (out - o))
 }
 
+// [lockless]
 fn outside(map: &Option<Vec<(u32, u32, u32)>>, ins: u32) -> Option<u32> {
     map.iter().flatten().find(|&&(i, _, n)| ins >= i && ins - i < n).map(|&(i, o, _)| o + (ins - i))
 }
@@ -561,6 +567,29 @@ pub fn show_gid(g: u32) -> u32 {
     match &crate::proc::current_cred_ref().ns.user {
         Some(n) => inside(&n.maps.borrow().gid, g),
         None => g,
+    }
+}
+
+/// c のユーザーの namespace の root (中の 0) が外の uid u か (Linux の uid_eq(u, make_kuid(ns, 0)))。はじめの namespace
+/// なら 0。中で 0 を写していなければ、だれも root でない
+// [lockless]
+pub fn is_root_kuid(c: &crate::cred::Cred, u: u32) -> bool {
+    match &c.ns.user {
+        Some(n) => outside(&n.maps.borrow().uid, 0) == Some(u),
+        None => u == 0,
+    }
+}
+
+/// 持ち主 uid と組 gid の inode が、c のユーザーの namespace に写っているか (Linux の privileged_wrt_inode_uidgid)。
+/// はじめの namespace ならいつも
+// [lockless]
+pub fn inode_mapped(c: &crate::cred::Cred, uid: u32, gid: u32) -> bool {
+    match &c.ns.user {
+        Some(n) => {
+            let m = n.maps.borrow();
+            inside(&m.uid, uid) != OVERFLOW && inside(&m.gid, gid) != OVERFLOW
+        }
+        None => true,
     }
 }
 
@@ -751,7 +780,7 @@ impl Which {
 /// ものは capability で、ユーザーの namespace のものは、それを作った人 (euid が同じ) か capability。LSM は聞く
 pub fn ns_capable(c: &crate::cred::Cred, owner: u64, cap: u32) -> bool {
     match &c.ns.user {
-        Some(u) => u.id == owner && crate::security::capable(c, cap, true),
+        Some(u) => u.id == owner && c.ns_cap(cap),
         None if owner == INIT_USER => c.capable(cap),
         None => {
             let made = USERS.get().get(&owner).and_then(|w| w.upgrade()).is_some_and(|u| u.owner == c.euid);
@@ -892,6 +921,8 @@ fn install(c: &mut crate::cred::Cred, w: &Which) -> Result<bool, i64> {
             return Err(-EPERM);
         }
         c.ns.user = u.clone();
+        // 入ったユーザーの namespace の中ではみな持つ (Linux の userns_install の set_cred_user_ns)
+        c.enter_user_ns();
         return Ok(false);
     }
     if !ns_capable(c, w.owner(), CAP_SYS_ADMIN) {
