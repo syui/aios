@@ -8,6 +8,7 @@ mod apparmor;
 mod audit;
 mod auditfilter;
 mod perf;
+mod pmu;
 mod ptrace;
 mod securityfs;
 mod efirt;
@@ -230,6 +231,8 @@ pub extern "C" fn kmain() -> ! {
     irq::init();
     irq::enable_ipi();
     timer::init();
+    // CPU の PMU (ARMv8 PMUv3: DTB の arm,armv8-pmuv3。割り込みは GIC のあとで)
+    pmu::init();
     // itimer と POSIX タイマー (Linux の CONFIG_POSIX_TIMERS)、timerfd の期限 (tick ごと。Linux ではそれぞれの hrtimer)
     syscall::register(posix_timers::SYSCALLS, posix_timers::sys);
     timer::every(1, posix_timers::tick);

@@ -1058,6 +1058,23 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   止まっているあいだも数は進む。ソフトウェアのできごとの 1 つめのあふれは止めない (perf_swevent_overflow の throttle 0)。
   perf_cpu_time_max_percent が 0 か 100 なら perf_event_max_sample_rate は書けない (EINVAL)。時計の期限は 10 us より
   短くしない (Linux の hrtimer と同じ)
+- CPU の PMU (test/pmu.c、Linux 7.4-rc3 と 17 行同じ。手本の Linux に ARM_PMU と ARM_PMUV3 を足した): pmu.rs (Linux の
+  drivers/perf/arm_pmuv3.c)。DTB の arm,armv8-pmuv3 があり ID_AA64DFR0.PMUVer が PMUv3 なら、PMCR.N (QEMU は 6) と
+  PMCEID を読み、PPI (QEMU は 23) を有効に (2 つめからの CPU は初めてスレッドを走らせるとき)。perf の種類は armv8_pmuv3
+  の 8 (Linux の空き番号: cpu_clock と task_clock が 6 と 7)、/sys/bus/event_source/devices/armv8_pmuv3 に type、cpus、
+  format (event、long、rdpmc、threshold ...)、events (PMCEID にあるもの: QEMU の cortex-a72 は cpu_cycles だけ、max は
+  stall も)、caps。PERF_TYPE_HARDWARE / HW_CACHE / RAW / 8 は Linux の __armv8_pmuv3_map_event と同じ (表にないもの・
+  PMCEID にないものは ENOENT、範囲の外は EINVAL、RAW は下の 16 ビットでどれでも、CHAIN は EINVAL、拡げた番号 (config の
+  上 32 ビット)、exclude_idle は EOPNOTSUPP、threshold は EINVAL)。exclude_user / kernel / hv は PMEVTYPER の U / P /
+  NSH。グループはカウンタに入るか見る (止めたメンバーは数えない: Linux の validate_group)。数えるのはスレッドが走って
+  いるあいだだけ: スケジューラがスレッドを走らせる前に、そのスレッドの有効なものをカウンタにわりあてて (cycles は
+  PMCCNTR、ほかは PMEVCNTRn、64 ビットのものは PMUv3p5 より前なら 2 つをつなぐ) 書き、止まったら読んで足す (perf.rs の
+  HW_RUNS: Linux の perf_event_task_sched_in / out)。間は Linux の armpmu_event_set_period (-left を書く。数えるだけの
+  ものはカウンタの半分)、あふれは PMU の割り込み (EL0 で鳴ったらすぐサンプル、EL1 なら次に EL0 の tick か止まった
+  ところで)。QEMU (TCG) の cycles は 1 ns に 1。mmap の頭のページには arm64 の時刻の変換 (cap_user_time、time_zero、
+  time_short、time_mult と time_shift、57 ビットの time_mask: Linux の arch_perf_update_userpage) も。
+  まだないもの: CPU ごとの (pid -1) PMU のもの、カウンタが足りないときの回し (multiplex)、rdpmc (ユーザーから読む)、
+  ACPI の機械の PMU (armv8_pmuv3_0)
 - atime (test/atime.c、root で ext4 と tmpfs とマウントの印で Linux と 5 行同じ): 前は持たなかった (stat の atime は mtime、
   utimensat の atime は捨てていた)。いまは ext4 は inode の i_atime (秒)、tmpfs は自分の属性に持ち、stat と statx に出す。
   utimensat は atime も決め、ctime をいまに (Linux の notify_change。前は ctime を変えなかった)。読んだら (read、pread、

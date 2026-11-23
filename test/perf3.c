@@ -111,6 +111,15 @@ static void mmaps(void) {
     printf(", version %u compat %u, data_offset %llu size %llu, head %llu tail %llu, size field %u, cap_user_time %u zero %u rdpmc %u, index %u",
            h->version, h->compat_version, (unsigned long long)h->data_offset, (unsigned long long)h->data_size, (unsigned long long)h->data_head, (unsigned long long)h->data_tail,
            h->size, (unsigned)h->cap_user_time, (unsigned)h->cap_user_time_zero, (unsigned)h->cap_user_rdpmc, h->index);
+    // カウンタを ns にする (arm64 の sched_clock: CPU のタイマ。周波数は VM しだいなので、1 刻みの ns と短い時間の印)
+    if (h->cap_user_time_zero) {
+      uint64_t one = ((uint64_t)1 << 20) * h->time_mult >> h->time_shift;
+      uint64_t cnt, frq;
+      __asm__ volatile("mrs %0, cntvct_el0" : "=r"(cnt));
+      __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(frq));
+      printf(", ns per 2^20 ticks right %d, short %u, mask bits %d", one == ((uint64_t)1 << 20) * 1000000000 / frq, (unsigned)h->cap_user_time_short, 64 - __builtin_clzll(h->time_mask));
+      (void)cnt;
+    }
   }
   // 2 度目は同じ大きさなら (同じ輪)、ちがえば EINVAL
   void *m2 = mmap(0, 9 * PG, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);

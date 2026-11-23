@@ -1980,6 +1980,11 @@ pub fn scheduler() -> ! {
                 if !p.kthread {
                     crate::hwdebug::switch_in(p);
                 }
+                // CPU の PMU のカウンタ (Linux の perf_event_task_sched_in)
+                let hw = !p.kthread && PERF_HW.load(Relaxed) != 0;
+                if hw && let Some(h) = perf() {
+                    h.sched_in(p);
+                }
                 crate::smp::dev_wait(2, t0);
                 // 切りかえはいつもカーネルの中なので、走りはじめはカーネルの時間から
                 let t = crate::timer::uptime_ns().max(1);
@@ -1991,6 +1996,10 @@ pub fn scheduler() -> ! {
                 }
                 p.pcount += 1;
                 swtch(sched_ctx(), &p.context);
+                // 止まった: PMU のカウンタを読む (Linux の perf_event_task_sched_out)
+                if hw && let Some(h) = perf() {
+                    h.sched_out(p);
+                }
                 crate::smp::set_user_pt(0);
                 crate::smp::set_user_files(0);
                 // 走った時間とカーネルの時間を足す (終わったスレッドは、終わるときに代表へわたして 0 にしている)
@@ -2357,7 +2366,16 @@ pub trait PerfHooks: Sync {
     fn bp_hit(&self, id: u64, tf: &crate::trap::TrapFrame, addr: u64);
     /// 写した (mmap、実行できるようにした mprotect: PERF_MMAP が 0 でないときだけ)。name は装置の写しの名前
     fn mmap(&self, rec: &crate::vm::MapRec, name: Option<&str>);
+    /// CPU の PMU のもの (PERF_HW が 0 でないときだけ): スレッドがこの CPU で走りはじめる / 止まった (カウンタを書く /
+    /// 読む: Linux の perf_event_task_sched_in / out)、PMU のあふれの割り込み (user は EL0 で鳴った)
+    fn sched_in(&self, p: &Proc);
+    fn sched_out(&self, p: &Proc);
+    fn pmu_irq(&self, tf: &crate::trap::TrapFrame, user: bool);
 }
+/// CPU の PMU で数える perf のイベントの数 (0 ならスレッドの切りかえで perf を呼ばない)
+pub static PERF_HW: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// CPU の PMU の割り込みの番号 (pmu.rs が置く。0 はなし)
+pub static PMU_IRQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// MMAP の記録をとる perf のイベントの数 (attr.mmap、mmap2、mmap_data)
 pub static PERF_MMAP: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 

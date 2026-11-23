@@ -711,8 +711,11 @@ fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>, esr: u64) {
             crate::debug::trace_irq(id);
             // tick (perf の期限だけで鳴ったものでない)
             let mut real_tick = false;
+            let mut pmu = false;
             match id {
                 timer::IRQ => real_tick = timer::tick(),
+                // CPU の PMU のあふれ (PPI: pmu.rs が番号を置く)
+                id if id != 0 && id == proc::PMU_IRQ.load(core::sync::atomic::Ordering::Relaxed) => pmu = true,
                 // ほかの CPU から: EL0 へ戻る前に、殺されたか、シグナルが来たかを見るだけ
                 irq::IPI => {}
                 id if id == crate::uart::irq() => crate::uart::intr(),
@@ -722,6 +725,9 @@ fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>, esr: u64) {
                 _ => println!("irq: unexpected {}", id),
             }
             irq::complete(raw);
+            if pmu && let Some(h) = proc::perf() {
+                h.pmu_irq(tf, kind == EL0_IRQ);
+            }
             // perf の task-clock / cpu-clock のサンプル (EL0 で鳴ったタイマ: Linux の perf_swevent_hrtimer)
             if kind == EL0_IRQ && id == timer::IRQ && proc::PERF_SAMPLING.load(core::sync::atomic::Ordering::Relaxed) != 0 {
                 if let Some(h) = proc::perf() {

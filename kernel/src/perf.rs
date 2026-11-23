@@ -26,11 +26,17 @@
 // CPU ごとのもの (pid -1、cpu >= 0: perf stat -a、perf top。paranoid が 0 より上なら CAP_PERFMON): その CPU のみなの
 // フォルト、切りかえ、移り (proc::CPU_SW) と、時計は有効だった時間。cpu-clock と task-clock とフォルトのサンプリングは、
 // その CPU で EL0 で鳴った tick とフォルトで。pid と cpu の両方なら、そのスレッドがいまその CPU にいるときの差だけ。
-// まだないもの (todo.json の syscall-gaps): PMU (ハードウェアの数: ENOENT)
+// CPU の PMU (pmu.rs: ARMv8 PMUv3、種類の番号 8): PERF_TYPE_HARDWARE / HW_CACHE / RAW / 8 は pmu::map_event で
+// できごとにし、グループはカウンタに入るか見る (Linux の validate_group)。スレッドが走りはじめたら CPU のカウンタに
+// 書いて動かし、止まったら読んで足す (HW_RUNS: イベントとスレッドごと。Linux の perf_event_task_sched_in / out)。
+// 間は Linux の armpmu_event_set_period (-left を書く)、あふれは PMU の割り込みで (EL0 で鳴ったらすぐ、EL1 なら
+// 次に EL0 へ戻るところか止まったところで)。
+// まだないもの: CPU ごとの (pid -1) PMU のもの、カウンタが足りないときの回し (multiplex)
 use crate::cell::Bkl;
 use crate::file::{self, Kind};
 use crate::hwdebug;
 use crate::proc::{self, Proc};
+use alloc::collections::BTreeMap;
 use alloc::rc::{Rc, Weak};
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
@@ -54,7 +60,10 @@ const EOPNOTSUPP: i64 = 95;
 const ATTR_SIZE: usize = 176;
 const ATTR_VER0: usize = 64;
 /// type
+const TYPE_HARDWARE: u32 = 0;
 const TYPE_SOFTWARE: u32 = 1;
+const TYPE_HW_CACHE: u32 = 3;
+const TYPE_RAW: u32 = 4;
 const TYPE_BREAKPOINT: u32 = 5;
 /// PERF_TYPE_SOFTWARE の config
 const SW_CPU_CLOCK: u64 = 0;
@@ -136,6 +145,8 @@ const B_PINNED: u32 = 2;
 const B_EXCLUSIVE: u32 = 3;
 const B_EXCLUDE_USER: u32 = 4;
 const B_EXCLUDE_KERNEL: u32 = 5;
+const B_EXCLUDE_HV: u32 = 6;
+const B_EXCLUDE_IDLE: u32 = 7;
 const B_MMAP: u32 = 8;
 const B_COMM: u32 = 9;
 const B_MMAP_DATA: u32 = 17;
@@ -207,6 +218,16 @@ pub fn knob_set(i: usize, s: &str) -> Result<(), i64> {
     Ok(())
 }
 
+/// /sys/bus/event_source/devices の種類 (名前と番号、並べた順): CPU の PMU があればそれも
+pub fn sources() -> Vec<(&'static str, u32)> {
+    let mut v = Vec::new();
+    if crate::pmu::present() {
+        v.push((crate::pmu::name(), crate::pmu::TYPE));
+    }
+    v.extend(SOURCES);
+    v
+}
+
 /// /sys/bus/event_source/devices の種類 (名前、PERF_TYPE_*)。並べた順
 pub const SOURCES: [(&str, u32); 2] = [("breakpoint", TYPE_BREAKPOINT), ("software", TYPE_SOFTWARE)];
 
@@ -254,6 +275,8 @@ pub struct Event {
     config: u64,
     /// ブレークポイントなら (ウォッチポイントか、bp_type、CPU の番地、ctrl)
     bp: Option<(bool, u8, u64, hwdebug::Ctrl)>,
+    /// CPU の PMU のもの (pmu.rs: PMEVTYPER の値、64 ビットか)
+    hw: Option<crate::pmu::Hw>,
     read_format: u64,
     bits: u64,
     /// サンプリング: sample_type、間 (下)、時計のものの前のサンプルの時刻、wakeup_events、sigtrap の sig_data、
@@ -327,6 +350,9 @@ impl Event {
         let kernel = !self.bit(B_EXCLUDE_KERNEL);
         if self.ty == TYPE_BREAKPOINT {
             return t.hwdbg.as_ref().and_then(|s| s.perf.iter().find(|b| b.id == self.id)).map_or(0, |b| b.count);
+        }
+        if let Some(hw) = &self.hw {
+            return hw_count(self.id, hw, t);
         }
         match self.config {
             SW_CPU_CLOCK | SW_TASK_CLOCK => now,
@@ -437,6 +463,10 @@ impl Event {
                     m.start();
                 }
             }
+        }
+        // PMU のもの: いまのスレッドのものなら、カウンタを書きなおす (ほかのスレッドは次に走るとき)
+        if (self.hw.is_some() || members.iter().any(|m| m.hw.is_some())) && (self.tracks(proc::current().pid) || members.iter().any(|m| m.tracks(proc::current().pid))) {
+            hw_reload();
         }
     }
 
@@ -585,6 +615,7 @@ impl Event {
     fn untrack(&self, tid: u32) {
         self.sync();
         self.st.borrow_mut().tasks.retain(|k| k.tid != tid);
+        HW_RUNS.get().remove(&(self.id, tid));
         if let Some(t) = proc::find_thread(tid) {
             self.uninstall(t);
         }
@@ -793,9 +824,18 @@ impl PerfFile {
             poll: Cell::new(0),
             generation: Cell::new(0),
         });
-        // 頭のページ (perf_event_init_userpage): cap_bit0_is_deprecated、size (__reserved の位置)、data_offset と data_size
-        rb.put_hdr(40, 2);
+        // 頭のページ (perf_event_init_userpage): cap_bit0_is_deprecated、size (__reserved の位置)、data_offset と data_size。
+        // arm64 の時刻 (Linux の arch_perf_update_userpage: sched_clock は CPU のタイマ): cap_user_time、time_zero、
+        // time_short と、カウンタの値を ns にする mult と shift (time_zero は 0: uptime_ns はカウンタ 0 から)、time_mask
+        // (57 ビット: Linux の arch_counter_get_width)、time_offset
+        let (mult, shift) = clock_mult_shift(crate::timer::freq());
+        rb.put_hdr(40, 2 | 1 << 3 | 1 << 4 | 1 << 5);
+        rb.put_hdr(48, (shift as u64) << 16 | (mult as u64) << 32);
+        rb.put_hdr(56, 0u64.wrapping_sub(crate::timer::uptime_ns()));
+        rb.put_hdr(64, 0);
         rb.put_hdr32(72, 96);
+        rb.put_hdr(80, 0);
+        rb.put_hdr(88, (1u64 << 57) - 1);
         rb.put_hdr(1040, PG as u64);
         rb.put_hdr(1048, size);
         let pages = rb.pages.clone();
@@ -866,6 +906,10 @@ impl file::FileOps for PerfFile {
         EVENTS.get().retain(|w| w.strong_count() > 0 && w.as_ptr() != p);
         if ev.sampling {
             proc::PERF_SAMPLING.fetch_sub(1, Relaxed);
+        }
+        if ev.hw.is_some() {
+            HW_RUNS.get().retain(|k, _| k.0 != ev.id);
+            proc::PERF_HW.fetch_sub(1, Relaxed);
         }
         if ev.wants_mmap() {
             proc::PERF_MMAP.fetch_sub(1, Relaxed);
@@ -1027,9 +1071,18 @@ fn open(uattr: usize, pid: i32, cpu: i32, group_fd: i32, flags: u64) -> R {
     if b(B_INHERIT) && sample_type & SAMPLE_READ != 0 && sample_type & SAMPLE_TID == 0 {
         return Err(-EINVAL);
     }
-    // 種類 (perf_init_event): ソフトウェアとブレークポイント。PMU (ハードウェア、キャッシュ、RAW) もトレースポイントもない
+    // 種類 (perf_init_event): ソフトウェア、ブレークポイント、CPU の PMU (ハードウェア、キャッシュ、RAW、8)。
+    // トレースポイントはない
     let mut bp = None;
+    let mut hw = None;
     match ty {
+        // Linux の armpmu_event_init: 分岐の記録 (BRBE) はない
+        TYPE_HARDWARE | TYPE_HW_CACHE | TYPE_RAW | crate::pmu::TYPE if crate::pmu::present() => {
+            if sample_type & SAMPLE_BRANCH_STACK != 0 {
+                return Err(-EOPNOTSUPP);
+            }
+            hw = Some(crate::pmu::map_event(ty, config, le64(&a, 56), b(B_EXCLUDE_USER), b(B_EXCLUDE_KERNEL), b(B_EXCLUDE_HV), b(B_EXCLUDE_IDLE), task.is_some())?);
+        }
         TYPE_SOFTWARE if config >= SW_MAX => return Err(-ENOENT),
         TYPE_SOFTWARE | TYPE_BREAKPOINT if sample_type & SAMPLE_BRANCH_STACK != 0 => return Err(-EOPNOTSUPP),
         TYPE_SOFTWARE => {}
@@ -1079,6 +1132,18 @@ fn open(uattr: usize, pid: i32, cpu: i32, group_fd: i32, flags: u64) -> R {
         if read_size(read_format, l.members().len() + 1) > 16 * 1024 {
             return Err(-E2BIG);
         }
+        // PMU のものは、リーダーとメンバーと自分がカウンタに入るか (止めたものは数えない)
+        if let Some(h) = &hw {
+            let mut used = 0u64;
+            let fits = |e: &Event, used: &mut u64| match &e.hw {
+                Some(h) if e.st.borrow().on || e.enable_on_exec.get() => crate::pmu::get_idx(used, h).is_some(),
+                _ => true,
+            };
+            let mine = !b(B_DISABLED) || b(B_ENABLE_ON_EXEC);
+            if !fits(l, &mut used) || !l.members().iter().all(|m| fits(m, &mut used)) || (mine && crate::pmu::get_idx(&mut used, h).is_none()) {
+                return Err(-EINVAL);
+            }
+        }
     }
     // サンプルの間: 時計のものは freq を 1e9 / freq ns の決まった間に (Linux の perf_swevent_init_hrtimer: freq をやめる)。
     // ほかの freq のものは 1 から、数と時間を見てなおしていく (perf_event_alloc と perf_adjust_period)
@@ -1095,6 +1160,7 @@ fn open(uattr: usize, pid: i32, cpu: i32, group_fd: i32, flags: u64) -> R {
         ty,
         config,
         bp,
+        hw,
         read_format,
         bits,
         sample_type,
@@ -1130,6 +1196,12 @@ fn open(uattr: usize, pid: i32, cpu: i32, group_fd: i32, flags: u64) -> R {
         leader: RefCell::new(leader.as_ref().map(Rc::downgrade)),
         siblings: RefCell::new(Vec::new()),
     });
+    // PMU の数えるだけのものは、カウンタの半分であふれさせて足す (Linux の __hw_perf_event_init)
+    if let Some(h) = &ev.hw
+        && !ev.sampling
+    {
+        ev.left.set((h.max_period() >> 1) as i64);
+    }
     if let Some(task) = task {
         ev.install(task)?;
         let t = proc::cpu_ns(task);
@@ -1156,6 +1228,12 @@ fn open(uattr: usize, pid: i32, cpu: i32, group_fd: i32, flags: u64) -> R {
     }
     if ev.wants_mmap() {
         proc::PERF_MMAP.fetch_add(1, Relaxed);
+    }
+    if ev.hw.is_some() {
+        proc::PERF_HW.fetch_add(1, Relaxed);
+        if ev.active() && ev.tracks(me.pid) {
+            hw_reload();
+        }
     }
     Ok(fd as i64)
 }
@@ -1582,14 +1660,191 @@ fn throttle_group(ev: &Rc<Event>) {
 /// 止めたグループをまた動かす (Linux の perf_event_unthrottle_group)
 fn unthrottle_group(ev: &Rc<Event>) {
     let (leader, members) = group_of(ev);
+    let mut hw = false;
     for e in core::iter::once(&leader).chain(members.iter()) {
         if e.active() {
             e.interrupts.set(0);
             if e.is_clock() {
                 e.restart_clock();
             }
+            hw |= e.hw.is_some();
             if Rc::ptr_eq(e, &leader) {
                 throttle_record(e, true);
+            }
+        }
+    }
+    if hw {
+        hw_reload();
+    }
+}
+
+/// カウンタの周波数 freq を ns にする mult と shift (Linux の clocks_calc_mult_shift(freq, NSEC_PER_SEC, 3600) と、
+/// arch_perf_update_userpage の shift 32 のなおし)
+fn clock_mult_shift(freq: u64) -> (u32, u32) {
+    let mut sftacc = 32u32;
+    let mut tmp = (3600 * freq) >> 32;
+    while tmp != 0 {
+        tmp >>= 1;
+        sftacc -= 1;
+    }
+    let mut sft = 32u32;
+    let mut m = 0u64;
+    while sft > 0 {
+        m = (((1_000_000_000u128 << sft) + freq as u128 / 2) / freq.max(1) as u128) as u64;
+        if m >> sftacc == 0 {
+            break;
+        }
+        sft -= 1;
+    }
+    if sft == 32 { ((m >> 1) as u32, 31) } else { (m as u32, sft) }
+}
+
+// ---- CPU の PMU のもの (pmu.rs) をスレッドの切りかえで数える ----
+
+/// イベントとスレッドごとの PMU の数 (Linux ではスレッドの文脈のイベントの hw): 足したもの、走っているあいだの
+/// カウンタ (-1 はない)、その CPU、前に読んだ (書いた) カウンタの値
+#[derive(Default)]
+struct HwRun {
+    acc: u64,
+    idx: Option<u32>,
+    cpu: usize,
+    prev: u64,
+}
+
+static HW_RUNS: Bkl<BTreeMap<(u64, u32), HwRun>> = Bkl::new(BTreeMap::new());
+/// CPU ごとの、まだ見ていない PMU のあふれ (EL1 で鳴ったもの)
+static HW_PENDING: [AtomicU64; crate::smp::MAXCPU] = [const { AtomicU64::new(0) }; crate::smp::MAXCPU];
+
+/// スレッド t の PMU の数 (この CPU で走っていれば、いまのカウンタの差も)
+fn hw_count(id: u64, hw: &crate::pmu::Hw, t: &Proc) -> u64 {
+    let runs = HW_RUNS.get();
+    let Some(r) = runs.get(&(id, t.pid)) else { return 0 };
+    match r.idx {
+        Some(idx) if r.cpu == crate::smp::id() && t.pid == proc::current().pid => r.acc.wrapping_add(crate::pmu::read(idx, hw).wrapping_sub(r.prev) & hw.max_period()),
+        _ => r.acc,
+    }
+}
+
+/// カウンタを読んで足す (Linux の armpmu_event_update: のこりも減らす)
+fn hw_update(ev: &Event, hw: &crate::pmu::Hw, r: &mut HwRun, idx: u32) {
+    let now = crate::pmu::read(idx, hw);
+    let d = now.wrapping_sub(r.prev) & hw.max_period();
+    r.prev = now;
+    r.acc = r.acc.wrapping_add(d);
+    ev.left.set(ev.left.get().wrapping_sub(d as i64));
+    ev.hits.set(ev.hits.get().wrapping_add(d));
+}
+
+/// 次にあふれるところを書く (Linux の armpmu_event_set_period: のこりが尽きていれば間を足して true)。書いた値を返す
+fn hw_set_period(ev: &Event, hw: &crate::pmu::Hw, idx: u32) -> (bool, u64) {
+    let max = hw.max_period();
+    let period = (if ev.sampling { ev.period.get() } else { max >> 1 }).max(1) as i64;
+    let mut left = ev.left.get();
+    let mut ret = false;
+    if left <= -period {
+        left = period;
+        ev.left.set(left);
+        ev.last_period.set(period as u64);
+        ret = true;
+    }
+    if left <= 0 {
+        left += period;
+        ev.left.set(left);
+        ev.last_period.set(period as u64);
+        ret = true;
+    }
+    let left = (left as u64).min(max >> 1);
+    let v = left.wrapping_neg() & max;
+    crate::pmu::write(idx, hw, v);
+    (ret, v)
+}
+
+/// p がこの CPU で走りはじめる: そのスレッドの有効な PMU のものをカウンタに書いて動かす (Linux の
+/// perf_event_sched_in と armpmu_add / armpmu_start)。カウンタが足りなければ、そのものは数えない
+fn hw_sched_in(p: &Proc) {
+    if !crate::pmu::present() {
+        return;
+    }
+    crate::pmu::cpu_ready();
+    crate::pmu::stop();
+    crate::pmu::disable_all();
+    let cpu = crate::smp::id();
+    let mut used = 0u64;
+    let mut any = false;
+    for ev in live() {
+        let Some(hw) = ev.hw else { continue };
+        if !ev.active() || !ev.tracks(p.pid) || (ev.cpu >= 0 && ev.cpu as usize != cpu) || ev.interrupts.get() == MAX_INTERRUPTS {
+            continue;
+        }
+        let Some(idx) = crate::pmu::get_idx(&mut used, &hw) else { continue };
+        let (_, v) = hw_set_period(&ev, &hw, idx);
+        let runs = HW_RUNS.get();
+        let r = runs.entry((ev.id, p.pid)).or_default();
+        (r.idx, r.cpu, r.prev) = (Some(idx), cpu, v);
+        crate::pmu::enable(idx, &hw);
+        any = true;
+    }
+    if any {
+        crate::pmu::start();
+    }
+}
+
+/// p が止まった (か、書きなおす): あふれを見てから、カウンタを読んで足し、みな止める
+fn hw_sched_out(p: &Proc) {
+    if !crate::pmu::present() {
+        return;
+    }
+    crate::pmu::stop();
+    if let Some(t) = proc::find_thread(p.pid) {
+        hw_overflow(p.pid, t.tf());
+    }
+    let cpu = crate::smp::id();
+    for ev in live() {
+        let Some(hw) = ev.hw else { continue };
+        let runs = HW_RUNS.get();
+        let Some(r) = runs.get_mut(&(ev.id, p.pid)) else { continue };
+        if let Some(idx) = r.idx.take()
+            && r.cpu == cpu
+        {
+            hw_update(&ev, &hw, r, idx);
+        }
+    }
+    crate::pmu::disable_all();
+}
+
+/// いまのスレッドの PMU のカウンタを書きなおす (有効にした、止めた、間を変えた、止めたものをまた動かす)
+fn hw_reload() {
+    let p = proc::current();
+    if p.kthread {
+        return;
+    }
+    hw_sched_out(p);
+    hw_sched_in(p);
+}
+
+/// あふれたカウンタ (割り込みで読んで消したものと、いま立っているもの) を見る (Linux の armv8pmu_handle_irq): 足して、
+/// 間を書きなおし、間を越えていればサンプル (止めた (throttle) ものはカウンタを止める)
+fn hw_overflow(pid: u32, tf: &crate::trap::TrapFrame) {
+    let cpu = crate::smp::id();
+    let bits = HW_PENDING[cpu].swap(0, Relaxed) | crate::pmu::take_overflow();
+    if bits == 0 {
+        return;
+    }
+    for ev in live() {
+        let Some(hw) = ev.hw else { continue };
+        let fire = {
+            let runs = HW_RUNS.get();
+            let Some(r) = runs.get_mut(&(ev.id, pid)) else { continue };
+            let Some(idx) = r.idx.filter(|&i| r.cpu == cpu && bits >> i & 1 != 0) else { continue };
+            hw_update(&ev, &hw, r, idx);
+            let (ret, v) = hw_set_period(&ev, &hw, idx);
+            r.prev = v;
+            ret
+        };
+        if fire && ev.sampling && overflow(&ev, tf, 0, ev.last_period.get(), true) {
+            // 止めた: カウンタを書きなおす (次の tick で unthrottle_group がまた)
+            if pid == proc::current().pid {
+                hw_reload();
             }
         }
     }
@@ -1728,6 +1983,24 @@ pub struct Hooks;
 pub static HOOKS: Hooks = Hooks;
 
 impl proc::PerfHooks for Hooks {
+    fn sched_in(&self, p: &Proc) {
+        hw_sched_in(p);
+    }
+
+    fn sched_out(&self, p: &Proc) {
+        hw_sched_out(p);
+    }
+
+    /// PMU のあふれの割り込み: 読んで消し、EL0 で鳴ったならすぐ見る (EL1 ならカーネルが perf を使っているところかも
+    /// しれないので、次に EL0 の tick か止まったところで)
+    fn pmu_irq(&self, tf: &crate::trap::TrapFrame, user: bool) {
+        let cpu = crate::smp::id();
+        HW_PENDING[cpu].fetch_or(crate::pmu::take_overflow(), Relaxed);
+        if user && proc::PERF_HW.load(Relaxed) != 0 {
+            hw_overflow(proc::current().pid, tf);
+        }
+    }
+
     /// inherit: 親を数えているものは、子も (inherit_thread ならスレッドだけ。Linux の inherit_task_group)。attr.task で
     /// 有効なものには PERF_RECORD_FORK (親の文脈のもの: Linux の perf_event_fork)
     fn fork(&self, parent: &Proc, child: &mut Proc, thread: bool) {
@@ -1836,6 +2109,10 @@ impl proc::PerfHooks for Hooks {
         // tick ごとにあふれの数を数えなおし、止めたものをまた動かす (Linux の perf_event_task_tick)
         if real {
             THROTTLE_SEQ[cpu as usize].fetch_add(1, Relaxed);
+        }
+        // EL1 で鳴った PMU のあふれ
+        if proc::PERF_HW.load(Relaxed) != 0 && HW_PENDING[cpu as usize].load(Relaxed) != 0 {
+            hw_overflow(p.pid, tf);
         }
         for ev in live() {
             let mine = if ev.per_cpu() { ev.cpu == cpu } else { ev.tracks(p.pid) && (ev.cpu < 0 || ev.cpu == cpu) };
