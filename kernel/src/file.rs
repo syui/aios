@@ -223,6 +223,10 @@ pub trait FileOps: core::any::Any {
     fn mmap(&self, _fr: &FileRef, _off: usize, _len: usize, _prot: u64) -> Option<Result<crate::vm::Backing, i64>> {
         None
     }
+    /// MAP_SHARED でしか写せない (MAP_PRIVATE は EINVAL: Linux の perf_mmap の VM_SHARED)
+    fn mmap_shared_only(&self) -> bool {
+        false
+    }
     /// 閉じた (最後の OpenFile が落ちた: Linux の f_op->release)
     fn release(&self) {}
 

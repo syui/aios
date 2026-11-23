@@ -2296,7 +2296,14 @@ pub trait PerfHooks: Sync {
     fn exit(&self, p: &Proc);
     fn exec(&self, p: &Proc);
     fn task_enable(&self, on: bool) -> i64;
+    /// サンプリングのもの (PERF_SAMPLING が 0 でないときだけ): ページフォルト (config は PERF_COUNT_SW_PAGE_FAULTS か
+    /// MIN)、EL0 で鳴った tick、perf のブレークポイントに当たった
+    fn sw_event(&self, config: u64, tf: &crate::trap::TrapFrame, addr: u64);
+    fn tick(&self, tf: &crate::trap::TrapFrame);
+    fn bp_hit(&self, id: u64, tf: &crate::trap::TrapFrame, addr: u64);
 }
+/// サンプリングの perf のイベントの数 (0 ならフォルトと tick で perf を呼ばない。ページフォルトはロックなしの道を通らない)
+pub static PERF_SAMPLING: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static PERF: crate::cell::Early<Option<&'static dyn PerfHooks>> = crate::cell::Early::new(None);
 
 pub fn register_perf(h: &'static dyn PerfHooks) {

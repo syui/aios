@@ -929,6 +929,21 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   まぜたもの、bp_len の 0 と 9 から、ずらして 8 バイトをはみ出すもの、カーネルの番地は EINVAL (番地と長さの検査は
   hwdebug::parse に移し、ptrace と perf でいっしょに)。inherit なら fork した子にも置く。exec で消えるのは ptrace の
   ものだけ (perf のものは残る)
+- perf のサンプリング (test/perf3.c、Linux 7.4-rc3 と 11 行同じ): perf record の形。輪は perf の fd の mmap
+  (MAP_SHARED だけ: FileOps::mmap_shared_only。位置 0、1 + 2^n ページ、inherit のスレッドのものはだめで EINVAL。2 度目は
+  同じ大きさなら同じ輪)。頭のページは Linux の perf_event_mmap_page (cap_bit0_is_deprecated、size 96、data_offset は
+  4096、data_size)、data_head をカーネルが進め、data_tail をユーザーが進める。空きがなければなくして数え、次に書ける
+  ときに PERF_RECORD_LOST を先に (写しが読むだけなら上書き)。起こすのは watermark (既定は輪の半分) をこえたときと、
+  サンプルが wakeup_events になったとき (poll は Linux の perf_poll: 起こしの印をとって POLLIN、数える相手がもう
+  いなければ POLLHUP)。PERF_RECORD_SAMPLE は Linux の perf_output_sample の順 (IDENTIFIER、IP、TID、TIME、ADDR、ID、
+  STREAM_ID、CPU、PERIOD、READ、CALLCHAIN (pc から x29 の frame record をたどる: perf_callchain_user)、RAW、REGS_USER、
+  STACK_USER、WEIGHT、DATA_SRC、TRANSACTION、REGS_INTR、PHYS_ADDR、DATA_PAGE_SIZE、CODE_PAGE_SIZE、AUX)。きっかけは
+  ページフォルト (trap.rs。サンプリングのものがあるあいだ、フォルトは大きなロックの道で: proc::PERF_SAMPLING)、EL0 で
+  鳴った tick (task-clock と cpu-clock: 間だけ走ったら。Linux の hrtimer も高分解能のタイマーのない手本では jiffies
+  ごと)、perf のブレークポイント (hwdebug.rs から: ADDR は bp_addr)。freq なら時計は 1e9 / freq ns、ほかは 1。sigtrap は
+  SIGTRAP (si_code TRAP_PERF、si_addr、si_perf_data は sig_data、si_perf_type は種類: signal.rs の siginfo の形)。
+  attr.task なら PERF_RECORD_FORK (fork したとき、親を数えているもの) と EXIT、attr.comm なら exec の COMM
+  (COMM_EXEC の印)、sample_id_all なら記録の終わりに sample_id。輪のページは写しがなくなってから返す (drm.rs と同じ)
 - atime (test/atime.c、root で ext4 と tmpfs とマウントの印で Linux と 5 行同じ): 前は持たなかった (stat の atime は mtime、
   utimensat の atime は捨てていた)。いまは ext4 は inode の i_atime (秒)、tmpfs は自分の属性に持ち、stat と statx に出す。
   utimensat は atime も決め、ctime をいまに (Linux の notify_change。前は ctime を変えなかった)。読んだら (read、pread、

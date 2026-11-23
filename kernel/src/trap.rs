@@ -427,7 +427,8 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame, kind: u64) {
             return;
         }
         // データと命令のフォルト (変換、アクセスフラグ、権限)。WnR は、キャッシュを整える命令 (CM) なら読んだことに (handle と同じ)
-        if (ec == EC_DABT_LOW || ec == EC_IABT_LOW) && (4..=15).contains(&(esr & 0x3f)) {
+        // perf のサンプリングがあれば、フォルトは大きなロックの道で (perf に知らせる)
+        if (ec == EC_DABT_LOW || ec == EC_IABT_LOW) && (4..=15).contains(&(esr & 0x3f)) && proc::PERF_SAMPLING.load(core::sync::atomic::Ordering::Relaxed) == 0 {
             let write = ec == EC_DABT_LOW && esr & (1 << 6) != 0 && esr & (1 << 8) == 0;
             if proc::current().pt().fast_fault(far() as usize, write, ec == EC_IABT_LOW) {
                 let p = proc::current();
@@ -619,6 +620,10 @@ fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>, esr: u64) {
                         let write = ec == EC_DABT_LOW && esr & (1 << 6) != 0 && !cm;
                         crate::smp::FAULTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                         proc::current().pgfault += 1;
+                        let sampling = proc::PERF_SAMPLING.load(core::sync::atomic::Ordering::Relaxed) != 0;
+                        if sampling && let Some(h) = proc::perf() {
+                            h.sw_event(2, tf, far);
+                        }
                         let mut r = proc::current().pt().fault(far as usize, write, ec == EC_IABT_LOW);
                         // 足りなければ自分のページもスワップへ追い出して、もう一度
                         if matches!(r, Err(crate::vm::FaultErr::NoMem)) && crate::vm::reclaim(crate::vm::RECLAIM_BATCH, 0) > 0 {
@@ -635,6 +640,9 @@ fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>, esr: u64) {
                         match r {
                             Ok(()) => {
                                 proc::current().min_flt += 1;
+                                if sampling && let Some(h) = proc::perf() {
+                                    h.sw_event(5, tf, far);
+                                }
                                 proc::check_killed();
                                 signal::deliver(tf, None);
                                 return;
@@ -708,6 +716,12 @@ fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>, esr: u64) {
                 _ => println!("irq: unexpected {}", id),
             }
             irq::complete(raw);
+            // perf の task-clock / cpu-clock のサンプル (EL0 で鳴った tick: Linux の perf_swevent_hrtimer)
+            if kind == EL0_IRQ && id == timer::IRQ && proc::PERF_SAMPLING.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+                if let Some(h) = proc::perf() {
+                    h.tick(tf);
+                }
+            }
             // EL0 で走っていて、タイムスライスを使いきったなら順番をゆずる
             if kind == EL0_IRQ {
                 // 起こされたものにゆずる印がついていても (ほかの CPU からの IPI か、この CPU の割り込みで起こした)

@@ -2089,10 +2089,18 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
                 Backing::File { ino: ino.clone(), off, fend: usize::MAX, ver: crate::vm::file_ver(ino) }
             }
             // 装置やソケット (画面、音の再生の口、TCP のソケット: file.rs の mmap_dev。Linux の f_op->mmap)。ほかは ENODEV
-            k => match crate::file::mmap_dev(k, &fr, off, len, prot) {
-                Some(b) => b?,
-                None => return Err(-ENODEV),
-            },
+            k => {
+                if let crate::file::Kind::Ops(o) = k
+                    && o.mmap_shared_only()
+                    && flags & MAP_SHARED == 0
+                {
+                    return Err(crate::why::inval());
+                }
+                match crate::file::mmap_dev(k, &fr, off, len, prot) {
+                    Some(b) => b?,
+                    None => return Err(-ENODEV),
+                }
+            }
         }
     } else {
         if len == 0 || !matches!(kind, 1 | 2 | MAP_DROPPABLE) {

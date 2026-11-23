@@ -271,6 +271,8 @@ pub fn rewind(p: &Proc, tf: &mut TrapFrame) {
 pub fn exception(tf: &mut TrapFrame, ec: u64, esr: u64, far: u64) -> Option<(i32, u64)> {
     let p = crate::proc::current();
     let pt_step = p.pt_step;
+    // 当たった perf のもの (数えたあと、サンプリングと sigtrap のために perf.rs に知らせる)
+    let mut hits: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
     let r = match ec {
         // 1 命令すすんだ: 越えていたのなら戻して、ptrace の 1 命令ずつでもなければおしまい (try_step_suspended_breakpoints)。
         // でなければ SIGTRAP、si_addr は次の pc (do_el0_softstep)
@@ -309,6 +311,7 @@ pub fn exception(tf: &mut TrapFrame, ec: u64, esr: u64, far: u64) -> Option<(i32
                     Who::Ptrace => sig = Some((TRAP_HWBKPT, pc)),
                     Who::Perf(i) => {
                         st.perf[i].count += 1;
+                        hits.push(st.perf[i].id);
                         step = true;
                     }
                 }
@@ -324,7 +327,7 @@ pub fn exception(tf: &mut TrapFrame, ec: u64, esr: u64, far: u64) -> Option<(i32
             let st = p.hwdbg.as_deref_mut()?;
             let access = if esr & (1 << 6) != 0 { 2 } else { 1 };
             let mut best: Option<(u64, Who)> = None;
-            let mut hits = alloc::vec::Vec::new();
+            let mut found = alloc::vec::Vec::new();
             for (addr, ctrl, ty, who) in st.on(true) {
                 if access & ty == 0 {
                     continue;
@@ -336,18 +339,19 @@ pub fn exception(tf: &mut TrapFrame, ec: u64, esr: u64, far: u64) -> Option<(i32
                     best = Some((d, who));
                 }
                 if d == 0 {
-                    hits.push(who);
+                    found.push(who);
                 }
             }
-            if hits.is_empty() {
-                hits.extend(best.map(|b| b.1));
+            if found.is_empty() {
+                found.extend(best.map(|b| b.1));
             }
             let (mut sig, mut step) = (None, false);
-            for who in hits {
+            for who in found {
                 match who {
                     Who::Ptrace => sig = Some((TRAP_HWBKPT, far)),
                     Who::Perf(i) => {
                         st.perf[i].count += 1;
+                        hits.push(st.perf[i].id);
                         step = true;
                     }
                 }
@@ -361,5 +365,12 @@ pub fn exception(tf: &mut TrapFrame, ec: u64, esr: u64, far: u64) -> Option<(i32
     };
     // 止めたか戻したブレークポイントと 1 命令ずつを、戻る前に CPU に
     switch_in(p);
+    if !hits.is_empty()
+        && let Some(h) = crate::proc::perf()
+    {
+        for id in hits {
+            h.bp_hit(id, tf, if ec == EC_WATCHPT_LOW { far } else { tf.elr });
+        }
+    }
     r
 }

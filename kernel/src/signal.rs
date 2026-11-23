@@ -41,6 +41,8 @@ const SS_DISABLE: i32 = 2;
 
 // si_code
 pub const SI_USER: i32 = 0;
+/// SIGTRAP の si_code: perf の sigtrap
+pub const TRAP_PERF: i32 = 6;
 pub const SI_KERNEL: i32 = 0x80;
 pub const SI_TIMER: i32 = -2;
 pub const SI_TKILL: i32 = -6;
@@ -655,6 +657,12 @@ fn siginfo_bytes(sig: i32, i: &SigInfo) -> [u8; FRAME_INFO] {
     match sig {
         // フォルトの番地。Linux の siginfo は共用体で、ptrace の知らせ (si_code が SIGTRAP の 5 など) は同じところに
         // si_pid と si_uid を書く: 番地がなくて pid があればそちら
+        // perf の sigtrap (TRAP_PERF 6): si_addr、si_perf_data (value)、si_perf_type (status)、si_perf_flags (0)
+        SIGTRAP if i.code == TRAP_PERF => {
+            put(&mut b, 16, &i.addr.to_le_bytes());
+            put(&mut b, 24, &i.value.to_le_bytes());
+            put(&mut b, 32, &i.status.to_le_bytes());
+        }
         SIGSEGV | SIGBUS | SIGILL | SIGFPE | SIGTRAP if kernel && (i.addr != 0 || i.pid == 0) => put(&mut b, 16, &i.addr.to_le_bytes()),
         SIGSEGV | SIGBUS | SIGILL | SIGFPE | SIGTRAP if kernel => {
             put(&mut b, 16, &crate::ns::local_or_0(i.pid).to_le_bytes());

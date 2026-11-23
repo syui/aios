@@ -9,7 +9,12 @@
 // 写しなおす (sync)。時間 (time_enabled、time_running) は Linux のタスクの文脈と同じく、そのスレッドが走った時間。
 // PERF_TYPE_BREAKPOINT (ブレークポイントとウォッチポイントで数える) は、数えるスレッドの hwdebug.rs の State に置き、
 // 当たった数をそこから読む (当たったら hwdebug.rs が数えて 1 命令越える)。
-// まだないもの (todo.json の syscall-gaps): PMU (ハードウェアの数: ENOENT)、サンプリング (mmap の輪、シグナル)、
+// サンプリング (sample_period / freq): 輪 (mmap: 頭のページと 2^n のページ、data_head と data_tail、LOST、
+// wakeup_events と watermark、poll) に PERF_RECORD_SAMPLE を書く (sample_type の順: Linux の perf_output_sample)。
+// きっかけはページフォルト (trap.rs)、EL0 で鳴った tick (task-clock と cpu-clock: Linux の hrtimer も HZ のない手本では
+// jiffies ごと)、perf のブレークポイント (hwdebug.rs)。sigtrap は SIGTRAP (TRAP_PERF)。attr.task と comm なら
+// PERF_RECORD_FORK、EXIT、COMM も。
+// まだないもの (todo.json の syscall-gaps): PMU (ハードウェアの数: ENOENT)、PERF_RECORD_MMAP / MMAP2 (attr.mmap)、
 // CPU ごとのもの (cpu >= 0: EOPNOTSUPP。root でないなら Linux と同じ EACCES)
 use crate::cell::Bkl;
 use crate::file::{self, Kind};
@@ -57,17 +62,42 @@ const FMT_GROUP: u64 = 8;
 const FMT_LOST: u64 = 16;
 const FMT_MAX: u64 = 32;
 /// sample_type
+const SAMPLE_IP: u64 = 1;
 const SAMPLE_TID: u64 = 1 << 1;
+const SAMPLE_TIME: u64 = 1 << 2;
+const SAMPLE_ADDR: u64 = 1 << 3;
 const SAMPLE_READ: u64 = 1 << 4;
 const SAMPLE_CALLCHAIN: u64 = 1 << 5;
+const SAMPLE_ID: u64 = 1 << 6;
+const SAMPLE_CPU: u64 = 1 << 7;
+const SAMPLE_PERIOD: u64 = 1 << 8;
+const SAMPLE_STREAM_ID: u64 = 1 << 9;
+const SAMPLE_RAW: u64 = 1 << 10;
 const SAMPLE_BRANCH_STACK: u64 = 1 << 11;
 const SAMPLE_REGS_USER: u64 = 1 << 12;
 const SAMPLE_STACK_USER: u64 = 1 << 13;
 const SAMPLE_WEIGHT: u64 = 1 << 14;
+const SAMPLE_DATA_SRC: u64 = 1 << 15;
+const SAMPLE_IDENTIFIER: u64 = 1 << 16;
+const SAMPLE_TRANSACTION: u64 = 1 << 17;
 const SAMPLE_PHYS_ADDR: u64 = 1 << 19;
 const SAMPLE_REGS_INTR: u64 = 1 << 18;
+const SAMPLE_AUX: u64 = 1 << 20;
+const SAMPLE_DATA_PAGE_SIZE: u64 = 1 << 22;
+const SAMPLE_CODE_PAGE_SIZE: u64 = 1 << 23;
 const SAMPLE_WEIGHT_STRUCT: u64 = 1 << 24;
 const SAMPLE_MAX: u64 = 1 << 25;
+/// 輪の記録の種類 (PERF_RECORD_*) と misc
+const REC_LOST: u32 = 2;
+const REC_COMM: u32 = 3;
+const REC_EXIT: u32 = 4;
+const REC_FORK: u32 = 7;
+const REC_SAMPLE: u32 = 9;
+const MISC_USER: u16 = 2;
+const MISC_COMM_EXEC: u16 = 1 << 13;
+/// コールチェーンの「ここからユーザー」 (PERF_CONTEXT_USER)
+const CONTEXT_USER: u64 = (-512i64) as u64;
+const PG: usize = 4096;
 /// perf_event_open の flags
 const FLAG_FD_NO_GROUP: u64 = 1;
 const FLAG_PID_CGROUP: u64 = 4;
@@ -80,8 +110,12 @@ const B_PINNED: u32 = 2;
 const B_EXCLUSIVE: u32 = 3;
 const B_EXCLUDE_USER: u32 = 4;
 const B_EXCLUDE_KERNEL: u32 = 5;
+const B_COMM: u32 = 9;
 const B_FREQ: u32 = 10;
 const B_ENABLE_ON_EXEC: u32 = 12;
+const B_TASK: u32 = 13;
+const B_WATERMARK: u32 = 14;
+const B_SAMPLE_ID_ALL: u32 = 18;
 const B_EXCLUDE_CALLCHAIN_KERNEL: u32 = 21;
 const B_USE_CLOCKID: u32 = 25;
 const B_NAMESPACES: u32 = 28;
@@ -184,7 +218,21 @@ pub struct Event {
     bp: Option<(bool, u8, u64, hwdebug::Ctrl)>,
     read_format: u64,
     bits: u64,
-    sampling: bool,
+    /// サンプリング: sample_type、間 (period。freq なら時計は 1e9 / freq ns、ほかは 1)、前のサンプルからの数と時刻、
+    /// wakeup_events、sigtrap の sig_data、レジスタとスタック、コールチェーンの深さ、ブレークポイントの番地
+    sample_type: u64,
+    period: u64,
+    since: Cell<u64>,
+    last_clock: Cell<u64>,
+    wakeup_events: u32,
+    watermark: u32,
+    sig_data: u64,
+    regs_user: u64,
+    stack_user: u32,
+    regs_intr: u64,
+    max_stack: u16,
+    bp_addr: u64,
+    rb: RefCell<Option<Rc<Rb>>>,
     /// 数える相手 (はじめのスレッドの本当の番号) と、開いたスレッド (prctl の PR_TASK_PERF_EVENTS_*)
     target: u32,
     owner: u32,
@@ -452,7 +500,7 @@ impl PerfFile {
             IOC_RESET => each(&|e| e.reset()),
             // サンプリングのもの (止まるまでの数を足す) だけ
             IOC_REFRESH => {
-                if ev.bit(B_INHERIT) || !ev.sampling {
+                if ev.bit(B_INHERIT) || !(ev.period != 0) {
                     return Err(-EINVAL);
                 }
                 ev.set_on(true);
@@ -461,7 +509,7 @@ impl PerfFile {
                 let mut b = [0u8; 8];
                 me.pt().copy_in(&mut b, arg).ok_or(-EFAULT)?;
                 let v = u64::from_le_bytes(b);
-                if !ev.sampling || v == 0 || v >> 63 != 0 || (ev.bit(B_FREQ) && v > MAX_SAMPLE_RATE.load(Relaxed) as u64) {
+                if !(ev.period != 0) || v == 0 || v >> 63 != 0 || (ev.bit(B_FREQ) && v > MAX_SAMPLE_RATE.load(Relaxed) as u64) {
                     return Err(-EINVAL);
                 }
             }
@@ -501,6 +549,67 @@ impl PerfFile {
     }
 }
 
+impl PerfFile {
+    /// 輪を写す (Linux の perf_mmap): MAP_SHARED、位置 0、1 + 2^n ページ。inherit のスレッドのものはだめ。2 度目は
+    /// 同じ大きさのときだけ (同じ輪)
+    fn mmap_inner(&self, fr: &file::FileRef, off: usize, len: usize, prot: u64) -> Result<crate::vm::Backing, i64> {
+        reap();
+        let ev = &self.0;
+        if off != 0 || ev.bit(B_INHERIT) {
+            return Err(-EINVAL);
+        }
+        let n = len.div_ceil(PG);
+        if n == 0 || (n - 1 != 0 && !(n - 1).is_power_of_two()) {
+            return Err(-EINVAL);
+        }
+        let nr = n - 1;
+        if let Some(rb) = ev.rb.borrow().as_ref() {
+            if rb.nr != nr {
+                return Err(-EINVAL);
+            }
+            return Ok(crate::vm::Backing::Pages { pages: rb.pages.clone(), off: 0, hold: Some(fr.clone()) });
+        }
+        let mut pages = Vec::with_capacity(n);
+        for _ in 0..n {
+            match crate::kalloc::alloc() {
+                Some(p) => pages.push(p),
+                None => {
+                    for p in pages {
+                        crate::kalloc::free(p);
+                    }
+                    return Err(-12);
+                }
+            }
+        }
+        let size = (nr * PG) as u64;
+        let wm = if ev.bit(B_WATERMARK) && ev.watermark != 0 { (ev.watermark as u64).min(size) } else { size / 2 };
+        let rb = Rc::new(Rb {
+            pages: Rc::new(pages),
+            nr,
+            overwrite: prot & 2 == 0,
+            head: Cell::new(0),
+            lost: Cell::new(0),
+            wakeup: Cell::new(0),
+            events: Cell::new(0),
+            watermark: wm,
+            poll: Cell::new(0),
+            generation: Cell::new(0),
+        });
+        // 頭のページ (perf_event_init_userpage): cap_bit0_is_deprecated、size (__reserved の位置)、data_offset と data_size
+        rb.put_hdr(40, 2);
+        rb.put_hdr32(72, 96);
+        rb.put_hdr(1040, PG as u64);
+        rb.put_hdr(1048, size);
+        let pages = rb.pages.clone();
+        *ev.rb.borrow_mut() = Some(rb);
+        Ok(crate::vm::Backing::Pages { pages, off: 0, hold: Some(fr.clone()) })
+    }
+
+    fn chan(&self) -> usize {
+        Rc::as_ptr(&self.0) as usize + 1
+    }
+}
+
 impl file::FileOps for PerfFile {
     fn describe(&self) -> alloc::string::String {
         "anon_inode:[perf_event]".into()
@@ -514,9 +623,25 @@ impl file::FileOps for PerfFile {
     fn ioctl(&self, req: u64, arg: usize, _nonblock: bool) -> Option<Result<i64, i64>> {
         Some(self.ioctl_inner(req, arg))
     }
-    /// 輪がないので POLLHUP だけ (Linux の perf_poll)
+    /// Linux の perf_poll: 数える相手がもういなければ POLLHUP。輪があれば、起こしの印 (POLLIN) をとって返す。なければ POLLHUP
     fn poll_mask(&self) -> Option<u32> {
-        Some(file::POLLHUP)
+        let ev = &self.0;
+        if ev.st.borrow().tasks.is_empty() {
+            return Some(file::POLLHUP);
+        }
+        Some(ev.rb.borrow().as_ref().map_or(file::POLLHUP, |rb| rb.poll.replace(0)))
+    }
+    fn poll_keys(&self) -> Option<Vec<usize>> {
+        Some(alloc::vec![self.chan()])
+    }
+    fn event_gen(&self) -> u64 {
+        self.0.rb.borrow().as_ref().map_or(0, |rb| rb.generation.get())
+    }
+    fn mmap(&self, fr: &file::FileRef, off: usize, len: usize, prot: u64) -> Option<Result<crate::vm::Backing, i64>> {
+        Some(self.mmap_inner(fr, off, len, prot))
+    }
+    fn mmap_shared_only(&self) -> bool {
+        true
     }
     fn release(&self) {
         let ev = &self.0;
@@ -537,6 +662,10 @@ impl file::FileOps for PerfFile {
         }
         let p = Rc::as_ptr(ev);
         EVENTS.get().retain(|w| w.strong_count() > 0 && w.as_ptr() != p);
+        if ev.period != 0 {
+            proc::PERF_SAMPLING.fetch_sub(1, Relaxed);
+        }
+        *ev.rb.borrow_mut() = None;
     }
 }
 
@@ -749,6 +878,15 @@ fn open(uattr: usize, pid: i32, cpu: i32, group_fd: i32, flags: u64) -> R {
             return Err(-E2BIG);
         }
     }
+    // サンプルの間: freq なら時計は 1e9 / freq ns、ほかは 1 から (Linux は数を見てなおしていく)
+    let clock = ty == TYPE_SOFTWARE && matches!(config, SW_CPU_CLOCK | SW_TASK_CLOCK);
+    let speriod = match (b(B_FREQ), period) {
+        (_, 0) => 0,
+        (true, f) if clock => (1_000_000_000 / f).max(1),
+        (true, _) => 1,
+        (false, p) => p,
+    };
+    let bp_addr = le64(&a, 56);
     let ev = Rc::new(Event {
         id: NEXT_ID.fetch_add(1, Relaxed),
         ty,
@@ -756,7 +894,22 @@ fn open(uattr: usize, pid: i32, cpu: i32, group_fd: i32, flags: u64) -> R {
         bp,
         read_format,
         bits,
-        sampling: period != 0,
+        sample_type,
+        period: speriod,
+        since: Cell::new(0),
+        last_clock: Cell::new(0),
+        wakeup_events: u32::from_le_bytes(a[48..52].try_into().unwrap()),
+        watermark: u32::from_le_bytes(a[48..52].try_into().unwrap()),
+        sig_data: le64(&a, 120),
+        regs_user: le64(&a, 80),
+        stack_user: u32::from_le_bytes(a[88..92].try_into().unwrap()),
+        regs_intr: le64(&a, 96),
+        max_stack: match u16::from_le_bytes([a[108], a[109]]) {
+            0 => MAX_STACK.load(Relaxed) as u16,
+            n => n,
+        },
+        bp_addr,
+        rb: RefCell::new(None),
         target: task.pid,
         owner: me.pid,
         enable_on_exec: Cell::new(b(B_ENABLE_ON_EXEC)),
@@ -778,7 +931,354 @@ fn open(uattr: usize, pid: i32, cpu: i32, group_fd: i32, flags: u64) -> R {
         l.siblings.borrow_mut().push(Rc::downgrade(&ev));
     }
     EVENTS.get().push(Rc::downgrade(&ev));
+    if ev.period != 0 {
+        proc::PERF_SAMPLING.fetch_add(1, Relaxed);
+    }
     Ok(fd as i64)
+}
+
+// ---- 輪とサンプル (Linux の kernel/events/ring_buffer.c と perf_output_sample) ----
+
+/// 写した輪: 頭のページと nr (0 か 2^n) のページ。head は書いたところ、lost はなくしたサンプルの数、wakeup と events
+/// は起こすための数 (watermark のバイトごと、wakeup_events のサンプルごと)、poll は poll の印 (POLLIN)
+pub struct Rb {
+    pages: Rc<Vec<*mut u8>>,
+    nr: usize,
+    overwrite: bool,
+    head: Cell<u64>,
+    lost: Cell<u64>,
+    wakeup: Cell<u64>,
+    events: Cell<u32>,
+    watermark: u64,
+    poll: Cell<u32>,
+    generation: Cell<u64>,
+}
+
+/// 写しが持っているかもしれないページ: だれも持たなくなってから返す (drm.rs の Bo と同じ)
+static DEAD: Bkl<Vec<Rc<Vec<*mut u8>>>> = Bkl::new(Vec::new());
+
+impl Drop for Rb {
+    fn drop(&mut self) {
+        DEAD.get().push(self.pages.clone());
+    }
+}
+
+fn reap() {
+    DEAD.get().retain(|p| {
+        if Rc::strong_count(p) > 1 {
+            return true;
+        }
+        for &pg in p.iter() {
+            crate::kalloc::free(pg);
+        }
+        false
+    });
+}
+
+impl Rb {
+    fn put_hdr(&self, off: usize, v: u64) {
+        unsafe { core::ptr::write_volatile(self.pages[0].add(off) as *mut u64, v) };
+    }
+    fn put_hdr32(&self, off: usize, v: u32) {
+        unsafe { core::ptr::write_volatile(self.pages[0].add(off) as *mut u32, v) };
+    }
+    fn hdr(&self, off: usize) -> u64 {
+        unsafe { core::ptr::read_volatile(self.pages[0].add(off) as *const u64) }
+    }
+
+    /// データの pos (ずっとふえる位置) から b を書く (終わりから頭へまわる)
+    fn write_at(&self, mut pos: u64, b: &[u8]) {
+        let size = (self.nr * PG) as u64;
+        let mut i = 0;
+        while i < b.len() {
+            let o = (pos % size) as usize;
+            let (pg, po) = (o / PG, o % PG);
+            let n = (PG - po).min(b.len() - i);
+            unsafe { core::ptr::copy_nonoverlapping(b.as_ptr().add(i), self.pages[1 + pg].add(po), n) };
+            i += n;
+            pos += n as u64;
+        }
+    }
+
+    /// 記録を 1 つ (Linux の __perf_output_begin と perf_output_end): 前になくしたものがあれば先に PERF_RECORD_LOST。
+    /// data_tail まで空きがなければなくす (上書きの写しでなければ)。watermark をこえたか、サンプルが wakeup_events に
+    /// なったら起こす (poll の POLLIN)
+    fn output(&self, ev: &Event, rec: &[u8], sample: bool, chan: usize) {
+        if self.nr == 0 {
+            self.lost.set(self.lost.get() + 1);
+            return;
+        }
+        let mut lost_rec = Vec::new();
+        if self.lost.get() != 0 {
+            lost_rec = header(REC_LOST, 0);
+            put64(&mut lost_rec, ev.id);
+            put64(&mut lost_rec, self.lost.get());
+            if ev.bit(B_SAMPLE_ID_ALL) {
+                sample_id(ev, &mut lost_rec);
+            }
+            fix_size(&mut lost_rec);
+        }
+        let total = (lost_rec.len() + rec.len()) as u64;
+        let size = (self.nr * PG) as u64;
+        let head = self.head.get();
+        let tail = self.hdr(1032);
+        if !self.overwrite && head.wrapping_sub(tail) + total > size {
+            self.lost.set(self.lost.get() + 1);
+            return;
+        }
+        if !lost_rec.is_empty() {
+            self.lost.set(0);
+        }
+        let w0 = self.wakeup.get();
+        let nh = head + total;
+        if nh - self.wakeup.get() > self.watermark {
+            self.wakeup.set(self.wakeup.get() + self.watermark);
+        }
+        self.write_at(head, &lost_rec);
+        self.write_at(head + lost_rec.len() as u64, rec);
+        if sample && !ev.bit(B_WATERMARK) && ev.wakeup_events != 0 {
+            self.events.set(self.events.get() + 1);
+            if self.events.get() >= ev.wakeup_events {
+                self.events.set(self.events.get() - ev.wakeup_events);
+                self.wakeup.set(self.wakeup.get() + 1);
+            }
+        }
+        self.head.set(nh);
+        unsafe { core::arch::asm!("dmb ish") };
+        self.put_hdr(1024, nh);
+        if self.wakeup.get() != w0 {
+            self.poll.set(file::POLLIN | file::POLLRDNORM);
+            self.generation.set(self.generation.get() + 1);
+            proc::wakeup(chan);
+        }
+    }
+}
+
+fn put64(v: &mut Vec<u8>, x: u64) {
+    v.extend_from_slice(&x.to_le_bytes());
+}
+fn put32(v: &mut Vec<u8>, x: u32) {
+    v.extend_from_slice(&x.to_le_bytes());
+}
+/// 記録の頭 (perf_event_header: type、misc、size はあとで fix_size)
+fn header(ty: u32, misc: u16) -> Vec<u8> {
+    let mut v = Vec::with_capacity(64);
+    put32(&mut v, ty);
+    v.extend_from_slice(&misc.to_le_bytes());
+    v.extend_from_slice(&0u16.to_le_bytes());
+    v
+}
+fn fix_size(v: &mut Vec<u8>) {
+    let n = v.len() as u16;
+    v[6..8].copy_from_slice(&n.to_le_bytes());
+}
+
+/// サンプルでない記録の終わりにつける sample_id (sample_id_all: TID、TIME、ID、STREAM_ID、CPU、IDENTIFIER)
+fn sample_id(ev: &Event, v: &mut Vec<u8>) {
+    let me = proc::current();
+    let st = ev.sample_type;
+    if st & SAMPLE_TID != 0 {
+        put32(v, crate::ns::local_or_0(me.tgid));
+        put32(v, crate::ns::local_or_0(me.pid));
+    }
+    if st & SAMPLE_TIME != 0 {
+        put64(v, crate::timer::uptime_ns());
+    }
+    if st & SAMPLE_ID != 0 {
+        put64(v, ev.id);
+    }
+    if st & SAMPLE_STREAM_ID != 0 {
+        put64(v, ev.id);
+    }
+    if st & SAMPLE_CPU != 0 {
+        put32(v, crate::smp::id() as u32);
+        put32(v, 0);
+    }
+    if st & SAMPLE_IDENTIFIER != 0 {
+        put64(v, ev.id);
+    }
+}
+
+/// レジスタ (arm64 の perf_regs: x0〜x30、sp、pc) を abi (64 ビット: 2) とマスクの順に
+fn regs(v: &mut Vec<u8>, tf: &crate::trap::TrapFrame, mask: u64) {
+    put64(v, 2);
+    for i in 0..33 {
+        if mask >> i & 1 != 0 {
+            put64(v, match i {
+                0..=30 => tf.x[i],
+                31 => tf.sp_el0,
+                _ => tf.elr,
+            });
+        }
+    }
+}
+
+/// PERF_RECORD_SAMPLE (Linux の perf_output_sample の順)。ip と addr はユーザーのもの
+fn sample_record(ev: &Event, tf: &crate::trap::TrapFrame, addr: u64, period: u64) -> Vec<u8> {
+    let me = proc::current();
+    let st = ev.sample_type;
+    let mut v = header(REC_SAMPLE, MISC_USER);
+    if st & SAMPLE_IDENTIFIER != 0 {
+        put64(&mut v, ev.id);
+    }
+    if st & SAMPLE_IP != 0 {
+        put64(&mut v, tf.elr);
+    }
+    if st & SAMPLE_TID != 0 {
+        put32(&mut v, crate::ns::local_or_0(me.tgid));
+        put32(&mut v, crate::ns::local_or_0(me.pid));
+    }
+    if st & SAMPLE_TIME != 0 {
+        put64(&mut v, crate::timer::uptime_ns());
+    }
+    if st & SAMPLE_ADDR != 0 {
+        put64(&mut v, addr);
+    }
+    if st & SAMPLE_ID != 0 {
+        put64(&mut v, ev.id);
+    }
+    if st & SAMPLE_STREAM_ID != 0 {
+        put64(&mut v, ev.id);
+    }
+    if st & SAMPLE_CPU != 0 {
+        put32(&mut v, crate::smp::id() as u32);
+        put32(&mut v, 0);
+    }
+    if st & SAMPLE_PERIOD != 0 {
+        put64(&mut v, period);
+    }
+    if st & SAMPLE_READ != 0 {
+        let mut b = alloc::vec![0u8; 8 * (5 + 3 * 64)];
+        let n = PerfFile(read_event(ev)).read_into(&mut b).unwrap_or(0);
+        v.extend_from_slice(&b[..n]);
+    }
+    // コールチェーン (Linux の perf_callchain_user: pc から、x29 の frame record をたどる。上へ進まなければやめる)
+    if st & SAMPLE_CALLCHAIN != 0 {
+        let mut ips = alloc::vec![CONTEXT_USER, tf.elr];
+        let mut fp = tf.x[29];
+        while ips.len() <= ev.max_stack as usize && fp != 0 && fp & 7 == 0 {
+            let mut b = [0u8; 16];
+            if me.pt().copy_in(&mut b, fp as usize).is_none() {
+                break;
+            }
+            let (next, lr) = (u64::from_le_bytes(b[..8].try_into().unwrap()), u64::from_le_bytes(b[8..].try_into().unwrap()));
+            ips.push(lr);
+            if next <= fp {
+                break;
+            }
+            fp = next;
+        }
+        put64(&mut v, ips.len() as u64);
+        for ip in ips {
+            put64(&mut v, ip);
+        }
+    }
+    // RAW (ソフトウェアのものにはない: 大きさ 4 と 0)
+    if st & SAMPLE_RAW != 0 {
+        put32(&mut v, 4);
+        put32(&mut v, 0);
+    }
+    if st & SAMPLE_REGS_USER != 0 {
+        regs(&mut v, tf, ev.regs_user);
+    }
+    // スタック (sp から stack_user バイト。読めないところは 0、読めた大きさを dyn_size に)
+    if st & SAMPLE_STACK_USER != 0 {
+        let size = ev.stack_user as usize;
+        put64(&mut v, size as u64);
+        if size != 0 {
+            let mut b = alloc::vec![0u8; size];
+            let mut got = 0;
+            while got < size {
+                let a = tf.sp_el0 as usize + got;
+                let n = (PG - a % PG).min(size - got);
+                if me.pt().copy_in(&mut b[got..got + n], a).is_none() {
+                    break;
+                }
+                got += n;
+            }
+            v.extend_from_slice(&b);
+            put64(&mut v, got as u64);
+        }
+    }
+    if st & (SAMPLE_WEIGHT | SAMPLE_WEIGHT_STRUCT) != 0 {
+        put64(&mut v, 0);
+    }
+    if st & SAMPLE_DATA_SRC != 0 {
+        put64(&mut v, 0);
+    }
+    if st & SAMPLE_TRANSACTION != 0 {
+        put64(&mut v, 0);
+    }
+    if st & SAMPLE_REGS_INTR != 0 {
+        regs(&mut v, tf, ev.regs_intr);
+    }
+    if st & SAMPLE_PHYS_ADDR != 0 {
+        put64(&mut v, 0);
+    }
+    if st & SAMPLE_DATA_PAGE_SIZE != 0 {
+        put64(&mut v, if addr != 0 { PG as u64 } else { 0 });
+    }
+    if st & SAMPLE_CODE_PAGE_SIZE != 0 {
+        put64(&mut v, PG as u64);
+    }
+    if st & SAMPLE_AUX != 0 {
+        put64(&mut v, 0);
+    }
+    fix_size(&mut v);
+    v
+}
+
+/// ev の Rc (サンプルの READ のため)
+fn read_event(ev: &Event) -> Rc<Event> {
+    live().into_iter().find(|e| e.id == ev.id).expect("perf: live event")
+}
+
+/// あふれた (Linux の __perf_event_overflow): sigtrap なら SIGTRAP、輪があればサンプルを書く
+fn overflow(ev: &Rc<Event>, tf: &crate::trap::TrapFrame, addr: u64) {
+    if ev.bit(B_SIGTRAP) {
+        let info = crate::signal::SigInfo {
+            code: crate::signal::TRAP_PERF,
+            addr: if ev.ty == TYPE_BREAKPOINT { ev.bp_addr } else { addr },
+            value: ev.sig_data,
+            status: ev.ty as i32,
+            ..crate::signal::SigInfo::ZERO
+        };
+        crate::signal::send_thread(proc::current(), crate::signal::SIGTRAP, info);
+    }
+    let rb = ev.rb.borrow().clone();
+    if let Some(rb) = rb {
+        let rec = sample_record(ev, tf, addr, ev.period);
+        rb.output(ev, &rec, true, Rc::as_ptr(ev) as usize + 1);
+    }
+}
+
+/// ev の数があと 1 ふえた: 間に届いたらあふれる
+fn tick_count(ev: &Rc<Event>, tf: &crate::trap::TrapFrame, addr: u64) {
+    let n = ev.since.get() + 1;
+    if n >= ev.period {
+        ev.since.set(0);
+        overflow(ev, tf, addr);
+    } else {
+        ev.since.set(n);
+    }
+}
+
+/// FORK / EXIT の記録 (attr.task: pid、ppid、tid、ptid、time)
+fn task_record(ev: &Event, ty: u32, t: &Proc, parent_tgid: u32, parent_tid: u32) {
+    let rb = ev.rb.borrow().clone();
+    let Some(rb) = rb else { return };
+    let l = crate::ns::local_or_0;
+    let mut v = header(ty, 0);
+    put32(&mut v, l(t.tgid));
+    put32(&mut v, l(parent_tgid));
+    put32(&mut v, l(t.pid));
+    put32(&mut v, l(parent_tid));
+    put64(&mut v, crate::timer::uptime_ns());
+    if ev.bit(B_SAMPLE_ID_ALL) {
+        sample_id(ev, &mut v);
+    }
+    fix_size(&mut v);
+    rb.output(ev, &v, false, Rc::as_ptr(&read_event(ev)) as usize + 1);
 }
 
 fn live() -> Vec<Rc<Event>> {
@@ -796,9 +1296,13 @@ pub struct Hooks;
 pub static HOOKS: Hooks = Hooks;
 
 impl proc::PerfHooks for Hooks {
-    /// inherit: 親を数えているものは、子も (inherit_thread ならスレッドだけ。Linux の inherit_task_group)
+    /// inherit: 親を数えているものは、子も (inherit_thread ならスレッドだけ。Linux の inherit_task_group)。attr.task で
+    /// 有効なものには PERF_RECORD_FORK (親の文脈のもの: Linux の perf_event_fork)
     fn fork(&self, parent: &Proc, child: &mut Proc, thread: bool) {
         for ev in live() {
+            if ev.bit(B_TASK) && ev.st.borrow().on && ev.tracks(parent.pid) {
+                task_record(&ev, REC_FORK, child, parent.tgid, parent.pid);
+            }
             if ev.bit(B_INHERIT) && (thread || !ev.bit(B_INHERIT_THREAD)) && ev.tracks(parent.pid) {
                 // ブレークポイントは子にも置く (スロットがなければ数えない)
                 if ev.install(child).is_err() {
@@ -820,6 +1324,9 @@ impl proc::PerfHooks for Hooks {
     fn exit(&self, p: &Proc) {
         for ev in live() {
             if ev.tracks(p.pid) {
+                if ev.bit(B_TASK) && ev.st.borrow().on {
+                    task_record(&ev, REC_EXIT, p, p.ppid, p.ppid);
+                }
                 ev.untrack(p.pid);
             }
         }
@@ -830,6 +1337,24 @@ impl proc::PerfHooks for Hooks {
         for ev in live() {
             if !ev.tracks(p.pid) {
                 continue;
+            }
+            // PERF_RECORD_COMM (新しい名前、exec の印)
+            if ev.bit(B_COMM) && ev.st.borrow().on && let Some(rb) = ev.rb.borrow().clone() {
+                let l = crate::ns::local_or_0;
+                let mut v = header(REC_COMM, MISC_COMM_EXEC);
+                put32(&mut v, l(p.tgid));
+                put32(&mut v, l(p.pid));
+                let n = p.comm.iter().position(|&c| c == 0).unwrap_or(p.comm.len());
+                v.extend_from_slice(&p.comm[..n]);
+                v.push(0);
+                while v.len() % 8 != 0 {
+                    v.push(0);
+                }
+                if ev.bit(B_SAMPLE_ID_ALL) {
+                    sample_id(&ev, &mut v);
+                }
+                fix_size(&mut v);
+                rb.output(&ev, &v, false, Rc::as_ptr(&ev) as usize + 1);
             }
             if ev.bit(B_REMOVE_ON_EXEC) {
                 ev.untrack(p.pid);
@@ -848,6 +1373,40 @@ impl proc::PerfHooks for Hooks {
             }
         }
         0
+    }
+
+    /// ページフォルト (EL0 から): そのフォルトを数えるサンプリングのもの (ユーザーを数えるもの)
+    fn sw_event(&self, config: u64, tf: &crate::trap::TrapFrame, addr: u64) {
+        let me = proc::current().pid;
+        for ev in live() {
+            if ev.period != 0 && ev.ty == TYPE_SOFTWARE && ev.config == config && !ev.bit(B_EXCLUDE_USER) && ev.active() && ev.tracks(me) {
+                tick_count(&ev, tf, addr);
+            }
+        }
+    }
+
+    /// EL0 で鳴った tick: task-clock と cpu-clock のサンプリングのものは、前のサンプルから間だけ走ったらあふれる
+    fn tick(&self, tf: &crate::trap::TrapFrame) {
+        let p = proc::current();
+        let now = proc::cpu_ns(p);
+        for ev in live() {
+            if ev.period != 0 && ev.ty == TYPE_SOFTWARE && matches!(ev.config, SW_CPU_CLOCK | SW_TASK_CLOCK) && !ev.bit(B_EXCLUDE_USER) && ev.active() && ev.tracks(p.pid) {
+                let last = ev.last_clock.get();
+                if last == 0 || now < last {
+                    ev.last_clock.set(now);
+                } else if now - last >= ev.period {
+                    ev.last_clock.set(now);
+                    overflow(&ev, tf, 0);
+                }
+            }
+        }
+    }
+
+    /// perf のブレークポイントに当たった (hwdebug.rs が数えたあと): サンプリングのものは間ごとにあふれる
+    fn bp_hit(&self, id: u64, tf: &crate::trap::TrapFrame, _addr: u64) {
+        if let Some(ev) = live().into_iter().find(|e| e.id == id && e.period != 0) {
+            tick_count(&ev, tf, ev.bp_addr);
+        }
     }
 }
 
