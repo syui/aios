@@ -123,8 +123,12 @@ int main(void) {
            tb - ta < 30000000 ? "still" : "advanced");
     printf("  pthread_getcpuclockid: %s, its clock %s, id is thread-sched %s\n", en(e),
            other >= 100000000 ? "advanced" : "stuck", !e && (tc & 7) == 6 ? "yes" : "no");
-    // 終わったスレッドの時計は EINVAL
+    // 終わったスレッドの時計は EINVAL (Linux は join から戻ってもまだ片づけていないことがあるので、100 ms まで待つ)
     long r = e ? -1 : syscall(SYS_clock_gettime, tc, &scratch);
+    for (int i = 0; i < 100 && r == 0; i++) {
+      usleep(1000);
+      r = syscall(SYS_clock_gettime, tc, &scratch);
+    }
     printf("  joined thread clock: %s\n", r ? en(errno) : "ok");
 
     // 3. clock_getcpuclockid: 自分、子、いないもの

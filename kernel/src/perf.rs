@@ -17,6 +17,9 @@
 // ものは間で割らずに 1 回ごとに 1 つ (perf_swevent_event)。freq のものは、はじめ間 1 から、あふれるたびと tick ごとに
 // 数と時間を見て間をなおす (perf_adjust_period: 差の 1/8 ずつ)。時計のものは freq を 1e9 / freq ns の決まった間にして
 // しまい (perf_swevent_init_hrtimer)、PERIOD ははじめの間のまま。IOC_PERIOD は freq か間を変える。
+// 1 tick に perf_event_max_sample_rate / HZ (切り上げ) まであふれた時計のものは、次の tick まで止める (Linux の
+// __perf_event_account_interrupt と perf_event_throttle_group: PERF_RECORD_THROTTLE / UNTHROTTLE。数は進む)。
+// ソフトウェアのできごとの 1 つめのあふれは止めない (perf_swevent_overflow の throttle 0)。
 // sigtrap は SIGTRAP (TRAP_PERF)。attr.task と comm なら PERF_RECORD_FORK、EXIT、COMM も。
 // attr.mmap (と mmap2、mmap_data) なら PERF_RECORD_MMAP / MMAP2 (mmap、実行できるようにした mprotect、exec の
 // プログラムの領域: Linux の perf_event_mmap)。
@@ -104,6 +107,18 @@ const REC_COMM: u32 = 3;
 const REC_EXIT: u32 = 4;
 const REC_FORK: u32 = 7;
 const REC_SAMPLE: u32 = 9;
+const REC_THROTTLE: u32 = 5;
+const REC_UNTHROTTLE: u32 = 6;
+
+/// 止めた印 (Linux の MAX_INTERRUPTS)
+const MAX_INTERRUPTS: u64 = u64::MAX;
+/// CPU ごとの tick の番号 (Linux の perf_throttled_seq: あふれた数を tick ごとに数えなおす)
+static THROTTLE_SEQ: [core::sync::atomic::AtomicU64; crate::smp::MAXCPU] = [const { core::sync::atomic::AtomicU64::new(0) }; crate::smp::MAXCPU];
+
+/// 1 tick にあふれてよい数 (Linux の max_samples_per_tick: perf_event_max_sample_rate / HZ を切り上げ)
+fn max_samples_per_tick() -> u64 {
+    (MAX_SAMPLE_RATE.load(Relaxed).max(1) as u64).div_ceil(crate::timer::HZ)
+}
 const MISC_USER: u16 = 2;
 const MISC_COMM_EXEC: u16 = 1 << 13;
 /// コールチェーンの「ここからユーザー」 (PERF_CONTEXT_USER)
@@ -179,6 +194,11 @@ pub fn knob_get(i: usize) -> alloc::string::String {
 }
 
 pub fn knob_set(i: usize, s: &str) -> Result<(), i64> {
+    // 止めないとき (perf_cpu_time_max_percent が 0 か 100) は max_sample_rate を書けない
+    // (Linux の perf_event_max_sample_rate_handler)
+    if i == 1 && matches!(CPU_TIME_MAX_PERCENT.load(Relaxed), 0 | 100) {
+        return Err(-EINVAL);
+    }
     let v = s.trim().parse::<i32>().map_err(|_| -EINVAL)?;
     if v < KNOBS[i].2 || v > KNOBS[i].3 {
         return Err(-EINVAL);
@@ -252,6 +272,9 @@ pub struct Event {
     freq_stamp: Cell<u64>,
     hits: Cell<u64>,
     last_clock: Cell<u64>,
+    /// この tick のあふれの数と、その tick の番号 (Linux の hw.interrupts と interrupts_seq。MAX_INTERRUPTS は止めた)
+    interrupts: Cell<u64>,
+    int_seq: Cell<u64>,
     wakeup_events: u32,
     watermark: u32,
     sig_data: u64,
@@ -447,7 +470,8 @@ impl Event {
         match now {
             Some(t) => {
                 self.last_clock.set(t);
-                crate::timer::hr_arm(self.period.get());
+                // Linux の hrtimer も 10 us より短くしない
+                crate::timer::hr_arm(self.period.get().max(10_000));
             }
             None => self.last_clock.set(0),
         }
@@ -1083,6 +1107,8 @@ fn open(uattr: usize, pid: i32, cpu: i32, group_fd: i32, flags: u64) -> R {
         freq_stamp: Cell::new(0),
         hits: Cell::new(0),
         last_clock: Cell::new(0),
+        interrupts: Cell::new(0),
+        int_seq: Cell::new(0),
         wakeup_events: u32::from_le_bytes(a[48..52].try_into().unwrap()),
         watermark: u32::from_le_bytes(a[48..52].try_into().unwrap()),
         sig_data: le64(&a, 120),
@@ -1518,11 +1544,74 @@ fn read_event(ev: &Event) -> Rc<Event> {
     live().into_iter().find(|e| e.id == ev.id).expect("perf: live event")
 }
 
-/// あふれた (Linux の __perf_event_overflow): freq なら間をなおし、sigtrap なら SIGTRAP、輪があればサンプル (PERIOD は
-/// period) を書く
-fn overflow(ev: &Rc<Event>, tf: &crate::trap::TrapFrame, addr: u64, period: u64) {
+/// THROTTLE / UNTHROTTLE の記録 (Linux の perf_log_throttle: time、id、stream_id)
+fn throttle_record(ev: &Rc<Event>, unthrottle: bool) {
+    let rb = ev.rb.borrow().clone();
+    let Some(rb) = rb else { return };
+    let mut v = header(if unthrottle { REC_UNTHROTTLE } else { REC_THROTTLE }, 0);
+    put64(&mut v, crate::timer::uptime_ns());
+    put64(&mut v, ev.id);
+    put64(&mut v, ev.id);
+    if ev.bit(B_SAMPLE_ID_ALL) {
+        sample_id(ev, &mut v);
+    }
+    fix_size(&mut v);
+    rb.output(ev, &v, false, Rc::as_ptr(ev) as usize + 1);
+}
+
+/// グループのリーダーとメンバー
+fn group_of(ev: &Rc<Event>) -> (Rc<Event>, Vec<Rc<Event>>) {
+    let leader = ev.leader().unwrap_or_else(|| ev.clone());
+    let members = leader.members();
+    (leader, members)
+}
+
+/// グループをまとめて止める (Linux の perf_event_throttle_group: 記録はリーダーだけ)
+fn throttle_group(ev: &Rc<Event>) {
+    let (leader, members) = group_of(ev);
+    for e in core::iter::once(&leader).chain(members.iter()) {
+        if e.active() {
+            e.interrupts.set(MAX_INTERRUPTS);
+            if Rc::ptr_eq(e, &leader) {
+                throttle_record(e, false);
+            }
+        }
+    }
+}
+
+/// 止めたグループをまた動かす (Linux の perf_event_unthrottle_group)
+fn unthrottle_group(ev: &Rc<Event>) {
+    let (leader, members) = group_of(ev);
+    for e in core::iter::once(&leader).chain(members.iter()) {
+        if e.active() {
+            e.interrupts.set(0);
+            if e.is_clock() {
+                e.restart_clock();
+            }
+            if Rc::ptr_eq(e, &leader) {
+                throttle_record(e, true);
+            }
+        }
+    }
+}
+
+/// あふれた (Linux の __perf_event_overflow): この tick のあふれを数え、throttle で上限に届いたら止める。freq なら間を
+/// なおし、sigtrap なら SIGTRAP、輪があればサンプル (PERIOD は period) を書く。止めたか REFRESH の残りで止まったら true
+fn overflow(ev: &Rc<Event>, tf: &crate::trap::TrapFrame, addr: u64, period: u64, throttle: bool) -> bool {
+    let mut ret = false;
+    // この tick のあふれの数 (Linux の __perf_event_account_interrupt)
+    let seq = THROTTLE_SEQ[crate::smp::id()].load(Relaxed);
+    if ev.int_seq.get() != seq {
+        ev.int_seq.set(seq);
+        ev.interrupts.set(1);
+    } else {
+        ev.interrupts.set(ev.interrupts.get().saturating_add(1));
+    }
+    if throttle && ev.interrupts.get() >= max_samples_per_tick() {
+        throttle_group(ev);
+        ret = true;
+    }
     // 前のあふれから 2 tick より短ければ、その時間に last_period 回だったとして間をなおす
-    // (Linux の __perf_event_account_interrupt)
     if ev.freq.get() != 0 {
         let now = crate::timer::uptime_ns();
         let d = now.wrapping_sub(ev.freq_time.get()) as i64;
@@ -1539,6 +1628,7 @@ fn overflow(ev: &Rc<Event>, tf: &crate::trap::TrapFrame, addr: u64, period: u64)
         if left == 1 {
             band = crate::fasync::POLL_HUP;
             ev.set_on(false);
+            ret = true;
         }
     }
     if ev.bit(B_SIGTRAP) {
@@ -1558,6 +1648,7 @@ fn overflow(ev: &Rc<Event>, tf: &crate::trap::TrapFrame, addr: u64, period: u64)
     }
     // O_ASYNC の持ち主に (Linux の perf_event_wakeup の kill_fasync)
     crate::fasync::kill(fasync_key(ev), crate::signal::SIGIO, band);
+    ret
 }
 
 /// O_ASYNC の表の鍵 (fasync.rs): イベントの場所 (inherit で数える子も同じイベント)
@@ -1571,13 +1662,19 @@ fn fasync_key(ev: &Event) -> usize {
 fn sw_hit(ev: &Rc<Event>, nr: u64, tf: &crate::trap::TrapFrame, addr: u64) {
     ev.hits.set(ev.hits.get().wrapping_add(nr));
     let freq = ev.freq.get() != 0;
+    // 止めているあいだはあふれない (Linux の perf_swevent_overflow の MAX_INTERRUPTS)
+    let throttled = ev.interrupts.get() == MAX_INTERRUPTS;
     if ev.sample_type & SAMPLE_PERIOD != 0 && !freq {
-        overflow(ev, tf, addr, nr);
+        if !throttled {
+            overflow(ev, tf, addr, nr, false);
+        }
         return;
     }
     let data = ev.last_period.get();
     if nr == 1 && ev.period.get() == 1 && !freq {
-        overflow(ev, tf, addr, data);
+        if !throttled {
+            overflow(ev, tf, addr, data, false);
+        }
         return;
     }
     let left = ev.left.get() + nr as i64;
@@ -1585,10 +1682,14 @@ fn sw_hit(ev: &Rc<Event>, nr: u64, tf: &crate::trap::TrapFrame, addr: u64) {
     if left < 0 {
         return;
     }
-    for _ in 0..ev.set_period() {
-        overflow(ev, tf, addr, data);
-        // REFRESH の残りで止まった
-        if !ev.active() {
+    let n = ev.set_period();
+    if throttled {
+        return;
+    }
+    // 1 つめは止めず、続けてあふれたものは止める (Linux の perf_swevent_overflow)。止めたか REFRESH の残りで止まったら
+    // そこまで
+    for i in 0..n {
+        if overflow(ev, tf, addr, data, i > 0) {
             break;
         }
     }
@@ -1732,9 +1833,22 @@ impl proc::PerfHooks for Hooks {
         let p = proc::current();
         let cpu = crate::smp::id() as i32;
         let mut next = u64::MAX;
+        // tick ごとにあふれの数を数えなおし、止めたものをまた動かす (Linux の perf_event_task_tick)
+        if real {
+            THROTTLE_SEQ[cpu as usize].fetch_add(1, Relaxed);
+        }
         for ev in live() {
             let mine = if ev.per_cpu() { ev.cpu == cpu } else { ev.tracks(p.pid) && (ev.cpu < 0 || ev.cpu == cpu) };
-            if !ev.sampling || ev.ty != TYPE_SOFTWARE || !ev.active() || !mine {
+            if !ev.sampling || !ev.active() || !mine {
+                continue;
+            }
+            if ev.interrupts.get() == MAX_INTERRUPTS {
+                if !real {
+                    continue;
+                }
+                unthrottle_group(&ev);
+            }
+            if ev.ty != TYPE_SOFTWARE {
                 continue;
             }
             if ev.is_clock() {
@@ -1751,7 +1865,10 @@ impl proc::PerfHooks for Hooks {
                     // 間の倍だけ進めて 1 つ (Linux の hrtimer_forward_now)。PERIOD ははじめの間のまま
                     let k = (now - last) / period;
                     ev.last_clock.set(last + k * period);
-                    overflow(&ev, tf, 0, ev.last_period.get());
+                    if overflow(&ev, tf, 0, ev.last_period.get(), true) {
+                        // 止めた: 次の tick まで鳴らさない
+                        continue;
+                    }
                     next = next.min(period - (now - last - k * period));
                 } else {
                     next = next.min(period - (now - last));
@@ -1766,7 +1883,8 @@ impl proc::PerfHooks for Hooks {
             }
         }
         if next < crate::timer::TICK_NS {
-            crate::timer::hr_arm(next);
+            // Linux の hrtimer も 10 us より短くしない
+            crate::timer::hr_arm(next.max(10_000));
         }
     }
 

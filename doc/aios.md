@@ -1050,7 +1050,14 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   見ない)。ほかの IOC_PERIOD は freq か間を変えて、のこりを 0 に。時計のサンプルは前は tick (10 ms) ごとだけだったが、
   間が tick より短ければ timer::hr_arm で CPU のタイマを期限にも鳴らす (Linux の hrtimer のかわり。timer.rs は CPU ごとに
   次の tick と期限を持ち、期限だけで鳴ったときは tick にしない: 時間の数え、タイムスライス、時刻は tick だけ)。
-  まだないもの: 1 tick にあふれすぎたときの止め (PERF_RECORD_THROTTLE / UNTHROTTLE、max_samples_per_tick)
+- perf のあふれすぎの止め (test/perf9.c、root で Linux 7.4-rc3 と 7 行同じ。手本の Linux に HIGH_RES_TIMERS を足した:
+  なければ時計のサンプルが tick ごとにしか来ず止まらない): あふれを CPU ごとの tick の番号 (Linux の perf_throttled_seq)
+  で数え、時計のもの (hrtimer で鳴らすもの: throttle 1) は 1 tick に perf_event_max_sample_rate / HZ (切り上げ。aios は
+  HZ 100 で既定 1000、手本は HZ 250) に届いたら、グループごと止めて PERF_RECORD_THROTTLE (time、id、stream_id。リーダー
+  だけ) を書き、そのサンプルも書く。次の tick で PERF_RECORD_UNTHROTTLE を書いてまた動かす (perf_adjust_freq_unthr_events)。
+  止まっているあいだも数は進む。ソフトウェアのできごとの 1 つめのあふれは止めない (perf_swevent_overflow の throttle 0)。
+  perf_cpu_time_max_percent が 0 か 100 なら perf_event_max_sample_rate は書けない (EINVAL)。時計の期限は 10 us より
+  短くしない (Linux の hrtimer と同じ)
 - atime (test/atime.c、root で ext4 と tmpfs とマウントの印で Linux と 5 行同じ): 前は持たなかった (stat の atime は mtime、
   utimensat の atime は捨てていた)。いまは ext4 は inode の i_atime (秒)、tmpfs は自分の属性に持ち、stat と statx に出す。
   utimensat は atime も決め、ctime をいまに (Linux の notify_change。前は ctime を変えなかった)。読んだら (read、pread、
