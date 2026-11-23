@@ -944,6 +944,13 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   SIGTRAP (si_code TRAP_PERF、si_addr、si_perf_data は sig_data、si_perf_type は種類: signal.rs の siginfo の形)。
   attr.task なら PERF_RECORD_FORK (fork したとき、親を数えているもの) と EXIT、attr.comm なら exec の COMM
   (COMM_EXEC の印)、sample_id_all なら記録の終わりに sample_id。輪のページは写しがなくなってから返す (drm.rs と同じ)
+- perf の PERF_RECORD_MMAP / MMAP2 (test/perf4.c、Linux 7.4-rc3 と 11 行同じ): perf record が新しく写したライブラリを知る。
+  attr.mmap か mmap2 なら実行できる写し、mmap_data なら読み書きのものも (MISC_MMAP_DATA の印)。きっかけは mmap (Linux の
+  mmap_region の perf_event_mmap)、実行できなかったところを実行できるようにした mprotect (mprotect_fixup)、exec の
+  新しいプログラムの領域 (ここではまとめて番地の順に)。pgoff はバイト (無名なら番地: Linux の vm_pgoff << PAGE_SHIFT)、
+  名前は /proc/PID/maps と同じ (proc::map_names、無名は //anon、装置の写しは anon_inode:[perf_event] など)。MMAP2 は
+  maj と min、ino、prot、flags (MAP_SHARED か MAP_PRIVATE)。記録をとるものがあるあいだ (proc::PERF_MMAP) は、mmap の
+  速い道 (syscall.rs の fast) をとおらない。vm.rs の MapRec と map_recs は /proc/PID/maps と perf でいっしょに
 - atime (test/atime.c、root で ext4 と tmpfs とマウントの印で Linux と 5 行同じ): 前は持たなかった (stat の atime は mtime、
   utimensat の atime は捨てていた)。いまは ext4 は inode の i_atime (秒)、tmpfs は自分の属性に持ち、stat と statx に出す。
   utimensat は atime も決め、ctime をいまに (Linux の notify_change。前は ctime を変えなかった)。読んだら (read、pread、

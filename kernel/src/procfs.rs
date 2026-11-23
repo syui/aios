@@ -719,15 +719,9 @@ impl ProcInode {
     }
 }
 
-/// maps の [heap]、[stack]、[vdso] の手がかり (カーネルのスレッドは なし)
+/// maps の [heap]、[stack]、[vdso] の手がかり (カーネルのスレッドは なし。proc.rs)
 fn map_names(p: &mut Proc) -> crate::vm::MapNames {
-    if p.kthread || p.mm.is_none() {
-        return crate::vm::MapNames::default();
-    }
-    let m = p.mm();
-    let on = !crate::parts::off(crate::parts::Part::Vdso);
-    let (vdso, vvar) = if on { (crate::vdso::VDSO_VA, crate::vdso::VVAR_VA) } else { (0, 0) };
-    crate::vm::MapNames { start_brk: m.heap_start, brk: m.brk, start_stack: crate::exec::USER_STACK_TOP - 1, vdso, vvar }
+    crate::proc::map_names(p)
 }
 
 /// map_files の名前 "はじめ-終わり" (16 進。0 でない数の頭の 0 はだめ: Linux の dname_to_vma_addr)

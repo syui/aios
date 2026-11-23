@@ -14,8 +14,10 @@
 // きっかけはページフォルト (trap.rs)、EL0 で鳴った tick (task-clock と cpu-clock: Linux の hrtimer も HZ のない手本では
 // jiffies ごと)、perf のブレークポイント (hwdebug.rs)。sigtrap は SIGTRAP (TRAP_PERF)。attr.task と comm なら
 // PERF_RECORD_FORK、EXIT、COMM も。
-// まだないもの (todo.json の syscall-gaps): PMU (ハードウェアの数: ENOENT)、PERF_RECORD_MMAP / MMAP2 (attr.mmap)、
-// CPU ごとのもの (cpu >= 0: EOPNOTSUPP。root でないなら Linux と同じ EACCES)
+// attr.mmap (と mmap2、mmap_data) なら PERF_RECORD_MMAP / MMAP2 (mmap、実行できるようにした mprotect、exec の
+// プログラムの領域: Linux の perf_event_mmap)。
+// まだないもの (todo.json の syscall-gaps): PMU (ハードウェアの数: ENOENT)、MMAP2 の build_id、CPU ごとのもの
+// (cpu >= 0: EOPNOTSUPP。root でないなら Linux と同じ EACCES)
 use crate::cell::Bkl;
 use crate::file::{self, Kind};
 use crate::hwdebug;
@@ -88,6 +90,9 @@ const SAMPLE_CODE_PAGE_SIZE: u64 = 1 << 23;
 const SAMPLE_WEIGHT_STRUCT: u64 = 1 << 24;
 const SAMPLE_MAX: u64 = 1 << 25;
 /// 輪の記録の種類 (PERF_RECORD_*) と misc
+const REC_MMAP: u32 = 1;
+const REC_MMAP2: u32 = 10;
+const MISC_MMAP_DATA: u16 = 1 << 13;
 const REC_LOST: u32 = 2;
 const REC_COMM: u32 = 3;
 const REC_EXIT: u32 = 4;
@@ -110,7 +115,10 @@ const B_PINNED: u32 = 2;
 const B_EXCLUSIVE: u32 = 3;
 const B_EXCLUDE_USER: u32 = 4;
 const B_EXCLUDE_KERNEL: u32 = 5;
+const B_MMAP: u32 = 8;
 const B_COMM: u32 = 9;
+const B_MMAP_DATA: u32 = 17;
+const B_MMAP2: u32 = 23;
 const B_FREQ: u32 = 10;
 const B_ENABLE_ON_EXEC: u32 = 12;
 const B_TASK: u32 = 13;
@@ -382,6 +390,10 @@ impl Event {
         let mut v = alloc::vec![leader.clone()];
         v.extend(leader.members());
         v
+    }
+
+    fn wants_mmap(&self) -> bool {
+        self.bit(B_MMAP) || self.bit(B_MMAP2) || self.bit(B_MMAP_DATA)
     }
 
     fn tracks(&self, tid: u32) -> bool {
@@ -665,6 +677,9 @@ impl file::FileOps for PerfFile {
         if ev.period != 0 {
             proc::PERF_SAMPLING.fetch_sub(1, Relaxed);
         }
+        if ev.wants_mmap() {
+            proc::PERF_MMAP.fetch_sub(1, Relaxed);
+        }
         *ev.rb.borrow_mut() = None;
     }
 }
@@ -934,7 +949,48 @@ fn open(uattr: usize, pid: i32, cpu: i32, group_fd: i32, flags: u64) -> R {
     if ev.period != 0 {
         proc::PERF_SAMPLING.fetch_add(1, Relaxed);
     }
+    if ev.wants_mmap() {
+        proc::PERF_MMAP.fetch_add(1, Relaxed);
+    }
     Ok(fd as i64)
+}
+
+/// PERF_RECORD_MMAP / MMAP2 (Linux の perf_event_mmap_output): 実行できるものは attr.mmap か mmap2、ほかは mmap_data
+/// (MMAP_DATA の印)。pgoff はバイト、名前は 8 バイトにそろえて 0 で終わる
+fn mmap_record(ev: &Event, r: &crate::vm::MapRec, name: &str) {
+    let exec = r.prot & 4 != 0;
+    if !(if exec { ev.bit(B_MMAP) || ev.bit(B_MMAP2) } else { ev.bit(B_MMAP_DATA) }) {
+        return;
+    }
+    let rb = ev.rb.borrow().clone();
+    let Some(rb) = rb else { return };
+    let me = proc::current();
+    let l = crate::ns::local_or_0;
+    let misc = MISC_USER | if exec { 0 } else { MISC_MMAP_DATA };
+    let mut v = header(if ev.bit(B_MMAP2) { REC_MMAP2 } else { REC_MMAP }, misc);
+    put32(&mut v, l(me.tgid));
+    put32(&mut v, l(me.pid));
+    put64(&mut v, r.start as u64);
+    put64(&mut v, (r.end - r.start) as u64);
+    put64(&mut v, r.pgoff);
+    if ev.bit(B_MMAP2) {
+        put32(&mut v, r.dev.0);
+        put32(&mut v, r.dev.1);
+        put64(&mut v, r.ino);
+        put64(&mut v, 0);
+        put32(&mut v, r.prot as u32);
+        put32(&mut v, if r.shared { 1 } else { 2 });
+    }
+    v.extend_from_slice(name.as_bytes());
+    v.push(0);
+    while v.len() % 8 != 0 {
+        v.push(0);
+    }
+    if ev.bit(B_SAMPLE_ID_ALL) {
+        sample_id(ev, &mut v);
+    }
+    fix_size(&mut v);
+    rb.output(ev, &v, false, Rc::as_ptr(&read_event(ev)) as usize + 1);
 }
 
 // ---- 輪とサンプル (Linux の kernel/events/ring_buffer.c と perf_output_sample) ----
@@ -1356,6 +1412,13 @@ impl proc::PerfHooks for Hooks {
                 fix_size(&mut v);
                 rb.output(&ev, &v, false, Rc::as_ptr(&ev) as usize + 1);
             }
+            // 新しいプログラムの領域の PERF_RECORD_MMAP (Linux は exec で写すたびに: ここではまとめて番地の順に)
+            if ev.wants_mmap() && ev.st.borrow().on {
+                let names = proc::map_names(proc::current());
+                for r in proc::current().pt().map_recs(names, None) {
+                    mmap_record(&ev, &r, &r.name);
+                }
+            }
             if ev.bit(B_REMOVE_ON_EXEC) {
                 ev.untrack(p.pid);
             } else if ev.enable_on_exec.replace(false) {
@@ -1398,6 +1461,16 @@ impl proc::PerfHooks for Hooks {
                     ev.last_clock.set(now);
                     overflow(&ev, tf, 0);
                 }
+            }
+        }
+    }
+
+    /// 写した: いまのスレッドを数えている有効なものに PERF_RECORD_MMAP / MMAP2
+    fn mmap(&self, rec: &crate::vm::MapRec, name: Option<&str>) {
+        let me = proc::current().pid;
+        for ev in live() {
+            if ev.wants_mmap() && ev.st.borrow().on && ev.tracks(me) {
+                mmap_record(&ev, rec, name.unwrap_or(&rec.name));
             }
         }
     }

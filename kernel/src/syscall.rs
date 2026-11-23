@@ -1005,7 +1005,9 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
         // 同じ表のスレッドがいないときだけ、ひとりで変える (fast_map_threads、fast_unmap の threads: write_enter)。
         // ファイルの mmap、共有、MAP_FIXED、スワップへ出したページのあるところ、知らない印や prot は、ふつうの道
         // (sys_mmap、sys_munmap) へ
+        // perf の MMAP の記録をとるものがあれば、ふつうの道で (記録を書く)
         MMAP if a[3] & !(MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_STACK) == 0
+            && crate::proc::PERF_MMAP.load(core::sync::atomic::Ordering::Relaxed) == 0
             && a[3] & (MAP_PRIVATE | MAP_ANONYMOUS) == MAP_PRIVATE | MAP_ANONYMOUS
             && a[2] & !7 == 0
             && a[5] % 4096 == 0
@@ -1032,6 +1034,7 @@ pub fn fast(tf: &mut TrapFrame) -> bool {
         // ふつうのファイルの写し (MAP_PRIVATE、MAP_FIXED でないもの): ext4 なら同じ inode の新しい InodeRef で
         // (vm::fast_mmap_file)。できなければふつうの道 (エラーもそこで)
         MMAP if a[3] & !(MAP_PRIVATE | MAP_NORESERVE) == 0
+            && crate::proc::PERF_MMAP.load(core::sync::atomic::Ordering::Relaxed) == 0
             && a[3] & MAP_PRIVATE != 0
             && a[2] & !7 == 0
             && a[5] % 4096 == 0
@@ -2048,6 +2051,7 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
     // ファイルを写すなら、その inode (と、/proc/PID/maps に出すパス)
     let mut path: Option<alloc::string::String> = None;
     let mut accessed: Option<(crate::vfs::InodeRef, u32)> = None;
+    let mut dev_name: Option<alloc::string::String> = None;
     // 写しかたの型 (Linux の MAP_TYPE: 1 MAP_SHARED、2 MAP_PRIVATE、3 MAP_SHARED_VALIDATE (ファイルだけ)、8 MAP_DROPPABLE
     // (無名だけ: fork した子では 0、Linux はメモリが足りなければ捨てる。aios は捨てない))。ほかは EINVAL
     let kind = flags & 0xf;
@@ -2095,6 +2099,10 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
                     && flags & MAP_SHARED == 0
                 {
                     return Err(crate::why::inval());
+                }
+                // perf の MMAP の記録の名前 (Linux の d_path: anon_inode:[perf_event] など)
+                if let crate::file::Kind::Ops(o) = k {
+                    dev_name = Some(o.describe());
                 }
                 match crate::file::mmap_dev(k, &fr, off, len, prot) {
                     Some(b) => b?,
@@ -2155,6 +2163,15 @@ fn sys_mmap(addr: usize, len: usize, prot: u64, flags: u64, fd: i64, off: usize)
     }
     if lock != 0 || flags & (MAP_POPULATE | MAP_NONBLOCK) == MAP_POPULATE {
         lock_new(m, va, len, lock, flags & (MAP_POPULATE | MAP_NONBLOCK) == MAP_POPULATE);
+    }
+    // perf の PERF_RECORD_MMAP (Linux の mmap_region の perf_event_mmap)
+    if proc::PERF_MMAP.load(core::sync::atomic::Ordering::Relaxed) != 0
+        && let Some(h) = proc::perf()
+    {
+        let names = proc::map_names(proc::current());
+        for r in proc::current().pt().map_recs(names, Some(va)) {
+            h.mmap(&r, dev_name.as_deref());
+        }
     }
     Ok(va as i64)
 }
@@ -2360,7 +2377,18 @@ fn sys_mprotect(addr: usize, len: usize, prot: u64) -> R {
     if proc::current().pt().sealed_in(addr, addr.saturating_add(pg_up(len))) {
         return Err(-EPERM);
     }
-    proc::current().pt().protect(addr, addr + pg_up(len), prot_bits(prot)).map(|_| 0).map_err(|_| -ENOMEM)
+    // 実行できなかったところを実行できるようにしたら perf の PERF_RECORD_MMAP (Linux の mprotect_fixup の perf_event_mmap)
+    let rec = proc::PERF_MMAP.load(core::sync::atomic::Ordering::Relaxed) != 0
+        && prot & crate::vm::PROT_EXEC as u64 != 0
+        && proc::current().pt().map_recs(crate::vm::MapNames::default(), Some(addr)).first().is_some_and(|r| r.prot & crate::vm::PROT_EXEC == 0);
+    proc::current().pt().protect(addr, addr + pg_up(len), prot_bits(prot)).map_err(|_| -ENOMEM)?;
+    if rec && let Some(h) = proc::perf() {
+        let names = proc::map_names(proc::current());
+        for r in proc::current().pt().map_recs(names, Some(addr)) {
+            h.mmap(&r, None);
+        }
+    }
+    Ok(0)
 }
 
 /// madvise (Linux の do_madvise と同じ順: 知らない値・そろっていない番地・あふれる長さは EINVAL、長さ 0 は 0。写して

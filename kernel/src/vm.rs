@@ -2392,6 +2392,31 @@ impl PageTable {
         out
     }
 
+    /// perf の MMAP の記録のための領域 (at があればそれを含むものだけ)
+    pub fn map_recs(&self, n: MapNames, at: Option<usize>) -> alloc::vec::Vec<MapRec> {
+        let mut out = alloc::vec::Vec::new();
+        for (&s, v) in self.vmas.iter() {
+            if at.is_some_and(|a| a < s || a >= v.end) {
+                continue;
+            }
+            let (pgoff, dev, ino) = match &v.back {
+                Backing::File { off, ino, .. } => (*off as u64, crate::vfs::fs_dev(ino.id().0), ino.meta().ino),
+                Backing::Pages { off, .. } => (*off as u64, (0, 0), 0),
+                Backing::Anon => (s as u64, (0, 0), 0),
+            };
+            let name = match v.name.as_deref() {
+                Some(f) => alloc::format!("/{}", f.trim_start_matches('/')),
+                None if s < n.brk && v.end > n.start_brk => "[heap]".into(),
+                None if s <= n.start_stack && v.end >= n.start_stack && n.start_stack != 0 => "[stack]".into(),
+                None if s == n.vdso && n.vdso != 0 => "[vdso]".into(),
+                None if s == n.vvar && n.vvar != 0 => "[vvar]".into(),
+                None => "//anon".into(),
+            };
+            out.push(MapRec { start: s, end: v.end, prot: v.prot, shared: v.shared, pgoff, name, dev, ino });
+        }
+        out
+    }
+
     fn map_line(&self, s: usize, v: &Vma, n: MapNames) -> alloc::string::String {
         let (off, dev, ino) = match &v.back {
             Backing::File { off, ino, .. } => (*off, crate::vfs::fs_dev(ino.id().0), ino.meta().ino),
@@ -4336,6 +4361,20 @@ pub struct MapNames {
     pub start_stack: usize,
     pub vdso: usize,
     pub vvar: usize,
+}
+
+/// perf の PERF_RECORD_MMAP / MMAP2 のための領域のようす (Linux の perf_event_mmap_event が vma から読むもの): 始めと
+/// 終わり、prot、共有か、pgoff (バイト: ファイルならその位置、無名なら番地)、名前 (ファイルは / からのパス、ほかは
+/// [heap]、[stack]、[vdso]、[vvar]、//anon)、(maj、min)、inode の番号
+pub struct MapRec {
+    pub start: usize,
+    pub end: usize,
+    pub prot: u8,
+    pub shared: bool,
+    pub pgoff: u64,
+    pub name: alloc::string::String,
+    pub dev: (u32, u32),
+    pub ino: u64,
 }
 
 /// ページ表のテーブルのページの数 (根もふくむ。/proc/meminfo の PageTables)

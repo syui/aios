@@ -2301,6 +2301,21 @@ pub trait PerfHooks: Sync {
     fn sw_event(&self, config: u64, tf: &crate::trap::TrapFrame, addr: u64);
     fn tick(&self, tf: &crate::trap::TrapFrame);
     fn bp_hit(&self, id: u64, tf: &crate::trap::TrapFrame, addr: u64);
+    /// 写した (mmap、実行できるようにした mprotect: PERF_MMAP が 0 でないときだけ)。name は装置の写しの名前
+    fn mmap(&self, rec: &crate::vm::MapRec, name: Option<&str>);
+}
+/// MMAP の記録をとる perf のイベントの数 (attr.mmap、mmap2、mmap_data)
+pub static PERF_MMAP: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// maps の [heap]、[stack]、[vdso] の手がかり (procfs と perf の MMAP の記録)
+pub fn map_names(p: &mut Proc) -> crate::vm::MapNames {
+    if p.kthread || p.mm.is_none() {
+        return crate::vm::MapNames::default();
+    }
+    let m = p.mm();
+    let on = !crate::parts::off(crate::parts::Part::Vdso);
+    let (vdso, vvar) = if on { (crate::vdso::VDSO_VA, crate::vdso::VVAR_VA) } else { (0, 0) };
+    crate::vm::MapNames { start_brk: m.heap_start, brk: m.brk, start_stack: crate::exec::USER_STACK_TOP - 1, vdso, vvar }
 }
 /// サンプリングの perf のイベントの数 (0 ならフォルトと tick で perf を呼ばない。ページフォルトはロックなしの道を通らない)
 pub static PERF_SAMPLING: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
