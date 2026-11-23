@@ -149,7 +149,7 @@ pub struct PosixTimer {
     pub notify: i32,
     pub tid: u32,
     pub value: u64,
-    /// 次に鳴る tick (0 なら止まっている) と、くり返しの間隔 (tick)
+    /// 次に鳴る時刻 (起動からの ns、0 なら止まっている) と、くり返しの間隔 (ns)
     pub deadline: u64,
     pub interval: u64,
     pub overrun: i32,

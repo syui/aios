@@ -715,8 +715,10 @@ fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>, esr: u64) {
             match id {
                 timer::IRQ => {
                     real_tick = timer::tick();
-                    // 精しい期限の眠り (nanosleep など): tick でも期限だけのものでも
-                    proc::wake_expired_ns(timer::uptime_ns());
+                    // 精しい期限 (timerfd、POSIX タイマー、itimer) と眠り (nanosleep など): tick でも期限だけのものでも
+                    let now = timer::uptime_ns();
+                    timer::hr_run(now);
+                    proc::wake_expired_ns(now);
                 }
                 // CPU の PMU のあふれ (PPI: pmu.rs が番号を置く)
                 id if id != 0 && id == proc::PMU_IRQ.load(core::sync::atomic::Ordering::Relaxed) => pmu = true,

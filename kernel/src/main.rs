@@ -233,10 +233,13 @@ pub extern "C" fn kmain() -> ! {
     timer::init();
     // CPU の PMU (ARMv8 PMUv3: DTB の arm,armv8-pmuv3。割り込みは GIC のあとで)
     pmu::init();
-    // itimer と POSIX タイマー (Linux の CONFIG_POSIX_TIMERS)、timerfd の期限 (tick ごと。Linux ではそれぞれの hrtimer)
+    // itimer と POSIX タイマー (Linux の CONFIG_POSIX_TIMERS)、timerfd の期限 (その時刻に: Linux の hrtimer。CPU の時計は
+    // tick ごと)
     syscall::register(posix_timers::SYSCALLS, posix_timers::sys);
     timer::every(1, posix_timers::tick);
     timer::every(1, timerfd::tick);
+    timer::hr_hook(posix_timers::hr);
+    timer::hr_hook(timerfd::hr);
     vdso::init();
     // ACPI の機械は RTC を表に書かない (PL031 は DTB だけ): 読めなければ、時刻は EFI の GetTime から (Linux の rtc-efi)。
     // QEMU は PL031 も読めるので、ちがいを出す (test/acpi-boot.sh でたしかめる)

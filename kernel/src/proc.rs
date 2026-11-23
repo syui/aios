@@ -524,7 +524,7 @@ pub struct Proc {
     pub sid: u32,
     /// システムコールに入ったときの x0 (やり直し用)
     pub orig_x0: u64,
-    /// setitimer の (期限, 間隔) と POSIX タイマー (代表スレッドに置く)
+    /// setitimer の (期限 (起動からの ns), 間隔 (ns)) と POSIX タイマー (代表スレッドに置く)
     pub itimer: (u64, u64),
     /// rlimit (Linux の signal_struct の rlim: スレッドグループで 1 つ。代表スレッドに置く: rlimit / set_rlimit)。
     /// None ならはじめの値 (default_rlimits)。表 (NPROC) に 256 バイトずつ持たないように、変えたときにヒープに

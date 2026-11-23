@@ -1083,7 +1083,18 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   でも、どの CPU でも) 期限の来たものを起こし、まだのもののいちばん近いもので鳴らしなおす (proc::wake_expired_ns。
   精しい期限で眠るものがなければ見ない)。仕事のない CPU も、期限があればタイマを止めずにそのときだけ鳴らす。
   clock_getres は REALTIME、MONOTONIC、MONOTONIC_RAW、BOOTTIME、TAI が 1 ns (Linux の hrtimer_resolution)、COARSE は
-  tick。まだ tick のもの: timerfd、POSIX タイマー、itimer、ソケットの SO_RCVTIMEO、端末の VTIME ほか
+  tick。tick のままのもの: ソケットの SO_RCVTIMEO と SO_SNDTIMEO、端末の VTIME (Linux も jiffies: sock_set_timeout、n_tty)
+- tick より細かいタイマ (test/hrtimers.c、Linux 7.4-rc3 と 5 行同じ): 前は timerfd、POSIX タイマー、itimer (ITIMER_REAL) の
+  期限を cpu0 の tick ごとに見ていて、1 ms のくり返しも 10 ms ごと (itimer と POSIX タイマーは間も tick にまるめ、getitimer の
+  間が 10000 us) だった。いまは期限も間も起動からの ns で持ち、timer.rs の「精しい期限で呼ぶもの」の表 (timer::hr_hook。
+  Linux の hrtimer の、鳴ったら呼ぶもの) に timerfd::hr と posix_timers::hr を置く: 決めたとき (timerfd_settime、
+  timer_settime、setitimer) に timer::hr_at でその CPU のタイマを期限に鳴らし、タイマの割り込みのたびに (どの CPU でも)
+  timer::hr_run が期限の来たものを呼ぶ。呼ばれたものは期限の来たものを鳴らし、のこりのいちばん近い期限を返す (それで
+  鳴らしなおす。くり返しで割り込みが続かないよう、次は少なくとも 10 us あと)。くり返しの次の期限は間の目盛りの上 (Linux の
+  hrtimer_forward: 遅れても目盛りはずれない)、とばした数は timer_getoverrun に。timerfd の read も期限 (ns) まで眠る。
+  getitimer ののこりは、動いていれば少なくとも 1 us (Linux の itimer_get_remtime)。CPU の時計のものは前と同じ tick ごと。
+  ちがい: Linux は itimer と POSIX タイマーのくり返しを、シグナルを受けとったときに鳴らしなおす (受けとらないあいだは
+  止まり、とばした数は si_overrun)。aios は鳴ったときに次を決め、si_overrun はいつも 0
 - atime (test/atime.c、root で ext4 と tmpfs とマウントの印で Linux と 5 行同じ): 前は持たなかった (stat の atime は mtime、
   utimensat の atime は捨てていた)。いまは ext4 は inode の i_atime (秒)、tmpfs は自分の属性に持ち、stat と statx に出す。
   utimensat は atime も決め、ctime をいまに (Linux の notify_change。前は ctime を変えなかった)。読んだら (read、pread、

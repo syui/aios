@@ -1,9 +1,9 @@
 // timerfd (timerfd_create / timerfd_settime / timerfd_gettime)。決めた時刻に読めるようになる fd。
 // read で、前に読んでから何回期限が来たか (u64) が返る。interval があればくりかえす。
-// 期限が来たかは、読むとき・poll のとき・タイマの割り込み (tick、cpu0 で 1/100 秒ごと) に見る。
+// 期限が来たかは、読むとき・poll のとき・タイマの割り込み (その期限: timer::hr_at。Linux の hrtimer) に見る。
 // 時刻はみな起動からの ns (CLOCK_MONOTONIC) で覚える。CLOCK_REALTIME の絶対時刻は、決めたときに直す。
 // CPU の時計 (CLOCK_PROCESS_CPUTIME_ID と CLOCK_THREAD_CPUTIME_ID: 作ったプロセスかスレッドのもの) は、その時計の ns で
-// 覚えて tick ごとに見る: aios がえらんだちがい (timerfd-cputime)。Linux は EINVAL (timerfd_create(2) の BUGS:
+// 覚えて tick ごと (cpu0) に見る: aios がえらんだちがい (timerfd-cputime)。Linux は EINVAL (timerfd_create(2) の BUGS:
 // timer_create はできるのに)。シグナルなしで、epoll などで CPU を使いすぎたことを待てる
 use crate::cell::Bkl;
 use crate::file::{self, Kind};
@@ -192,6 +192,10 @@ pub fn settime(fd: u64, flags: u64, new: usize, old: usize) -> Result<i64, i64> 
     }
     if t.borrow().next != 0 {
         armed().push(Rc::downgrade(&t));
+        // 壁と起動からの時計は、その期限にこの CPU のタイマを鳴らす
+        if t.borrow().cpu.is_none() {
+            crate::timer::hr_at(hr, t.borrow().next, false);
+        }
     }
     // もう過ぎていれば、すぐ知らせる
     if update(&mut t.borrow_mut()) {
@@ -225,10 +229,9 @@ pub fn read(t: &TimerRef, dst: &mut [u8], nonblock: bool) -> Result<usize, i64> 
         if nonblock {
             return Err(-EAGAIN);
         }
-        // 期限 (tick) まで眠る。止まっているタイマなら settime を待つ。CPU の時計は壁の時刻では来ないので、tick が起こす
+        // 期限 (起動からの ns) まで眠る。止まっているタイマなら settime を待つ。CPU の時計は壁の時刻では来ないので、tick が起こす
         let cpu = t.borrow().cpu.is_some();
-        let d = if deadline == 0 || cpu { 0 } else { deadline.div_ceil(1_000_000_000 / crate::timer::HZ).max(1) };
-        proc::sleep_until(chan(t), d)?;
+        proc::sleep_until_ns(chan(t), if cpu { 0 } else { deadline })?;
     }
 }
 
@@ -242,23 +245,36 @@ pub fn generation(t: &TimerRef) -> u64 {
     t.borrow().generation
 }
 
-/// タイマの割り込みから (cpu0): 期限の来たものの待ち手を起こす。止まったもの・閉じたものは外す
-pub fn tick() {
+/// 期限の来たものの待ち手を起こす。止まったもの・閉じたものは外す。のこりの壁と起動からの時計のいちばん近い期限 (0 は無し) を返す
+pub fn hr() -> u64 {
     let list = armed();
     if list.is_empty() {
-        return;
+        return 0;
     }
     let mut fired = Vec::new();
+    let mut next = u64::MAX;
     list.retain(|w| {
         let Some(t) = w.upgrade() else { return false };
         let mut tm = t.borrow_mut();
         if update(&mut tm) {
             fired.push(t.clone());
         }
+        if tm.cpu.is_none() && tm.next != 0 {
+            next = next.min(tm.next);
+        }
         tm.next != 0
     });
     for t in fired {
         wake(&t);
+    }
+    if next == u64::MAX { 0 } else { next }
+}
+
+/// tick ごと (cpu0): CPU の時計のもの (と、念のためほかのもの)
+pub fn tick() {
+    if !armed().is_empty() {
+        let next = hr();
+        crate::timer::hr_at(hr, next, true);
     }
 }
 

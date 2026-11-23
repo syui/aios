@@ -1,6 +1,7 @@
 // setitimer・getitimer と POSIX タイマー (timer_create など) (Linux の CONFIG_POSIX_TIMERS: kernel/time/itimer.c、
 // posix-timers.c、posix-cpu-timers.c)。タイマーそのもの (signal::PosixTimer) はプロセスの代表スレッドが持つ (Linux の
-// signal_struct の posix_timers)。main.rs が syscall::register と timer::every でつなぐ
+// signal_struct の posix_timers)。期限は起動からの ns (Linux の hrtimer: timer::hr_at で、その時刻にタイマを鳴らす)。
+// CPU の時計のものは tick ごとに見る。main.rs が syscall::register と timer::every、timer::hr_hook でつなぐ
 use crate::proc;
 use crate::signal::{send_group, send_thread, PosixTimer, SigInfo, NSIG, SIGALRM, SI_KERNEL, SI_TIMER};
 use alloc::vec::Vec;
@@ -36,14 +37,6 @@ fn read_timespec(va: usize) -> Result<u64, i64> {
     Ok(u64::from_le_bytes(b[..8].try_into().unwrap()) * 1_000_000_000 + u64::from_le_bytes(b[8..].try_into().unwrap()))
 }
 
-fn ns_to_ticks(ns: u64) -> u64 {
-    (ns * crate::timer::HZ).div_ceil(1_000_000_000)
-}
-
-fn ticks_to_ns(t: u64) -> u64 {
-    t * 1_000_000_000 / crate::timer::HZ
-}
-
 fn timespec(ns: u64) -> [u8; 16] {
     let mut b = [0u8; 16];
     b[..8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
@@ -65,8 +58,9 @@ fn setitimer(which: u64, new: usize, old: usize) -> R {
         let mut b = [0u8; 32];
         proc::current().pt().copy_in(&mut b, new).ok_or(-EFAULT)?;
         let tv = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap()) * 1_000_000_000 + u64::from_le_bytes(b[o + 8..o + 16].try_into().unwrap()) * 1000;
-        let (interval, value) = (ns_to_ticks(tv(0)), tv(16));
-        leader.itimer = if value == 0 { (0, 0) } else { (crate::timer::ticks_after(value), interval) };
+        let (interval, value) = (tv(0), tv(16));
+        leader.itimer = if value == 0 { (0, 0) } else { (crate::timer::uptime_ns().saturating_add(value).max(1), interval) };
+        crate::timer::hr_at(hr, leader.itimer.0, false);
     }
     Ok(0)
 }
@@ -76,7 +70,8 @@ fn getitimer(which: u64, cur: usize) -> R {
         return Err(crate::why::inval());
     }
     let (deadline, interval) = proc::current_leader().itimer;
-    let left = if deadline == 0 { 0 } else { ticks_to_ns(deadline.saturating_sub(crate::timer::ticks())) };
+    // 動いていれば、過ぎていても 1 us (Linux の itimer_get_remtime)
+    let left = if deadline == 0 { 0 } else { deadline.saturating_sub(crate::timer::uptime_ns()).max(1000) };
     let tv = |ns: u64| {
         let mut b = [0u8; 16];
         b[..8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
@@ -84,7 +79,7 @@ fn getitimer(which: u64, cur: usize) -> R {
         b
     };
     let mut b = [0u8; 32];
-    b[..16].copy_from_slice(&tv(ticks_to_ns(interval)));
+    b[..16].copy_from_slice(&tv(interval));
     b[16..].copy_from_slice(&tv(left));
     out(cur, &b)?;
     Ok(0)
@@ -162,16 +157,19 @@ fn timer_settime(id: i32, flags: u64, new: usize, old: usize) -> R {
         t.overrun = 0;
         return Ok(0);
     }
-    t.interval = ns_to_ticks(interval);
+    // 期限は起動からの ns (REALTIME の絶対時刻は、いまの差で直す。過ぎていればすぐ)
+    let now = crate::timer::uptime_ns();
+    t.interval = interval;
     t.deadline = if value == 0 {
         0
     } else if flags & TIMER_ABSTIME != 0 {
-        let cur = if t.realtime { crate::timer::epoch_ns() } else { crate::timer::uptime_ns() };
-        crate::timer::ticks_after(value.saturating_sub(cur).max(1))
+        let cur = if t.realtime { crate::timer::epoch_ns() } else { now };
+        now.saturating_add(value.saturating_sub(cur)).max(1)
     } else {
-        crate::timer::ticks_after(value)
+        now.saturating_add(value)
     };
     t.overrun = 0;
+    crate::timer::hr_at(hr, t.deadline, false);
     Ok(0)
 }
 
@@ -182,7 +180,7 @@ fn timer_gettime(id: i32, cur: usize) -> R {
             let now = crate::timer::clock_ns(c).unwrap_or(0);
             (if t.cpu_deadline == 0 { 0 } else { t.cpu_deadline.saturating_sub(now).max(1) }, t.cpu_interval)
         }
-        None => (if t.deadline == 0 { 0 } else { ticks_to_ns(t.deadline.saturating_sub(crate::timer::ticks())) }, ticks_to_ns(t.interval)),
+        None => (if t.deadline == 0 { 0 } else { t.deadline.saturating_sub(crate::timer::uptime_ns()).max(1) }, t.interval),
     };
     let mut b = [0u8; 32];
     b[..16].copy_from_slice(&timespec(interval));
@@ -202,15 +200,32 @@ fn timer_delete(id: i32) -> R {
     if l.timers.len() == before { Err(crate::why::inval()) } else { Ok(0) }
 }
 
-/// タイマ割り込みから (timer::every で tick ごと): 期限の来た itimer と POSIX タイマーを鳴らす
+/// くり返しのタイマの次の期限: deadline からの間隔の目盛りで、now より後のもの (Linux の hrtimer_forward)。とばした数も
+fn forward(deadline: u64, interval: u64, now: u64) -> (u64, u64) {
+    let missed = (now - deadline) / interval;
+    (deadline.saturating_add((missed + 1).saturating_mul(interval)), missed)
+}
+
+/// tick ごと (timer::every、cpu0): CPU の時計のもの (と、念のためほかのもの)
 pub fn tick() {
-    let now = crate::timer::ticks();
+    let next = hr();
+    crate::timer::hr_at(hr, next, true);
+}
+
+/// 期限の来た itimer と POSIX タイマーを鳴らす (timer::hr_run から、どの CPU でも)。のこりの壁と起動からの時計のいちばん
+/// 近い期限 (0 は無し) を返す
+pub fn hr() -> u64 {
+    let now = crate::timer::uptime_ns();
+    let mut next = u64::MAX;
     for p in proc::all_leader_procs() {
         let tgid = p.tgid;
         let (deadline, interval) = p.itimer;
         if deadline != 0 && deadline <= now {
-            p.itimer = if interval == 0 { (0, 0) } else { (now + interval, interval) };
+            p.itimer = if interval == 0 { (0, 0) } else { (forward(deadline, interval, now).0, interval) };
             let _ = send_group(tgid, SIGALRM, SigInfo { code: SI_KERNEL, ..SigInfo::ZERO });
+        }
+        if p.itimer.0 != 0 {
+            next = next.min(p.itimer.0);
         }
         let mut fire: Vec<PosixTimer> = Vec::new();
         for t in p.timers.iter_mut() {
@@ -234,7 +249,16 @@ pub fn tick() {
             }
             if t.deadline != 0 && t.deadline <= now {
                 fire.push(*t);
-                t.deadline = if t.interval == 0 { 0 } else { now + t.interval };
+                t.deadline = if t.interval == 0 {
+                    0
+                } else {
+                    let (n, missed) = forward(t.deadline, t.interval, now);
+                    t.overrun = missed.min(i32::MAX as u64) as i32;
+                    n
+                };
+            }
+            if t.deadline != 0 {
+                next = next.min(t.deadline);
             }
         }
         for t in fire {
@@ -252,4 +276,5 @@ pub fn tick() {
             }
         }
     }
+    if next == u64::MAX { 0 } else { next }
 }

@@ -344,7 +344,64 @@ pub fn tick() -> bool {
     true
 }
 
-/// tick ごと (cpu0) に呼ぶもの (Linux では装置やプロトコルがそれぞれ回す timer_list: itimer と POSIX タイマー、timerfd の期限、割り込みの来なかった
+// ---- 精しい期限 (Linux の hrtimer) ----
+// tick より細かい期限で鳴らすもの (timerfd、POSIX タイマー、itimer)。(次の期限 (起動からの ns、0 は無し), 呼ぶもの)。
+// 呼ぶものは期限の来たものを鳴らして、のこりのいちばん近い期限 (0 は無し) を返す。どの CPU のタイマの割り込みでも、
+// 期限が来ていれば呼ぶ (trap から hr_run)。期限はそれを決めた CPU のタイマ (hr_arm) で鳴らす
+const NR_HR: usize = 4;
+static HRS: [(AtomicU64, core::sync::atomic::AtomicUsize); NR_HR] = [const { (AtomicU64::new(0), core::sync::atomic::AtomicUsize::new(0)) }; NR_HR];
+
+/// くり返しのタイマで割り込みが続かないように、hr_run が次に鳴らすのは少なくともこれだけあと (ns。perf の時計と同じ)
+const HR_MIN_NS: u64 = 10_000;
+
+/// f を精しい期限で呼ぶものとして置く (起動のとき)
+pub fn hr_hook(f: fn() -> u64) {
+    let g = EVERY_LOCK.lock();
+    let Some((_, h)) = HRS.iter().find(|e| e.1.load(Ordering::Relaxed) == 0) else { panic!("timer: more than {} hrtimer hooks", NR_HR) };
+    h.store(f as usize, Ordering::Release);
+    drop(g);
+}
+
+/// f (hr_hook で置いたもの) を起動からの deadline ns に呼ぶ (もっと早い期限があればそのまま。0 は何もしない)。
+/// exact なら、いまの期限をこれにする (f の期限をみな見なおしたとき)。この CPU のタイマを鳴らす
+pub fn hr_at(f: fn() -> u64, deadline: u64, exact: bool) {
+    let Some((d, _)) = HRS.iter().find(|e| e.1.load(Ordering::Relaxed) == f as usize) else { return };
+    let cur = d.load(Ordering::Relaxed);
+    if exact || cur == 0 || (deadline != 0 && deadline < cur) {
+        d.store(deadline, Ordering::Relaxed);
+    }
+    if deadline != 0 {
+        hr_arm(deadline.saturating_sub(uptime_ns()));
+    }
+}
+
+/// タイマの割り込みから (どの CPU でも): 期限の来たものを呼び、次の期限でこの CPU のタイマを鳴らす
+pub fn hr_run(now: u64) {
+    for (d, h) in &HRS {
+        let f = h.load(Ordering::Acquire);
+        if f == 0 {
+            break;
+        }
+        let at = d.load(Ordering::Relaxed);
+        if at == 0 || at > now {
+            continue;
+        }
+        d.store(0, Ordering::Relaxed);
+        // SAFETY: hr_hook が fn() -> u64 だけを置く
+        let f: fn() -> u64 = unsafe { core::mem::transmute::<usize, fn() -> u64>(f) };
+        let next = f();
+        let cur = d.load(Ordering::Relaxed);
+        if next != 0 && (cur == 0 || next < cur) {
+            d.store(next, Ordering::Relaxed);
+        }
+        let next = d.load(Ordering::Relaxed);
+        if next != 0 {
+            hr_arm(next.saturating_sub(now).max(HR_MIN_NS));
+        }
+    }
+}
+
+/// tick ごと (cpu0) に呼ぶもの (Linux では装置やプロトコルがそれぞれ回す timer_list: CPU の時計の itimer と POSIX タイマーと timerfd、割り込みの来なかった
 /// ディスクの要求、TCP の再送など)。(何 tick ごとか, 呼ぶもの)。置いた順に呼ぶ。起動のとき (や modprobe のとき) に every で
 const NR_EVERY: usize = 8;
 static EVERY: [(AtomicU64, core::sync::atomic::AtomicUsize); NR_EVERY] = [const { (AtomicU64::new(0), core::sync::atomic::AtomicUsize::new(0)) }; NR_EVERY];
