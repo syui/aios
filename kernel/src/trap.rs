@@ -735,7 +735,8 @@ fn handle(tf: &mut TrapFrame, kind: u64, claimed: Option<u32>, esr: u64) {
                 h.pmu_irq(tf, kind == EL0_IRQ);
             }
             // perf の task-clock / cpu-clock のサンプル (EL0 で鳴ったタイマ: Linux の perf_swevent_hrtimer)
-            if kind == EL0_IRQ && id == timer::IRQ && proc::PERF_SAMPLING.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+            // と、カウンタが足りない PMU のものを回す (multiplex)
+            if kind == EL0_IRQ && id == timer::IRQ && (proc::PERF_SAMPLING.load(core::sync::atomic::Ordering::Relaxed) != 0 || proc::PERF_HW.load(core::sync::atomic::Ordering::Relaxed) != 0) {
                 if let Some(h) = proc::perf() {
                     h.tick(tf, real_tick);
                 }

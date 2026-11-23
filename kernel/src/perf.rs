@@ -249,11 +249,14 @@ fn allow_cpu() -> Result<(), i64> {
 
 // ---- イベント ----
 
-/// 数えているスレッド (はじめのものと、inherit で fork した子) と、前に写したときのその数と走った時間
+/// 数えているスレッド (はじめのものと、inherit で fork した子) と、前に写したときのその数と走った時間と、PMU のものが
+/// カウンタにいた時間 (hw_running) と、入れずに待った時間 (hw_missed)
 struct Task {
     tid: u32,
     c: u64,
     t: u64,
+    hr: u64,
+    hm: u64,
 }
 
 struct St {
@@ -412,7 +415,12 @@ impl Event {
             let here = self.cpu < 0 || t.cpu == self.cpu as usize;
             if act && here {
                 c = c.wrapping_add(dc);
-                r += dt;
+                // PMU のものは、カウンタに入れずに待ったことがあれば、カウンタにいたあいだだけ (multiplex: Linux の
+                // time_running。ずっと入っていれば time_enabled と同じ。グループのものはいっしょに入るので同じ)
+                r += match self.hw {
+                    Some(_) if hw_missed(self.id, t) != k.hm => hw_running(self.id, t).saturating_sub(k.hr),
+                    _ => dt,
+                };
             }
             if st.on {
                 e += dt;
@@ -435,6 +443,9 @@ impl Event {
             if let Some(t) = proc::find_thread(k.tid) {
                 let now = proc::cpu_ns(t);
                 (k.c, k.t) = (self.source(t, now), now);
+                if self.hw.is_some() {
+                    (k.hr, k.hm) = (hw_running(self.id, t), hw_missed(self.id, t));
+                }
             }
         }
     }
@@ -445,6 +456,12 @@ impl Event {
             return;
         }
         let members = self.members();
+        // PMU のもので、いまのスレッドのもの: 先にカウンタを読んで止める (グループのものを同じ時刻で写す)。あとで入れなおす
+        let me = proc::current();
+        let hw = (self.hw.is_some() || members.iter().any(|m| m.hw.is_some())) && (self.tracks(me.pid) || members.iter().any(|m| m.tracks(me.pid))) && !me.kthread;
+        if hw {
+            hw_sched_out(me);
+        }
         for m in &members {
             m.sync();
         }
@@ -465,8 +482,8 @@ impl Event {
             }
         }
         // PMU のもの: いまのスレッドのものなら、カウンタを書きなおす (ほかのスレッドは次に走るとき)
-        if (self.hw.is_some() || members.iter().any(|m| m.hw.is_some())) && (self.tracks(proc::current().pid) || members.iter().any(|m| m.tracks(proc::current().pid))) {
-            hw_reload();
+        if hw {
+            hw_sched_in(proc::current());
         }
     }
 
@@ -1206,7 +1223,7 @@ fn open(uattr: usize, pid: i32, cpu: i32, group_fd: i32, flags: u64) -> R {
         ev.install(task)?;
         let t = proc::cpu_ns(task);
         let c = ev.source(task, t);
-        ev.st.borrow_mut().tasks.push(Task { tid: task.pid, c, t });
+        ev.st.borrow_mut().tasks.push(Task { tid: task.pid, c, t, hr: 0, hm: 0 });
     } else {
         ev.sync();
     }
@@ -1702,13 +1719,37 @@ fn clock_mult_shift(freq: u64) -> (u32, u32) {
 // ---- CPU の PMU のもの (pmu.rs) をスレッドの切りかえで数える ----
 
 /// イベントとスレッドごとの PMU の数 (Linux ではスレッドの文脈のイベントの hw): 足したもの、走っているあいだの
-/// カウンタ (-1 はない)、その CPU、前に読んだ (書いた) カウンタの値
+/// カウンタ (-1 はない)、その CPU、前に読んだ (書いた) カウンタの値、カウンタにいた時間と入れずに待った時間 (スレッドの
+/// 走った時間で) と、いまのカウンタに入った / 待ちはじめたときのスレッドの走った時間
 #[derive(Default)]
 struct HwRun {
     acc: u64,
     idx: Option<u32>,
     cpu: usize,
     prev: u64,
+    run: u64,
+    on_at: u64,
+    missed: u64,
+    off_at: Option<u64>,
+}
+
+/// スレッドごとの、PMU のグループを回す数 (Linux の perf_rotate_context: 先頭のものをうしろへ) と、カウンタに入らなかった
+/// グループがあるスレッド (tick で回す: rotate_necessary)
+static HW_ROT: Bkl<BTreeMap<u32, usize>> = Bkl::new(BTreeMap::new());
+static HW_MUX: Bkl<BTreeMap<u32, ()>> = Bkl::new(BTreeMap::new());
+
+/// スレッド t でこのものが PMU のカウンタにいた時間 (t の走った時間で)
+fn hw_running(id: u64, t: &Proc) -> u64 {
+    let runs = HW_RUNS.get();
+    let Some(r) = runs.get(&(id, t.pid)) else { return 0 };
+    r.run + if r.idx.is_some() { proc::cpu_ns(t).saturating_sub(r.on_at) } else { 0 }
+}
+
+/// スレッド t でこのものが、数えたいのに PMU のカウンタに入れずに待った時間 (t の走った時間で)
+fn hw_missed(id: u64, t: &Proc) -> u64 {
+    let runs = HW_RUNS.get();
+    let Some(r) = runs.get(&(id, t.pid)) else { return 0 };
+    r.missed + r.off_at.map_or(0, |o| proc::cpu_ns(t).saturating_sub(o))
 }
 
 static HW_RUNS: Bkl<BTreeMap<(u64, u32), HwRun>> = Bkl::new(BTreeMap::new());
@@ -1759,8 +1800,9 @@ fn hw_set_period(ev: &Event, hw: &crate::pmu::Hw, idx: u32) -> (bool, u64) {
     (ret, v)
 }
 
-/// p がこの CPU で走りはじめる: そのスレッドの有効な PMU のものをカウンタに書いて動かす (Linux の
-/// perf_event_sched_in と armpmu_add / armpmu_start)。カウンタが足りなければ、そのものは数えない
+/// p がこの CPU で走りはじめる: そのスレッドの有効な PMU のものを、グループごとにまとめてカウンタに書いて動かす (Linux の
+/// perf_event_sched_in、merge_sched_in と armpmu_add / armpmu_start)。pinned のものが先、ほかは回す数 (HW_ROT) だけ
+/// ずらした順に。入らないグループがあれば、あとのものは入れない (Linux の can_add_hw) で、tick で回す (multiplex)
 fn hw_sched_in(p: &Proc) {
     if !crate::pmu::present() {
         return;
@@ -1769,24 +1811,79 @@ fn hw_sched_in(p: &Proc) {
     crate::pmu::stop();
     crate::pmu::disable_all();
     let cpu = crate::smp::id();
-    let mut used = 0u64;
-    let mut any = false;
+    // このスレッドで数える PMU のもの (グループのリーダーごと。ソフトウェアのものはカウンタを使わない)
+    let mut pinned: Vec<Vec<Rc<Event>>> = Vec::new();
+    let mut flexible: Vec<Vec<Rc<Event>>> = Vec::new();
     for ev in live() {
-        let Some(hw) = ev.hw else { continue };
-        if !ev.active() || !ev.tracks(p.pid) || (ev.cpu >= 0 && ev.cpu as usize != cpu) || ev.interrupts.get() == MAX_INTERRUPTS {
+        if ev.leader().is_some() {
             continue;
         }
-        let Some(idx) = crate::pmu::get_idx(&mut used, &hw) else { continue };
-        let (_, v) = hw_set_period(&ev, &hw, idx);
-        let runs = HW_RUNS.get();
-        let r = runs.entry((ev.id, p.pid)).or_default();
-        (r.idx, r.cpu, r.prev) = (Some(idx), cpu, v);
-        crate::pmu::enable(idx, &hw);
-        any = true;
+        let g: Vec<Rc<Event>> = ev
+            .group()
+            .into_iter()
+            .filter(|e| e.hw.is_some() && e.active() && e.tracks(p.pid) && (e.cpu < 0 || e.cpu as usize == cpu) && e.interrupts.get() != MAX_INTERRUPTS)
+            .collect();
+        if !g.is_empty() {
+            if ev.bit(B_PINNED) { pinned.push(g) } else { flexible.push(g) }
+        }
+    }
+    let n = flexible.len();
+    if n > 0 {
+        let rot = HW_ROT.get().get(&p.pid).copied().unwrap_or(0) % n;
+        flexible.rotate_left(rot);
+    }
+    let now = proc::cpu_ns(p);
+    let mut used = 0u64;
+    let mut can_add = true;
+    let mut mux = false;
+    let mut any = false;
+    for g in pinned.iter().chain(flexible.iter()) {
+        let mut u = used;
+        let idxs: Option<Vec<u32>> = if can_add { g.iter().map(|e| crate::pmu::get_idx(&mut u, e.hw.as_ref().unwrap())).collect() } else { None };
+        let Some(idxs) = idxs else {
+            // 入らない: 待つ (time_running は進まない)
+            can_add = false;
+            mux = true;
+            for ev in g {
+                HW_RUNS.get().entry((ev.id, p.pid)).or_default().off_at.get_or_insert(now);
+            }
+            continue;
+        };
+        used = u;
+        for (ev, idx) in g.iter().zip(idxs) {
+            let hw = ev.hw.unwrap();
+            let (_, v) = hw_set_period(ev, &hw, idx);
+            let runs = HW_RUNS.get();
+            let r = runs.entry((ev.id, p.pid)).or_default();
+            (r.idx, r.cpu, r.prev, r.on_at) = (Some(idx), cpu, v, now);
+            if let Some(o) = r.off_at.take() {
+                r.missed += now.saturating_sub(o);
+            }
+            crate::pmu::enable(idx, &hw);
+            any = true;
+        }
+    }
+    if mux {
+        HW_MUX.get().insert(p.pid, ());
+    } else {
+        HW_MUX.get().remove(&p.pid);
+        if n == 0 {
+            HW_ROT.get().remove(&p.pid);
+        }
     }
     if any {
         crate::pmu::start();
     }
+}
+
+/// tick (EL0 で): カウンタに入らなかったグループがあるスレッドなら、グループを回して入れなおす (Linux の
+/// perf_rotate_context。Linux は perf_event_mux_interval_ms ごと、aios は tick ごと)
+fn hw_rotate(p: &Proc) {
+    if p.kthread || !HW_MUX.get().contains_key(&p.pid) {
+        return;
+    }
+    *HW_ROT.get().entry(p.pid).or_default() += 1;
+    hw_reload();
 }
 
 /// p が止まった (か、書きなおす): あふれを見てから、カウンタを読んで足し、みな止める
@@ -1799,14 +1896,19 @@ fn hw_sched_out(p: &Proc) {
         hw_overflow(p.pid, t.tf());
     }
     let cpu = crate::smp::id();
+    let now = proc::cpu_ns(p);
     for ev in live() {
         let Some(hw) = ev.hw else { continue };
         let runs = HW_RUNS.get();
         let Some(r) = runs.get_mut(&(ev.id, p.pid)) else { continue };
-        if let Some(idx) = r.idx.take()
-            && r.cpu == cpu
-        {
-            hw_update(&ev, &hw, r, idx);
+        if let Some(o) = r.off_at.take() {
+            r.missed += now.saturating_sub(o);
+        }
+        if let Some(idx) = r.idx.take() {
+            r.run += now.saturating_sub(r.on_at);
+            if r.cpu == cpu {
+                hw_update(&ev, &hw, r, idx);
+            }
         }
     }
     crate::pmu::disable_all();
@@ -2020,7 +2122,7 @@ impl proc::PerfHooks for Hooks {
                 }
                 let t = proc::cpu_ns(child);
                 let c = ev.source(child, t);
-                ev.st.borrow_mut().tasks.push(Task { tid: child.pid, c, t });
+                ev.st.borrow_mut().tasks.push(Task { tid: child.pid, c, t, hr: 0, hm: 0 });
             }
         }
     }
@@ -2113,6 +2215,10 @@ impl proc::PerfHooks for Hooks {
         // EL1 で鳴った PMU のあふれ
         if proc::PERF_HW.load(Relaxed) != 0 && HW_PENDING[cpu as usize].load(Relaxed) != 0 {
             hw_overflow(p.pid, tf);
+        }
+        // カウンタが足りないスレッドの PMU のグループを回す
+        if real && proc::PERF_HW.load(Relaxed) != 0 {
+            hw_rotate(p);
         }
         for ev in live() {
             let mine = if ev.per_cpu() { ev.cpu == cpu } else { ev.tracks(p.pid) && (ev.cpu < 0 || ev.cpu == cpu) };

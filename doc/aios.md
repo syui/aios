@@ -1073,8 +1073,17 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   ものはカウンタの半分)、あふれは PMU の割り込み (EL0 で鳴ったらすぐサンプル、EL1 なら次に EL0 の tick か止まった
   ところで)。QEMU (TCG) の cycles は 1 ns に 1。mmap の頭のページには arm64 の時刻の変換 (cap_user_time、time_zero、
   time_short、time_mult と time_shift、57 ビットの time_mask: Linux の arch_perf_update_userpage) も。
-  まだないもの: CPU ごとの (pid -1) PMU のもの、カウンタが足りないときの回し (multiplex)、rdpmc (ユーザーから読む)、
-  ACPI の機械の PMU (armv8_pmuv3_0)
+  まだないもの: CPU ごとの (pid -1) PMU のもの、rdpmc (ユーザーから読む)、ACPI の機械の PMU (armv8_pmuv3_0)
+- PMU のカウンタが足りないときの回し (multiplex。test/perfmux.c、Linux 7.4-rc3 と 6 行同じ): 前はスレッドが走りはじめる
+  ときにイベントを 1 つずつ空いたカウンタに入れ、入らないものは数えないまま time_running は time_enabled と同じだった
+  (perf stat の見積もりがくるう)。グループのメンバーも、入ったものだけ数えていた。いまは Linux の merge_sched_in と
+  同じく、グループごとにまとめて入れ (pinned のものが先)、入らないグループがあればあとのものは入れず (can_add_hw)、
+  そのスレッドの tick (EL0) ごとに、先頭のグループをうしろへ回す (perf_rotate_context。Linux は
+  perf_event_mux_interval_ms の 4 ms ごと、aios は tick の 10 ms ごと)。time_running は、カウンタに入れずに待ったことが
+  あれば、カウンタにいたあいだ (スレッドの走った時間で: HwRun の run と missed)。ずっと入っていれば time_enabled と同じ
+  (Linux と同じ)。グループのメンバーは同じ時刻に入り出るので同じ。有効・無効にするときは、先にカウンタを読んで止めて
+  から写す (グループのものを同じ時刻で)。止めて開いたもの (disabled) は、グループに入るかを見るとき数えない (Linux の
+  validate_event と同じ、前から)
 - tick より細かい眠り (test/hrsleep.c、Linux 7.4-rc3 (HIGH_RES_TIMERS) と 12 行同じ。test/cpuclock.c も 47 行同じに):
   前は眠りの期限がみな tick (10 ms) で、nanosleep(300 us) も poll(1 ms) も 10 ms 待っていた。いまは nanosleep、
   clock_nanosleep (TIMER_ABSTIME も)、poll、ppoll、select、epoll_wait、epoll_pwait2、futex の待ち (と PI ロック)、
