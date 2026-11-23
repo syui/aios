@@ -7,7 +7,7 @@
 //              ふつうに、番号を -1 にすると x0 を答えにして飛ばす。tracer がいなければ ENOSYS
 //   listen     PTRACE_LISTEN: SEIZE したものがグループの止まりにいるとき、止まったまま SIGCONT で起きられる (起きたら
 //              PTRACE_EVENT_STOP でまた知らせる)。ほかの止まりでも、SEIZE でなくても EIO
-//   options    PTRACE_O_SUSPEND_SECCOMP (手本の Linux は CHECKPOINT_RESTORE がないので EINVAL)
+//   options    PTRACE_O_SUSPEND_SECCOMP (CAP_SYS_ADMIN がなければ EPERM)、知らない印 (SETOPTIONS は EINVAL、SEIZE は EIO)
 // 1 行ずつ出す (aios と Linux で同じか、test/ldiff.sh でくらべる)。終わりの番号は思ったものでなかった数
 #define _GNU_SOURCE
 #include <elf.h>
@@ -272,8 +272,19 @@ static void listen_(void) {
   long e2 = P(PTRACE_LISTEN, d, 0, 0);
   long so = P(PTRACE_SETOPTIONS, d, 0, PTRACE_O_SUSPEND_SECCOMP);
   printf("listen: not seized %ld; options: SUSPEND_SECCOMP %ld\n", e2, so);
+  long su = P(PTRACE_SETOPTIONS, d, 0, 1L << 30);
   kill(d, SIGKILL);
   wait1(d);
+  pid_t f = fork();
+  if (f == 0) {
+    pause();
+    _exit(0);
+  }
+  long zu = P(PTRACE_SEIZE, f, 0, 1L << 30);
+  long zs = P(PTRACE_SEIZE, f, 0, PTRACE_O_SUSPEND_SECCOMP);
+  printf("options: SETOPTIONS 1<<30 %ld, SEIZE 1<<30 %ld, SEIZE SUSPEND_SECCOMP %ld\n", su, zu, zs);
+  kill(f, SIGKILL);
+  wait1(f);
 }
 
 int main(void) {

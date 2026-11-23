@@ -453,8 +453,9 @@ pub fn dispatch(tf: &mut TrapFrame) -> Option<Restart> {
     // スレッドで分けた表から大きなロックなしで閉じたもの (file::fast_close_shared) を落とす (Linux の fput の task_work)
     crate::file::drop_closed();
     // seccomp: かかっていれば、フィルタの答えにしたがう (security::seccomp_permit_syscall。s は写して持つ: user notification
-    // で眠るあいだに、ほかのスレッドの TSYNC で入れかわっても消えないように)
-    if let Some(s) = p.cred.seccomp.clone() {
+    // で眠るあいだに、ほかのスレッドの TSYNC で入れかわっても消えないように)。tracer が PTRACE_O_SUSPEND_SECCOMP で止めて
+    // いれば見ない (CRIU が restore するあいだ)
+    if let Some(s) = p.cred.seccomp.clone().filter(|_| !p.seccomp_suspended()) {
         let args = [a[0], a[1], a[2], a[3], a[4], a[5]];
         let mut permit = crate::security::seccomp_permit_syscall(&s, nr, &args, tf.elr);
         // SECCOMP_RET_TRACE (Linux の __seccomp_filter): PTRACE_O_TRACESECCOMP の tracer がいなければ ENOSYS。いれば

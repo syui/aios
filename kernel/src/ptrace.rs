@@ -38,8 +38,8 @@ const PTRACE_LISTEN: u64 = 0x4208;
 const PTRACE_PEEKSIGINFO: u64 = 0x4209;
 /// PEEKSIGINFO の flags: プロセス (スレッドグループ) に来たものを
 const PTRACE_PEEKSIGINFO_SHARED: u32 = 1;
-/// seccomp を止める (CHECKPOINT_RESTORE がいる: 手本の Linux にもないので EINVAL)
-const PTRACE_O_SUSPEND_SECCOMP: u64 = 0x20_0000;
+/// seccomp を止める (CRIU のため。CAP_SYS_ADMIN がいる: proc::PT_SUSPEND_SECCOMP)
+const PTRACE_O_SUSPEND_SECCOMP: u64 = proc::PT_SUSPEND_SECCOMP as u64;
 /// 知っている PTRACE_O_* (Linux の PTRACE_O_MASK)
 const PTRACE_O_MASK: u64 = 0x0030_00ff;
 /// GETREGSET の NT_PRSTATUS (struct user_pt_regs: x0〜x30、sp、pc、pstate の 272 バイト)
@@ -113,13 +113,29 @@ fn resume(t: &mut Proc, sig: usize, syscall: bool, step: bool) -> R {
     Ok(0)
 }
 
+/// SEIZE と SETOPTIONS の印 (Linux の check_ptrace_options): 知らないものは EINVAL。SUSPEND_SECCOMP は CAP_SYS_ADMIN が
+/// いり、呼ぶほうに seccomp がかかっているか、呼ぶほうも SUSPEND_SECCOMP で ptrace されていれば EPERM
+fn check_options(data: u64) -> Result<(), i64> {
+    if data & !PTRACE_O_MASK != 0 {
+        return Err(crate::why::inval());
+    }
+    if data & PTRACE_O_SUSPEND_SECCOMP != 0 {
+        let me = proc::current();
+        if !me.cred.capable(crate::cred::CAP_SYS_ADMIN) || me.cred.seccomp.is_some() || me.seccomp_suspended() {
+            return Err(-EPERM);
+        }
+    }
+    Ok(())
+}
+
 fn attach(t: &'static mut Proc, seize: bool, addr: usize, data: usize) -> R {
     let me = proc::current();
+    // SEIZE の知らない印は EIO (SETOPTIONS は EINVAL: Linux の ptrace_attach のむかしからのちがい)
     if seize && (addr != 0 || data as u64 & !PTRACE_O_MASK != 0) {
-        return Err(if addr != 0 { -EIO } else { -EINVAL });
+        return Err(-EIO);
     }
-    if seize && data as u64 & PTRACE_O_SUSPEND_SECCOMP != 0 {
-        return Err(-EINVAL);
+    if seize {
+        check_options(data as u64)?;
     }
     // カーネルのスレッド、自分のスレッドグループ、もうつながっているものは EPERM
     if t.kthread || t.tgid == me.tgid || t.ptracer != 0 || !may_attach(t) {
@@ -202,9 +218,7 @@ pub fn ptrace(req: u64, pid: i32, addr: usize, data: usize) -> R {
             resume(t, data, false, false)
         }
         PTRACE_SETOPTIONS => {
-            if data as u64 & !PTRACE_O_MASK != 0 || data as u64 & PTRACE_O_SUSPEND_SECCOMP != 0 {
-                return Err(-EINVAL);
-            }
+            check_options(data as u64)?;
             t.pt_opts = data as u32;
             Ok(0)
         }

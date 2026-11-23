@@ -2507,6 +2507,16 @@ pub fn register_exit_hook(f: fn(u32)) {
     EXIT_HOOK.set(Some(f));
 }
 
+/// PTRACE_O_SUSPEND_SECCOMP (Linux の PT_SUSPEND_SECCOMP): tracer がこの印で SEIZE か SETOPTIONS したあいだ、seccomp を見ない
+pub const PT_SUSPEND_SECCOMP: u32 = 0x20_0000;
+
+impl Proc {
+    /// seccomp を止められているか (ptrace されていて PTRACE_O_SUSPEND_SECCOMP: Linux の __secure_computing)
+    pub fn seccomp_suspended(&self) -> bool {
+        self.ptracer != 0 && self.pt_opts & PT_SUSPEND_SECCOMP != 0
+    }
+}
+
 fn exit_status(status: i32) -> ! {
     let p = current();
     // PTRACE_O_TRACEEXIT: 終わる前に PTRACE_EVENT_EXIT で止まる (値は wait の status。SIGKILL なら止まらない)
