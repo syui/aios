@@ -944,6 +944,23 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   SIGTRAP (si_code TRAP_PERF、si_addr、si_perf_data は sig_data、si_perf_type は種類: signal.rs の siginfo の形)。
   attr.task なら PERF_RECORD_FORK (fork したとき、親を数えているもの) と EXIT、attr.comm なら exec の COMM
   (COMM_EXEC の印)、sample_id_all なら記録の終わりに sample_id。輪のページは写しがなくなってから返す (drm.rs と同じ)
+- fcntl の持ち主と O_ASYNC (test/fasync.c、Linux 7.4-rc3 と 24 行同じ): fasync.rs (core。Linux の fs/fcntl.c)。前は
+  F_SETOWN / F_GETOWN / F_SETSIG / O_ASYNC がなかった (EINVAL)。持ち主 (Fown: 番号、スレッドかプロセスかグループか、つけた人の
+  uid と euid、F_SETSIG のシグナル) は開いたファイルごと (OpenFile::fown、dup と fork でいっしょ。はじめて要るときに作る)。
+  F_SETOWN (負はグループ、0 は外す、INT_MIN は EINVAL、いない番号は ESRCH: スレッドもゾンビもグループもセッションもいる番号)、
+  F_GETOWN (持ち主が終わって回収されたら 0、ゾンビはまだいる)、F_SETOWN_EX / F_GETOWN_EX (F_OWNER_TID / PID / PGRP。まだなら
+  TID の 0)、F_GETOWNER_UIDS (Linux の CHECKPOINT_RESTORE のもの: 手本の Linux にはない)、F_SETSIG / F_GETSIG (0 から 64)。
+  O_ASYNC は fasync のあるもの (パイプ、ソケット、inotify、/dev/random と /dev/urandom) だけ (F_SETFL と FIOASYNC。ないものは
+  F_SETFL では何もせず、FIOASYNC は ENOTTY。open(2) の O_ASYNC は印だけ残る: Linux と同じ)。表はものの番地を鍵に
+  (パイプは読む口と書く口で 2 つ)、ファイルが最後に閉じたらいなくなる (Weak)。知らせは send_sigio: F_SETSIG のシグナルなら
+  si_code POLL_IN ... (自分の si_code を持つシグナルは SI_SIGIO)、si_band (Linux の band_table)、si_fd (O_ASYNC にしたときの
+  fd の番号)、なければ SIGIO (SI_KERNEL)。送ってよいのは持ち主をつけた人の uid / euid が合うとき (sigio_perm)。siginfo の形は
+  SIL_POLL (signal.rs: ハンドラ、signalfd、ptrace)。パイプは書くと読む口に POLL_IN (EPIPE、EAGAIN、いっぱいで眠る前も)、
+  読むと書く口に POLL_OUT (空で EAGAIN でも)、読む口か書く口の最後が閉じると両方に (Linux の pipe_write、pipe_read、
+  pipe_release)。O_ASYNC の口のあるパイプはロックなしの読み書き (fast_rw、fast_splice) をしない (FAST_RW の 12)。inotify は
+  できごとをためたとき (まとめたものはのぞく)。F_DUPFD_QUERY、F_CREATED_QUERY (open で作ったファイル: OpenFile::created)、
+  F_GET_RW_HINT / F_SET_RW_HINT ((装置, inode) ごとに中で覚える。作ったファイルは消す) も。aios とちがうところ: 持ち主は番号で
+  覚える (Linux は struct pid) ので、終わって番号がほかのプロセスに使われると、そちらに送る
 - perf の PERF_RECORD_MMAP / MMAP2 (test/perf4.c、Linux 7.4-rc3 と 11 行同じ): perf record が新しく写したライブラリを知る。
   attr.mmap か mmap2 なら実行できる写し、mmap_data なら読み書きのものも (MISC_MMAP_DATA の印)。きっかけは mmap (Linux の
   mmap_region の perf_event_mmap)、実行できなかったところを実行できるようにした mprotect (mprotect_fixup)、exec の

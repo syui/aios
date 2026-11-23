@@ -1741,6 +1741,10 @@ impl file::FileOps for SockFile {
     fn describe(&self) -> alloc::string::String {
         alloc::format!("socket:[{}]", Rc::as_ptr(&self.0) as usize & 0xffffff)
     }
+    /// O_ASYNC の表の鍵 (fasync.rs: ソケットの番地。Linux の sock_fasync)
+    fn fasync_key(&self) -> Option<usize> {
+        Some(Rc::as_ptr(&self.0) as *const u8 as usize)
+    }
     fn class(&self) -> usize {
         4
     }

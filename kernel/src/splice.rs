@@ -683,7 +683,8 @@ fn fast_splice(me: &proc::Proc, fd_in: u64, off_in: usize, fd_out: u64, off_out:
     match (&ofi.kind, &ofo.kind) {
         (Kind::PipeRead(p), Kind::Null) if off_in == 0 => {
             let mut pp = p.borrow_mut();
-            if pp.data.len == 0 {
+            // O_ASYNC の口があれば、知らせるのはふつうの道で
+            if pp.data.len == 0 || pp.fasync {
                 return None;
             }
             let k = len.min(pp.data.len);
@@ -732,8 +733,9 @@ fn fast_splice(me: &proc::Proc, fd_in: u64, off_in: usize, fd_out: u64, off_out:
                 let total: usize = parts.iter().map(|x| x.len()).sum();
                 let mut pp = p.borrow_mut();
                 // ファイルのページのかけらごとに箱ひとつ (Linux の splice と同じ)。全部入るときだけ。箱にはそのときの
-                // 中身を写す (aios がえらんだちがい (splice-snapshot): sysfile::splice_file_to_pipe と同じ)
-                if pp.readers == 0 || pp.splice_room(off as u64, total) < total {
+                // 中身を写す (aios がえらんだちがい (splice-snapshot): sysfile::splice_file_to_pipe と同じ)。O_ASYNC の
+                // 口があれば、知らせるのはふつうの道で
+                if pp.readers == 0 || pp.fasync || pp.splice_room(off as u64, total) < total {
                     return false;
                 }
                 if off_in != 0 && !me.pt().copy_out_nofault(off_in, &((off + total) as i64).to_le_bytes()) {

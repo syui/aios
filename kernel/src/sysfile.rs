@@ -42,11 +42,22 @@ const F_GETFD: u64 = 1;
 const F_SETFD: u64 = 2;
 const F_GETFL: u64 = 3;
 const F_SETFL: u64 = 4;
+const F_SETOWN: u64 = 8;
+const F_GETOWN: u64 = 9;
+const F_SETSIG: u64 = 10;
+const F_GETSIG: u64 = 11;
+const F_SETOWN_EX: u64 = 15;
+const F_GETOWN_EX: u64 = 16;
+const F_GETOWNER_UIDS: u64 = 17;
+const F_DUPFD_QUERY: u64 = 1027;
+const F_CREATED_QUERY: u64 = 1028;
 const F_DUPFD_CLOEXEC: u64 = 1030;
 const F_SETPIPE_SZ: u64 = 1031;
 const F_GETPIPE_SZ: u64 = 1032;
 const F_ADD_SEALS: u64 = 1033;
 const F_GET_SEALS: u64 = 1034;
+const F_GET_RW_HINT: u64 = 1035;
+const F_SET_RW_HINT: u64 = 1036;
 const FD_CLOEXEC: u64 = 1;
 
 const O_NONBLOCK: u32 = 0o4000;
@@ -1409,7 +1420,9 @@ fn open_found(found: Found, flags: u64, mode: u64) -> R {
             let lsm_deny = crate::security::file_open(&crate::security::FileOpen { path: &full, flags: flags as u32, dir: false, ouid: ino.meta().uid, how: crate::security::How::Created, dev: false })?;
             inotify::file_event(&full, &ino, inotify::IN_OPEN);
             let f = file::new(Kind::Inode(ino, full), file_flags(flags));
+            rw_hint_forget(&f.borrow());
             f.borrow_mut().lsm_deny = lsm_deny;
+            f.borrow_mut().created = true;
             let fd = proc::current().files().add(f, flags & O_CLOEXEC != 0, 0).ok_or(-EMFILE)?;
             return Ok(fd as i64);
         }
@@ -2617,8 +2630,8 @@ pub fn dup3(old: u64, new: u64, flags: u64) -> R {
 pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
     let p = proc::current().files();
     let entry = p.fds.get_mut(fd as usize).and_then(|f| f.as_mut()).ok_or(-EBADF)?;
-    // O_PATH の fd にできるのは、写す、FD_CLOEXEC、F_GETFL だけ (Linux の check_fcntl_cmd)
-    if entry.file.borrow().flags & file::O_PATH != 0 && !matches!(cmd, F_DUPFD | F_DUPFD_CLOEXEC | F_GETFD | F_SETFD | F_GETFL) {
+    // O_PATH の fd にできるのは、写す、FD_CLOEXEC、F_GETFL、たずねるもの だけ (Linux の check_fcntl_cmd)
+    if entry.file.borrow().flags & file::O_PATH != 0 && !matches!(cmd, F_DUPFD | F_DUPFD_CLOEXEC | F_GETFD | F_SETFD | F_GETFL | F_DUPFD_QUERY | F_CREATED_QUERY) {
         return Err(-EBADF);
     }
     match cmd {
@@ -2663,9 +2676,83 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
             if arg & O_DIRECT != 0 && !odirect {
                 return Err(crate::why::inval());
             }
+            // O_ASYNC は fasync のあるもの (パイプ、ソケット、inotify ...) だけが、表に入れて印をつける (fasync.rs。Linux
+            // の f_op->fasync。ないものは何もしない)
+            if (arg ^ f.flags) & crate::fasync::FASYNC != 0 {
+                drop(f);
+                let file = entry.file.clone();
+                crate::fasync::toggle(fd as i32, &file, arg & crate::fasync::FASYNC != 0);
+                f = entry.file.borrow_mut();
+            }
             f.flags = (f.flags & !MASK) | (arg & MASK);
             if let Kind::Ops(o) = &f.kind {
                 o.set_nonblock(arg as u32 & O_NONBLOCK != 0);
+            }
+            Ok(0)
+        }
+        // 持ち主と、知らせるシグナル (fasync.rs)。F_GETOWN のグループは負 (-4095 より上なら libc はエラーと思う: Linux と同じ)
+        F_SETOWN => crate::fasync::setown(&entry.file.clone(), arg as i32),
+        F_GETOWN => Ok(crate::fasync::getown(&entry.file.clone())),
+        F_SETOWN_EX => {
+            let mut b = [0u8; 8];
+            proc::current().pt().copy_in(&mut b, arg as usize).ok_or(-EFAULT)?;
+            let w = |o: usize| i32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+            crate::fasync::setown_ex(&entry.file.clone(), w(0), w(4))
+        }
+        F_GETOWN_EX => {
+            let (t, pid) = crate::fasync::getown_ex(&entry.file.clone());
+            let mut b = [0u8; 8];
+            b[..4].copy_from_slice(&t.to_le_bytes());
+            b[4..].copy_from_slice(&pid.to_le_bytes());
+            out(arg as usize, &b)?;
+            Ok(0)
+        }
+        F_GETOWNER_UIDS => {
+            let (u, e) = crate::fasync::owner_uids(&entry.file.clone());
+            let mut b = [0u8; 8];
+            b[..4].copy_from_slice(&u.to_le_bytes());
+            b[4..].copy_from_slice(&e.to_le_bytes());
+            out(arg as usize, &b)?;
+            Ok(0)
+        }
+        F_SETSIG => crate::fasync::setsig(&entry.file.clone(), arg as i32),
+        F_GETSIG => Ok(crate::fasync::getsig(&entry.file.clone())),
+        // arg の fd が同じ開いたファイルか (dup したものか)
+        F_DUPFD_QUERY => {
+            let me = entry.file.clone();
+            let other = p.fds.get(arg as i32 as usize).and_then(|f| f.as_ref()).ok_or(-EBADF)?;
+            Ok(alloc::rc::Rc::ptr_eq(&me, &other.file) as i64)
+        }
+        F_CREATED_QUERY => Ok(entry.file.borrow().created as i64),
+        // 書き込みの寿命の見こみ (Linux の inode->i_write_hint: 中だけで覚える)。たしかめる順は Linux の
+        // fcntl_set_rw_hint: 変えられない印 (+i)、持ち主か CAP_FOWNER (EPERM)、読む (EFAULT)、値 (EINVAL)
+        F_GET_RW_HINT => {
+            let h = rw_hint(&entry.file.borrow());
+            out(arg as usize, &h.to_le_bytes())?;
+            Ok(0)
+        }
+        F_SET_RW_HINT => {
+            let f = entry.file.borrow();
+            if let Kind::Inode(i, _) = &f.kind
+                && i.immutable()
+            {
+                return Err(-cred::EPERM);
+            }
+            let c = cred::current();
+            if f.stat().uid != c.fsuid && !c.capable(cred::CAP_FOWNER) {
+                return Err(-cred::EPERM);
+            }
+            let mut b = [0u8; 8];
+            proc::current().pt().copy_in(&mut b, arg as usize).ok_or(-EFAULT)?;
+            let h = u64::from_le_bytes(b);
+            if h > 5 {
+                return Err(crate::why::inval());
+            }
+            let st = f.stat();
+            if h == 0 {
+                RW_HINTS.get().remove(&(st.dev, st.ino));
+            } else {
+                RW_HINTS.get().insert((st.dev, st.ino), h);
             }
             Ok(0)
         }
@@ -2713,6 +2800,23 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> R {
             _ => Err(-EBADF),
         },
         _ => Err(crate::why::inval()),
+    }
+}
+
+/// 書き込みの寿命の見こみ (F_SET_RW_HINT): (装置, inode の番号) ごと。0 (NOT_SET) のものは置かない
+static RW_HINTS: crate::cell::Bkl<alloc::collections::BTreeMap<(u64, u64), u64>> = crate::cell::Bkl::new(alloc::collections::BTreeMap::new());
+
+fn rw_hint(f: &file::OpenFile) -> u64 {
+    let st = f.stat();
+    RW_HINTS.get().get(&(st.dev, st.ino)).copied().unwrap_or(0)
+}
+
+/// 作ったファイルの見こみを消す (同じ番号の前のファイルのものが残らないように)
+fn rw_hint_forget(f: &file::OpenFile) {
+    let hints = RW_HINTS.get();
+    if !hints.is_empty() {
+        let st = f.stat();
+        hints.remove(&(st.dev, st.ino));
     }
 }
 
@@ -2927,6 +3031,17 @@ pub fn ioctl(fd: u64, req: u64, arg: usize) -> R {
     if req == FIOCLEX || req == FIONCLEX {
         if let Some(e) = proc::current().files().fds.get_mut(fd as usize).and_then(|f| f.as_mut()) {
             e.cloexec = req == FIOCLEX;
+        }
+        return Ok(0);
+    }
+    // FIOASYNC: O_ASYNC (fasync.rs)。fasync のないものは ENOTTY (Linux の ioctl_fioasync)
+    const FIOASYNC: u64 = 0x5452;
+    if req == FIOASYNC {
+        let mut v = [0u8; 4];
+        proc::current().pt().copy_in(&mut v, arg).ok_or(-EFAULT)?;
+        let on = u32::from_le_bytes(v) != 0;
+        if on != (f.borrow().flags & crate::fasync::FASYNC != 0) && crate::fasync::toggle(fd as i32, &f, on).is_none() {
+            return Err(-25);
         }
         return Ok(0);
     }

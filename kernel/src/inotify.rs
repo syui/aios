@@ -233,16 +233,19 @@ fn push(n: &InotifyRef, wd: i32, mask: u32, cookie: u32, name: Option<&str>) {
             o.extend_from_slice(&(-1i32).to_le_bytes());
             o.extend_from_slice(&IN_Q_OVERFLOW.to_le_bytes());
             o.extend_from_slice(&[0; 8]);
-            if b.queue.back() != Some(&o) {
-                b.queue.push_back(o);
+            if b.queue.back() == Some(&o) {
+                return;
             }
-            return;
+            b.queue.push_back(o);
+        } else {
+            b.queue.push_back(ev);
         }
-        b.queue.push_back(ev);
         b.generation += 1;
     }
     proc::wakeup(chan(n));
     proc::poll_wake(chan(n));
+    // O_ASYNC (Linux の fsnotify_add_event の kill_fasync。まとめたものはのぞく)
+    crate::fasync::kill(chan(n), crate::signal::SIGIO, crate::fasync::POLL_IN);
 }
 
 /// 見張っている inotify があるか (なければ知らせるところは何もしない)
@@ -419,6 +422,9 @@ pub struct InotifyFile(pub InotifyRef);
 impl file::FileOps for InotifyFile {
     fn describe(&self) -> alloc::string::String {
         "anon_inode:inotify".into()
+    }
+    fn fasync_key(&self) -> Option<usize> {
+        Some(chan(&self.0))
     }
     fn stream(&self) -> bool {
         true

@@ -24,6 +24,7 @@ pub const SIGCONT: i32 = 18;
 pub const SIGSTOP: i32 = 19;
 pub const SIGURG: i32 = 23;
 pub const SIGWINCH: i32 = 28;
+pub const SIGIO: i32 = 29;
 pub const SIGSYS: i32 = 31;
 
 pub const SIG_DFL: u64 = 0;
@@ -451,6 +452,11 @@ pub fn signalfd_info(sig: i32, i: &SigInfo) -> [u8; 128] {
     put(&mut b, 8, &i.code.to_le_bytes());
     let pid = crate::ns::local_or_0(i.pid).to_le_bytes();
     match i.code {
+        // SIGIO の知らせ (fasync.rs): ssi_fd と ssi_band
+        c if crate::fasync::poll_layout(sig, c) => {
+            put(&mut b, 20, &i.status.to_le_bytes());
+            put(&mut b, 28, &(i.addr as u32).to_le_bytes());
+        }
         c if c > SI_USER && c < SI_KERNEL => match sig {
             SIGCHLD => {
                 put(&mut b, 12, &pid);
@@ -655,6 +661,11 @@ fn siginfo_bytes(sig: i32, i: &SigInfo) -> [u8; FRAME_INFO] {
     // sigqueue で送られたものは pid と uid (と値)
     let kernel = i.code > SI_USER && i.code < SI_KERNEL;
     match sig {
+        // SIGIO の知らせ (fasync.rs の send_sigio。Linux の SIL_POLL): si_band と si_fd
+        _ if crate::fasync::poll_layout(sig, i.code) => {
+            put(&mut b, 16, &i.addr.to_le_bytes());
+            put(&mut b, 24, &i.status.to_le_bytes());
+        }
         // フォルトの番地。Linux の siginfo は共用体で、ptrace の知らせ (si_code が SIGTRAP の 5 など) は同じところに
         // si_pid と si_uid を書く: 番地がなくて pid があればそちら
         // perf の sigtrap (TRAP_PERF 6): si_addr、si_perf_data (value)、si_perf_type (status)、si_perf_flags (0)
@@ -988,6 +999,10 @@ pub fn siginfo_from(b: &[u8; 128]) -> (i32, SigInfo) {
     let kernel = i.code > SI_USER && i.code < SI_KERNEL;
     let pid = |o: usize| crate::ns::to_global(i32_at(o) as u32).unwrap_or(0);
     match sig {
+        _ if crate::fasync::poll_layout(sig, i.code) => {
+            i.addr = u64_at(16);
+            i.status = i32_at(24);
+        }
         SIGSEGV | SIGBUS | SIGILL | SIGFPE | SIGTRAP if kernel => i.addr = u64_at(16),
         SIGSYS if kernel => {
             i.timerid = i32_at(4);

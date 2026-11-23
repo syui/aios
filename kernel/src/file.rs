@@ -278,6 +278,10 @@ pub trait FileOps: core::any::Any {
     fn touch(&self, _mtime: Option<u64>) {}
     /// O_NONBLOCK が変わった (FIONBIO、F_SETFL)
     fn set_nonblock(&self, _on: bool) {}
+    /// O_ASYNC の表の鍵 (fasync.rs: そのものの番地)。O_ASYNC を使えないもの (Linux の f_op->fasync がない) は None
+    fn fasync_key(&self) -> Option<usize> {
+        None
+    }
     /// splice で位置のないものとして読む (TCP / UDP: Linux の tcp_splice_read と copy_splice_read)
     fn splice_stream(&self) -> bool {
         false
@@ -436,6 +440,10 @@ pub struct OpenFile {
     /// 開いた (作った) プロセスの LSM のラベル (なければ None: Linux の file->f_security、AppArmor の aa_file_ctx の
     /// label)。ソケットをほかのラベルのプロセスが読み書きするときに見なおす (security::file_permission)
     pub label: Option<crate::security::Label>,
+    /// 持ち主 (F_SETOWN、F_SETSIG: fasync.rs。はじめて要るときに作る。Linux の file->f_owner)
+    pub fown: Option<Rc<crate::fasync::Fown>>,
+    /// この open が作ったファイル (F_CREATED_QUERY。Linux の FMODE_CREATED)
+    pub created: bool,
 }
 
 pub type FileRef = Rc<RefCell<OpenFile>>;
@@ -460,7 +468,7 @@ pub fn new(kind: Kind, flags: u32) -> FileRef {
     if let Kind::Inode(ino, _) = &kind {
         ino.opened();
     }
-    Rc::new(RefCell::new(OpenFile { kind, offset: 0, flags, dirents: None, reading: false, reuse: false, locked: false, lsm_deny: 0, recv_err: 0, label: crate::cred::current().label.clone() }))
+    Rc::new(RefCell::new(OpenFile { kind, offset: 0, flags, dirents: None, reading: false, reuse: false, locked: false, lsm_deny: 0, recv_err: 0, label: crate::cred::current().label.clone(), fown: None, created: false }))
 }
 
 /// 閉じたふつうのファイルの棚 (fd の表ごと)。aios のしかけ (Linux にはない): 読むだけで開いた ext4 のふつうのファイルを
@@ -1850,11 +1858,13 @@ impl Drop for OpenFile {
                 { let mut pp = p.borrow_mut(); pp.readers -= 1; pp.generation += 1; }
                 proc::wakeup(Rc::as_ptr(p) as usize);
                 proc::poll_wake(Rc::as_ptr(p) as usize);
+                pipe_released(p);
             }
             Kind::PipeWrite(p) => {
                 { let mut pp = p.borrow_mut(); pp.writers -= 1; pp.generation += 1; }
                 proc::wakeup(Rc::as_ptr(p) as usize);
                 proc::poll_wake(Rc::as_ptr(p) as usize);
+                pipe_released(p);
             }
             Kind::PipeRw(p) => {
                 let mut pp = p.borrow_mut();
@@ -1864,11 +1874,25 @@ impl Drop for OpenFile {
                 drop(pp);
                 proc::wakeup(Rc::as_ptr(p) as usize);
                 proc::poll_wake(Rc::as_ptr(p) as usize);
+                pipe_released(p);
             }
             Kind::Tty(t) if matches!(t.borrow().dev, tty::Dev::Pty(_)) => tty::close_slave(t),
             Kind::PtyMaster(t) => tty::close_master(t),
             _ => {}
         }
+    }
+}
+
+/// パイプの口を閉じた: 読む口か書く口の最後のもので、もう片方は残っているなら、両方の O_ASYNC の表に知らせる
+/// (Linux の pipe_release。閉じた口はもう表にいない)
+fn pipe_released(p: &Rc<PipeCell>) {
+    let (fa, last) = {
+        let pp = p.borrow();
+        (pp.fasync, (pp.readers == 0) != (pp.writers == 0))
+    };
+    if fa && last {
+        crate::fasync::pipe_readers(p);
+        crate::fasync::pipe_writers(p);
     }
 }
 
@@ -1878,7 +1902,7 @@ pub const PIPE_SIZE: usize = 64 * 1024;
 /// 大きなロックなしの read/write (Pipe::fast_rw) の数: [0] はうまくいったもの、ほかはふつうの道へ行ったわけ
 /// (2 大きさ、3 fd の表をほかのスレッドが変えている途中、4 パイプでない、5 6 ... は fast_rw_inner を見よ)。7 は、うまくいった
 /// もののうち空のパイプで終わり (0) か EAGAIN を返したもの。/proc/bkl に出す
-pub static FAST_RW: [core::sync::atomic::AtomicU64; 12] = [const { core::sync::atomic::AtomicU64::new(0) }; 12];
+pub static FAST_RW: [core::sync::atomic::AtomicU64; 13] = [const { core::sync::atomic::AtomicU64::new(0) }; 13];
 /// 大きなロックなしのファイルの read (fast_read_file) の数: [0] うまくいったもの、ほかはふつうの道へ行ったわけ
 /// (1 大きさか、わざとしくじらせる決まりがある、2 IN_ACCESS の見張り、3 fd の表をほかのスレッドが変えている途中、4 ほかの人がその開いたファイルの
 /// 位置を使っている途中 (pos_slow)、5 ext4 のファイルでない、6 ページキャッシュにない、7 atime を変えるかもしれない
@@ -2034,6 +2058,8 @@ pub struct Pipe {
     pub watchers: usize,
     /// epoll に登録されたことがある (いつ待たれるかわからないので、fast_rw はいつも起こしを頼む)
     pub epolled: bool,
+    /// O_ASYNC の口がある (fasync.rs の表にいる): 読み書きのたびに知らせるので、fast_rw は使わない
+    pub fasync: bool,
 }
 
 /// 大きなロックなしの read (syscall::fast): ext4 のふつうのファイルで、読むところがページキャッシュに全部あるとき。
@@ -2609,7 +2635,7 @@ impl core::ops::DerefMut for PipeGuard<'_> {
 impl Pipe {
     pub fn new() -> (Kind, Kind) {
         let q = PageQueue::new();
-        let p = Rc::new(PipeCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 1, writers: 1, r_opened: 1, w_opened: 1, generation: 0, wrote: 0, taken: 0, sleepers: 0, watchers: 0, epolled: false }));
+        let p = Rc::new(PipeCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 1, writers: 1, r_opened: 1, w_opened: 1, generation: 0, wrote: 0, taken: 0, sleepers: 0, watchers: 0, epolled: false, fasync: false }));
         (Kind::PipeRead(p.clone()), Kind::PipeWrite(p))
     }
 
@@ -2689,7 +2715,7 @@ impl Pipe {
     /// 誰も開いていない FIFO 用
     pub fn empty() -> Rc<PipeCell> {
         let q = PageQueue::new();
-        Rc::new(PipeCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 0, writers: 0, r_opened: 0, w_opened: 0, generation: 0, wrote: 0, taken: 0, sleepers: 0, watchers: 0, epolled: false }))
+        Rc::new(PipeCell::new(Pipe { data: q, cap: PIPE_SIZE, readers: 0, writers: 0, r_opened: 0, w_opened: 0, generation: 0, wrote: 0, taken: 0, sleepers: 0, watchers: 0, epolled: false, fasync: false }))
     }
 
     /// 大きなロックなしの read / write (syscall::fast)。パイプで、眠らずにすむときだけ。ほかは None で
@@ -2721,6 +2747,10 @@ impl Pipe {
             (Kind::PipeRead(p), false) | (Kind::PipeWrite(p), true) => p,
             _ => return Err(4),
         };
+        // O_ASYNC の口があれば、知らせるのはふつうの道で
+        if p.borrow().fasync {
+            return Err(12);
+        }
         if write {
             let mut tmp = Vec::with_capacity(len);
             unsafe { tmp.set_len(len) };
@@ -2789,8 +2819,17 @@ impl Pipe {
         wake_key(Rc::as_ptr(p) as usize);
     }
 
-    /// 読む。peek なら取り除かない (tee 用)
+    /// 読む。peek なら取り除かない (tee 用)。読んだら (空で EAGAIN や終わりでも) 書く口の O_ASYNC の表に POLL_OUT を
+    /// (Linux の pipe_read: 待っていてシグナルで起きたときと、0 バイトの読みはのぞく)
     pub fn read_ex(p: &Rc<PipeCell>, dst: &mut [u8], peek: bool, nonblock: bool) -> Result<usize, i64> {
+        let r = Pipe::read_inner(p, dst, peek, nonblock);
+        if !peek && !dst.is_empty() && !matches!(r, Err(e) if e != -11) && p.borrow().fasync {
+            crate::fasync::pipe_writers(p);
+        }
+        r
+    }
+
+    fn read_inner(p: &Rc<PipeCell>, dst: &mut [u8], peek: bool, nonblock: bool) -> Result<usize, i64> {
         let _p = crate::debug::span("file:pipe_read");
         loop {
             let mut pp = p.borrow_mut();
@@ -2816,6 +2855,15 @@ impl Pipe {
     /// nonblock なら、書けるだけ書いて、1 バイトも書けなければ EAGAIN。入れ方は Linux の anon_pipe_write
     /// (PageQueue): 初めに端数を前の箱に足せたら足し、あとは箱があくだけ
     fn write(p: &Rc<PipeCell>, src: &[u8], nonblock: bool) -> Result<usize, i64> {
+        let r = Pipe::write_inner(p, src, nonblock);
+        // 読む口の O_ASYNC の表に POLL_IN (Linux の pipe_write: EPIPE や EAGAIN でも。0 バイトはのぞく)
+        if !src.is_empty() && p.borrow().fasync {
+            crate::fasync::pipe_readers(p);
+        }
+        r
+    }
+
+    fn write_inner(p: &Rc<PipeCell>, src: &[u8], nonblock: bool) -> Result<usize, i64> {
         let _p = crate::debug::span("file:pipe_write");
         let mut done = 0;
         let mut first = true;
@@ -2849,7 +2897,10 @@ impl Pipe {
                     const EAGAIN: i64 = 11;
                     return if done > 0 { Ok(done) } else { Err(-EAGAIN) };
                 }
-                // いっぱいのまま (起こしたあとに読まれていなければ) 眠る
+                // いっぱいのまま (起こしたあとに読まれていなければ) 眠る。眠る前に読む口の O_ASYNC の表へ
+                if p.borrow().fasync {
+                    crate::fasync::pipe_readers(p);
+                }
                 let pp = p.borrow_mut();
                 if pp.readers > 0 && pp.full()
                     && let Err(e) = Pipe::sleep(p, pp)

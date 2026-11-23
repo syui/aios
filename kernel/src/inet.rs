@@ -5934,6 +5934,10 @@ impl file::FileOps for InetFile {
     fn describe(&self) -> alloc::string::String {
         describe(&self.0)
     }
+    /// O_ASYNC の表の鍵 (fasync.rs: ソケットの番地。Linux の sock_fasync)
+    fn fasync_key(&self) -> Option<usize> {
+        Some(Rc::as_ptr(&self.0) as *const u8 as usize)
+    }
     fn class(&self) -> usize {
         4
     }

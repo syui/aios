@@ -30,7 +30,7 @@
 
   "kernel": {
     "core":  ["boot", "main", "memlayout", "mmio", "spinlock", "cell", "kalloc", "heap", "oom", "tlsf", "mem", "vm", "trap", "irq", "timer", "smp", "dtb", "acpi",
-              "uart", "console", "kmsg", "tty", "proc", "signal", "pidfd", "syscall", "exec", "vdso", "cpuvuln", "hwdebug", "file", "futex", "sysfile", "vfs", "statc", "fastdir", "fs", "tmpfs",
+              "uart", "console", "kmsg", "tty", "proc", "signal", "pidfd", "syscall", "exec", "vdso", "cpuvuln", "hwdebug", "fasync", "file", "futex", "sysfile", "vfs", "statc", "fastdir", "fs", "tmpfs",
               "initrd", "cred", "security", "ns", "crypto", "rand", "parts", "why", "debug"],
     "extra": ["aiproc", "apparmor", "bcm2835_rng", "block", "efi", "efirt", "efivarfs", "epoll", "extfs", "gpu", "drm", "syncobj", "kms", "edid", "htree", "inet", "inotify", "locks", "input", "jbd2", "landlock", "lsm_syscalls",
               "module", "pci", "net", "addrconf", "netif", "netlink", "nftables", "nfhook", "conntrack", "ctnetlink", "audit", "auditfilter", "procfs", "lockstat", "prof", "fail", "trace", "whylog", "sd", "seccomp", "securityfs", "socket", "perf", "ptrace", "splice", "sound", "swap", "sysctl", "sysfs", "sysrq",

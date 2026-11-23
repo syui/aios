@@ -57,6 +57,7 @@ mod futex;
 mod irq;
 mod heap;
 mod hwdebug;
+mod fasync;
 mod tlsf;
 mod mem;
 mod initrd;
