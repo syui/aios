@@ -245,6 +245,8 @@ pub struct Event {
     target: u32,
     owner: u32,
     enable_on_exec: Cell<bool>,
+    /// PERF_EVENT_IOC_REFRESH の残り (0 はかぎりなし。0 になったら止まる: Linux の event_limit)
+    limit: Cell<i64>,
     st: RefCell<St>,
     /// グループ: メンバーならリーダー、リーダーならメンバーたち
     leader: RefCell<Option<Weak<Event>>>,
@@ -515,6 +517,7 @@ impl PerfFile {
                 if ev.bit(B_INHERIT) || !(ev.period != 0) {
                     return Err(-EINVAL);
                 }
+                ev.limit.set(ev.limit.get() + arg as i32 as i64);
                 ev.set_on(true);
             }
             IOC_PERIOD => {
@@ -654,6 +657,10 @@ impl file::FileOps for PerfFile {
     }
     fn mmap_shared_only(&self) -> bool {
         true
+    }
+    /// O_ASYNC (Linux の perf_fasync): あふれるたびに持ち主に知らせる
+    fn fasync_key(&self) -> Option<usize> {
+        Some(fasync_key(&self.0))
     }
     fn release(&self) {
         let ev = &self.0;
@@ -928,6 +935,7 @@ fn open(uattr: usize, pid: i32, cpu: i32, group_fd: i32, flags: u64) -> R {
         target: task.pid,
         owner: me.pid,
         enable_on_exec: Cell::new(b(B_ENABLE_ON_EXEC)),
+        limit: Cell::new(0),
         st: RefCell::new(St { on: false, cnt: 0, en: 0, run: 0, tasks: Vec::new() }),
         leader: RefCell::new(leader.as_ref().map(Rc::downgrade)),
         siblings: RefCell::new(Vec::new()),
@@ -1291,6 +1299,16 @@ fn read_event(ev: &Event) -> Rc<Event> {
 
 /// あふれた (Linux の __perf_event_overflow): sigtrap なら SIGTRAP、輪があればサンプルを書く
 fn overflow(ev: &Rc<Event>, tf: &crate::trap::TrapFrame, addr: u64) {
+    // REFRESH の残りが 0 になったら止まって POLL_HUP (Linux の __perf_event_overflow の event_limit)
+    let mut band = crate::fasync::POLL_IN;
+    let left = ev.limit.get();
+    if left != 0 {
+        ev.limit.set(left - 1);
+        if left == 1 {
+            band = crate::fasync::POLL_HUP;
+            ev.set_on(false);
+        }
+    }
     if ev.bit(B_SIGTRAP) {
         let info = crate::signal::SigInfo {
             code: crate::signal::TRAP_PERF,
@@ -1306,6 +1324,13 @@ fn overflow(ev: &Rc<Event>, tf: &crate::trap::TrapFrame, addr: u64) {
         let rec = sample_record(ev, tf, addr, ev.period);
         rb.output(ev, &rec, true, Rc::as_ptr(ev) as usize + 1);
     }
+    // O_ASYNC の持ち主に (Linux の perf_event_wakeup の kill_fasync)
+    crate::fasync::kill(fasync_key(ev), crate::signal::SIGIO, band);
+}
+
+/// O_ASYNC の表の鍵 (fasync.rs): イベントの場所 (inherit で数える子も同じイベント)
+fn fasync_key(ev: &Event) -> usize {
+    ev as *const Event as usize
 }
 
 /// ev の数があと 1 ふえた: 間に届いたらあふれる

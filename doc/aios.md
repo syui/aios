@@ -1002,6 +1002,12 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   名前は /proc/PID/maps と同じ (proc::map_names、無名は //anon、装置の写しは anon_inode:[perf_event] など)。MMAP2 は
   maj と min、ino、prot、flags (MAP_SHARED か MAP_PRIVATE)。記録をとるものがあるあいだ (proc::PERF_MMAP) は、mmap の
   速い道 (syscall.rs の fast) をとおらない。vm.rs の MapRec と map_recs は /proc/PID/maps と perf でいっしょに
+- perf のあふれの SIGIO と PERF_EVENT_IOC_REFRESH (test/perf5.c、Linux 7.4-rc3 と 12 行同じ): perf の fd は O_ASYNC を
+  持てる (Linux の perf_fasync: fasync.rs の表、鍵はイベント)。サンプリングのものがあふれるたびに持ち主に POLL_IN (F_SETSIG の
+  シグナルなら si_band と si_fd。Linux の perf_event_wakeup の kill_fasync)。IOC_REFRESH(n) は n を event_limit に足して
+  動かし、あふれるたびに 1 減らして、0 になったら止めて POLL_HUP (Linux の __perf_event_overflow)。数えるだけのものと inherit
+  のものは EINVAL。テストはページフォルトで (ブレークポイントは、シグナルで 1 命令越えが切れて同じところでまた当たる: arm64
+  の Linux も同じ)
 - atime (test/atime.c、root で ext4 と tmpfs とマウントの印で Linux と 5 行同じ): 前は持たなかった (stat の atime は mtime、
   utimensat の atime は捨てていた)。いまは ext4 は inode の i_atime (秒)、tmpfs は自分の属性に持ち、stat と statx に出す。
   utimensat は atime も決め、ctime をいまに (Linux の notify_change。前は ctime を変えなかった)。読んだら (read、pread、
