@@ -4,7 +4,7 @@
 #   でクロスビルドする。/opt/c に入る。道具 (exrinfo ...)、Python のモジュール、例は入れない
 #   版は Blender 5.3 が使う系列 (build_files/build_environment/cmake/versions.cmake) のいちばん新しいもの
 pkgname=openexr
-pkgver=3.4.18
+pkgver=3.4.19
 pkgrel=1
 pkgdesc='High dynamic-range image file format library (static, for aios)'
 arch=('aarch64')

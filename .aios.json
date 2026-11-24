@@ -1,7 +1,7 @@
 {
   "branch": "main",
   "arch": "aarch64",
-  "updated": "2026-11-21",
+  "updated": "2026-11-24",
   "repo": {
     "rust":    { "lang": "Rust",  "prefix": "/usr" },
     "c":       { "lang": "C/C++", "prefix": "/opt/c" },
@@ -49,12 +49,12 @@
       "rust": {
         "coreutils": "0.13.0",
         "findutils": "0.11.0", "grep": "0.2.0", "sudo-rs": "0.2.15",
-        "ripgrep": "15.2.0", "uv": "0.13.9"
+        "ripgrep": "16.0.0", "uv": "0.13.9"
       },
       "c": {
         "alsa-lib": "1.2.16.1", "alsa-utils": "1.2.16", "atk": "2.38.0",
-        "ca-certificates": "20261105", "cairo": "1.18.6", "curl": "8.23.0", "egl-headers": "0.0.1.20261117",
-        "expat": "2.10.0", "ffmpeg": "9.1", "firefox": "160.0.1", "fontconfig": "2.18.4",
+        "ca-certificates": "20261105", "cairo": "1.18.6", "curl": "8.23.0", "egl-headers": "0.0.1.20261123",
+        "expat": "2.11.0", "ffmpeg": "9.1", "firefox": "161.0", "fontconfig": "2.18.4",
         "freetype2": "2.15.0", "fribidi": "1.0.18", "gdk-pixbuf2": "2.44.8", "git": "2.56.1",
         "glib2": "2.90.1", "gtk3": "3.24.52", "harfbuzz": "15.2.0", "libdrm": "2.4.134",
         "libepoxy": "1.5.10", "libffi": "3.8.1", "libpng": "1.6.59", "libxkbcommon": "1.13.2",
@@ -64,12 +64,12 @@
         "xkeyboard-config": "2.49", "zig": "0.17.1", "zlib": "1.4",
 
         "ncurses": "6.6", "libevent": "2.1.13",
-        "zsh": "5.9.2", "vim": "9.2.1373", "tmux": "3.8", "openssh": "10.6p2", "jq": "1.8.2",
+        "zsh": "5.9.2", "vim": "9.2.1409", "tmux": "3.8", "openssh": "10.6p2", "jq": "1.8.2",
         "libunwind": "0.16.0", "nodejs": "26.13.1", "cargo": "1.100.0", "less": "710",
 
         "procps-ng": "4.0.7", "gawk": "5.4.2", "libarchive": "3.8.11", "gzip": "1.15", "xz": "5.8.4",
-        "bzip2": "1.0.8", "zstd": "1.5.7", "patch": "2.8.1", "make": "4.4.1", "file": "5.48", "tree": "2.3.2",
-        "toybox": "0.8.15", "iproute2": "7.3.0", "diffutils": "3.12", "sed": "4.10", "vlc": "3.0.24", "llama.cpp": "1.0.0", "claude": "2.1.330", "apparmor": "5.0.2", "nftables": "1.1.7", "pnpm": "12.21.0", "conntrack-tools": "1.4.9", "python": "3.13.18", "libdeflate": "1.26", "libjpeg-turbo": "3.2.1", "libtiff": "4.7.2", "fmt": "12.1.0", "imath": "3.2.3", "minizip-ng": "4.2.2", "onetbb": "2022.3.0", "openjph": "0.25.3", "pystring": "1.1.5", "yaml-cpp": "0.8.0", "opencolorio": "2.5.2", "openexr": "3.4.18", "opensubdiv": "3.7.0", "openimageio": "3.1.19.0", "blender": "5.3.0", "brotli": "1.2.1", "gitea": "28.4.0", "gcc-libs": "16.2.0", "openssl": "4.1.0", "go": "1.27.4", "postgresql": "19.0", "protobuf": "36.2", "redis": "8.10.3"
+        "bzip2": "1.0.8", "zstd": "1.6.0", "patch": "2.8.1", "make": "4.4.1", "file": "5.48", "tree": "2.3.2",
+        "toybox": "0.8.15", "iproute2": "7.3.0", "diffutils": "3.12", "sed": "4.10", "vlc": "3.0.24", "llama.cpp": "1.0.0", "claude": "2.1.331", "apparmor": "5.0.2", "nftables": "1.1.7", "pnpm": "12.23.0", "conntrack-tools": "1.4.9", "python": "3.13.18", "libdeflate": "1.26", "libjpeg-turbo": "3.2.1", "libtiff": "4.7.2", "fmt": "12.1.0", "imath": "3.2.3", "minizip-ng": "4.2.2", "onetbb": "2022.3.0", "openjph": "0.25.3", "pystring": "1.1.5", "yaml-cpp": "0.8.0", "opencolorio": "2.5.2", "openexr": "3.4.19", "opensubdiv": "3.7.0", "openimageio": "3.1.19.0", "blender": "5.3.0", "brotli": "1.2.1", "gitea": "28.4.0", "gcc-libs": "16.2.0", "openssl": "4.1.0", "go": "1.27.4", "postgresql": "19.0", "protobuf": "36.2", "redis": "8.12.0"
       },
       "uv":  { "python": "3.15.1" }
     }

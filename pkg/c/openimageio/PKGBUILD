@@ -9,7 +9,7 @@
 #   版は Blender 5.3 が使う系列 (build_files/build_environment/cmake/versions.cmake) のいちばん新しいもの
 pkgname=openimageio
 pkgver=3.1.19.0
-pkgrel=2
+pkgrel=3
 pkgdesc='Library for reading, writing, and processing images in a wide variety of formats (static, for aios)'
 arch=('aarch64')
 url='https://openimageio.org/'

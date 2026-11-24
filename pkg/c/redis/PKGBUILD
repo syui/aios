@@ -4,7 +4,7 @@
 #   Alpine の redis も MALLOC=libc)、TLS は OpenSSL (openssl のパッケージの静的なライブラリ: BUILD_TLS=yes)。
 #   モジュール (RedisJSON、RediSearch など: BUILD_WITH_MODULES) は入れない
 pkgname=redis
-pkgver=8.10.3
+pkgver=8.12.0
 pkgrel=1
 pkgdesc='An in-memory database that persists on disk (static, for aios)'
 arch=('aarch64')
@@ -14,7 +14,7 @@ _latest_url=https://download.redis.io/releases/
 _latest_regex='redis-([0-9]+[.][0-9]+[.][0-9]+)[.]tar[.]gz'
 # sha256 は redis-hashes (github.com/redis/redis-hashes の README) のものと同じ
 source=("https://download.redis.io/releases/redis-$pkgver.tar.gz")
-sha256sums=('edde778f6bdee7581e42fc139ca9e07e2822212092f7501f99989656e3629d02')
+sha256sums=('b0100a879b2d45dc97d8fda941127609d648f8913008db1b65a2f72a8ae36c8b')
 
 prepare() {
   rm -rf "redis-$pkgver"

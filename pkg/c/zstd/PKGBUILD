@@ -1,14 +1,14 @@
 # zstd: Zstandard の圧縮 (zstd、unzstd、zstdcat と libzstd)。aios build pkg がパッケージを -19 で縮めるのに使う
 # ビルドは pkg/c/zig.sh の Zig (aarch64-linux-musl)。/opt/c に入れる
 pkgname=zstd
-pkgver=1.5.7
-pkgrel=4
+pkgver=1.6.0
+pkgrel=1
 pkgdesc='Zstandard compression (zstd command and libzstd, for aios)'
 arch=('aarch64')
 url='https://facebook.github.io/zstd/'
 license=('BSD-3-Clause' 'GPL-2.0-only')
 source=("https://github.com/facebook/zstd/releases/download/v$pkgver/zstd-$pkgver.tar.gz")
-sha256sums=('eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3')
+sha256sums=('2ba599ae2a257976278e7e71e998433a387bfd18aa7b78678229fd5d84f5e9b8')
 
 prepare() {
   rm -rf "zstd-$pkgver"

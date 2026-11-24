@@ -1,7 +1,7 @@
 # aios (aarch64) 用。Arch なら: CARCH=aarch64 makepkg (ほかでは bin/mkpkg.sh pkg/rust/ripgrep)
 # rg: .gitignore を読んで速く探す。aish の grep ツールと C-g / C-f も、あればこれを使う
 pkgname=ripgrep
-pkgver=15.2.0
+pkgver=16.0.0
 pkgrel=1
 pkgdesc='A search tool that combines the usability of ag with the raw speed of grep'
 arch=('aarch64')
