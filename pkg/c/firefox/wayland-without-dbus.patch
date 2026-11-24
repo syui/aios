@@ -23,27 +23,27 @@
 @@ -195,8 +195,10 @@
  #ifdef MOZ_WIDGET_GTK
  #  if defined(MOZ_ENABLE_DBUS)
-   client = MakeUnique<nsDBusRemoteClient>(mStartupToken);
+   client = std::make_unique<nsDBusRemoteClient>(mStartupToken);
 -#  else
 +#  elif defined(MOZ_X11)
-   client = MakeUnique<nsXRemoteClient>(mStartupToken);
+   client = std::make_unique<nsXRemoteClient>(mStartupToken);
 +#  else
 +  return NS_ERROR_NOT_AVAILABLE;
  #  endif
  #elif defined(XP_WIN)
-   client = MakeUnique<nsWinRemoteClient>();
+   client = std::make_unique<nsWinRemoteClient>();
 @@ -257,8 +259,10 @@
  #ifdef MOZ_WIDGET_GTK
  #  if defined(MOZ_ENABLE_DBUS)
-   mRemoteServer = MakeUnique<nsDBusRemoteServer>();
+   mRemoteServer = std::make_unique<nsDBusRemoteServer>();
 -#  else
 +#  elif defined(MOZ_X11)
-   mRemoteServer = MakeUnique<nsGTKRemoteServer>();
+   mRemoteServer = std::make_unique<nsGTKRemoteServer>();
 +#  else
 +  return;
  #  endif
  #elif defined(XP_WIN)
-   mRemoteServer = MakeUnique<nsWinRemoteServer>();
+   mRemoteServer = std::make_unique<nsWinRemoteServer>();
 --- a/widget/gtk/nsAppShell.cpp
 +++ b/widget/gtk/nsAppShell.cpp
 @@ -32,6 +32,7 @@
