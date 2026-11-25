@@ -60,6 +60,8 @@ struct Params {
     ro: Option<bool>,
     /// tmpfs のオプション (mode、uid、gid、size、nr_inodes ...)
     tmpfs: crate::tmpfs::Options,
+    /// ほかの種類のオプション ("," でつないだもの: cgroup2 の nsdelegate など)
+    data: String,
 }
 
 /// fs のコンテキスト (fsopen と fspick の口: Linux の struct fs_context)
@@ -107,6 +109,13 @@ impl FsCtx {
                 }
                 match (t, key) {
                     ("proc", "hidepid" | "gid" | "subset" | "pidns") => {}
+                    // cgroup2 のオプション (FSCONFIG_CREATE で cgroup.rs に渡す)
+                    ("cgroup2", "nsdelegate" | "favordynmods" | "memory_localevents" | "memory_recursiveprot" | "memory_hugetlb_accounting" | "pids_localevents") => {
+                        if !p.data.is_empty() {
+                            p.data.push(',');
+                        }
+                        p.data.push_str(key);
+                    }
                     (_, "source") => {
                         let v = val.ok_or_else(|| self.invalf(String::from("Non-string source")))?;
                         if p.source.is_some() {
@@ -133,7 +142,7 @@ impl FsCtx {
             if self.fstype == "tmpfs" {
                 p.tmpfs.new_root()
             } else {
-                vfs::mount_nodev(&self.fstype)
+                vfs::mount_nodev_data(&self.fstype, &p.data)
             }
         })();
         match made {

@@ -1,7 +1,8 @@
 // pidfd (Linux の pidfs): pidfd が指すスレッド・プロセスのことを答える口と、pidfd を使うシステムコール (Linux 7.4)
 //
 //   /proc/PID/fdinfo/N の Pid: と NSpid: (fdinfo)。片づけられたものは -1、読む人の PID の namespace から見えなければ 0
-//   ioctl の PIDFD_GET_INFO (struct pidfd_info): 番号 (pid、tgid、ppid)、資格情報、終わって片づけられたときの exit_code、
+//   ioctl の PIDFD_GET_INFO (struct pidfd_info): 番号 (pid、tgid、ppid)、資格情報、いる cgroup の番号 (cgroupid:
+//       cgroup2 のディレクトリの ino)、終わって片づけられたときの exit_code (と、そのときの cgroupid)、
 //       coredump の印 (PR_SET_DUMPABLE)、知っている印 (supported_mask)。大きさは版ごと (64、72、80、88) で、入らない欄の
 //       印は落とす。systemd の pidfd_get_pid などはこれを使い、なければ fdinfo を読む
 //   pidfd_getfd (438): 相手の fd を写して受けとる (close-on-exec。ptrace で ATTACH できる相手だけ)
@@ -30,12 +31,13 @@ pub const SELF_THREAD_GROUP: i32 = -10001;
 
 const INFO_PID: u64 = 1 << 0;
 const INFO_CREDS: u64 = 1 << 1;
+const INFO_CGROUPID: u64 = 1 << 2;
 const INFO_EXIT: u64 = 1 << 3;
 const INFO_COREDUMP: u64 = 1 << 4;
 const INFO_SUPPORTED_MASK: u64 = 1 << 5;
 const INFO_COREDUMP_SIGNAL: u64 = 1 << 6;
 const INFO_COREDUMP_CODE: u64 = 1 << 7;
-/// このカーネルが知っている印 (CGROUPID も: cgroup のない Linux と同じく、答えには入らない)
+/// このカーネルが知っている印
 const INFO_SUPPORTED: u64 = 0xff;
 const SIZE_VER0: usize = 64;
 const SIZE_VER1: usize = 72;
@@ -50,8 +52,8 @@ const COREDUMP_ROOT: u32 = 1 << 3;
 struct Attr {
     /// この番号を指す pidfd (開いたファイル) の数
     refs: u32,
-    /// 片づけられたときの wait の status (Linux の pidfs_exit)
-    exit: Option<i32>,
+    /// 片づけられたときの wait の status と、いた cgroup (Linux の pidfs_exit)
+    exit: Option<(i32, u64)>,
 }
 
 static ATTRS: SpinLock<BTreeMap<u32, Attr>> = SpinLock::new(BTreeMap::new());
@@ -72,14 +74,14 @@ pub fn closed(pid: u32) {
     }
 }
 
-/// pid のスレッドが片づけられた (proc の free_slot。status は wait の形): pidfd があれば覚える
-pub fn reaped(pid: u32, status: i32) {
+/// pid のスレッドが片づけられた (proc の free_slot。status は wait の形、cgroup はいた cgroup): pidfd があれば覚える
+pub fn reaped(pid: u32, status: i32, cgroup: u64) {
     if let Some(e) = ATTRS.lock().get_mut(&pid) {
-        e.exit = Some(status);
+        e.exit = Some((status, cgroup));
     }
 }
 
-fn exit_of(pid: u32) -> Option<i32> {
+fn exit_of(pid: u32) -> Option<(i32, u64)> {
     ATTRS.lock().get(&pid).and_then(|e| e.exit)
 }
 
@@ -151,11 +153,13 @@ fn info(pid: u32, _thread: bool, usize: usize, arg: usize) -> Result<i64, i64> {
     let mut k = [0u8; SIZE_VER3];
     let put = |k: &mut [u8; SIZE_VER3], o: usize, v: u32| k[o..o + 4].copy_from_slice(&v.to_le_bytes());
     let mut got = 0u64;
+    // 終わったときのことを聞かれれば、そのときの cgroup も (Linux の pidfs_exit が覚えた cgroupid)
     if mask & INFO_EXIT != 0
-        && let Some(code) = exit_of(pid)
+        && let Some((code, cg)) = exit_of(pid)
     {
-        got |= INFO_EXIT;
+        got |= INFO_EXIT | INFO_CGROUPID;
         put(&mut k, 60, code as u32);
+        k[8..16].copy_from_slice(&cg.to_le_bytes());
     }
     match task(pid) {
         None => {
@@ -186,6 +190,11 @@ fn info(pid: u32, _thread: bool, usize: usize, arg: usize) -> Result<i64, i64> {
             put(&mut k, 20, crate::ns::local_or_0(t.tgid));
             put(&mut k, 24, crate::ns::local_or_0(t.ppid));
             got |= INFO_PID;
+            // いる cgroup もいつも (まだ覚えていなければ)
+            if got & INFO_CGROUPID == 0 {
+                k[8..16].copy_from_slice(&t.cgroup.to_le_bytes());
+                got |= INFO_CGROUPID;
+            }
         }
     }
     if mask & INFO_SUPPORTED_MASK != 0 {

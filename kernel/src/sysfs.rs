@@ -8,6 +8,8 @@
 //   /sys/devices/system/cpu/{online,possible,present} と cpuN/online
 //   /sys/devices/system/cpu/vulnerabilities/*       Spectre / Meltdown などの様子 (cpuvuln.rs。Linux 7.3 と同じ 19 のファイル)
 //   /sys/kernel/security                             securityfs をかぶせるところ (securityfs.rs)
+//   /sys/kernel/cgroup/{delegate,features}           cgroup2 の任せてよいファイルとマウントのオプション (cgroup.rs)
+//   /sys/fs/cgroup                                   cgroup2 をかぶせるところ (中は空)
 //   /sys/firmware/efi/{fw_platform_size,systab}      UEFI から起動したとき (arm64 の Linux と同じもの。systab は root だけ)
 //   /sys/firmware/efi/efivars                        efivarfs をかぶせるところ (efivarfs.rs)
 //   /sys/firmware/acpi/tables/SIG                    ACPI で起こしたとき、表そのもの (同じ名前がいくつかなら SSDT1、SSDT2。root だけ)
@@ -41,6 +43,8 @@ const NET_FILES: [&str; 7] = ["address", "mtu", "operstate", "carrier", "ifindex
 const NET_STATS: [&str; 8] = ["rx_bytes", "tx_bytes", "rx_packets", "tx_packets", "rx_errors", "tx_errors", "rx_dropped", "tx_dropped"];
 const CPU_FILES: [&str; 3] = ["online", "possible", "present"];
 const EFI_FILES: [&str; 2] = ["fw_platform_size", "systab"];
+/// /sys/kernel/cgroup のファイル
+const CG_FILES: [&str; 2] = ["delegate", "features"];
 /// /sys/firmware/acpi/hotplug の下 (Linux の container、pci_root、processor のドライバのもの) と、その enabled
 /// (Linux の既定: container は 0、ほかは 1。root が 0 か 1 を書ける。aios はそのまま覚えるだけ)
 const ACPI_HOTPLUG: [&str; 3] = ["container", "pci_root", "processor"];
@@ -76,6 +80,11 @@ enum Node {
     Vuln(u8),
     Kernel,
     Security,
+    /// /sys/fs、/sys/fs/cgroup、/sys/kernel/cgroup とその中のファイル (CG_FILES の番号)
+    Fs,
+    FsCgroup,
+    KernelCgroup,
+    KernelCgroupFile(u8),
     Module,
     ModAa,
     ModAaParams,
@@ -335,6 +344,10 @@ impl SysInode {
             Node::Cpu => 9,
             Node::Kernel => 10,
             Node::Security => 11,
+            Node::Fs => 32,
+            Node::FsCgroup => 33,
+            Node::KernelCgroup => 34,
+            Node::KernelCgroupFile(k) => 35 + k as u64,
             Node::Module => 12,
             Node::ModAa => 13,
             Node::ModAaParams => 14,
@@ -420,7 +433,7 @@ impl SysInode {
     fn is_dir(&self) -> bool {
         matches!(
             self.node,
-            Node::Root | Node::Block | Node::Disk | Node::Queue | Node::Part(_) | Node::Class | Node::ClassNet | Node::Net(_) | Node::NetStats(_) | Node::Devices | Node::System | Node::Cpu | Node::Vulns | Node::CpuN(_) | Node::Kernel | Node::Security | Node::Module | Node::ModAa | Node::ModAaParams | Node::Firmware | Node::Efi | Node::EfiVars | Node::Acpi | Node::AcpiTables | Node::AcpiSub(_) | Node::AcpiHotplug | Node::AcpiHp(_)
+            Node::Root | Node::Block | Node::Disk | Node::Queue | Node::Part(_) | Node::Class | Node::ClassNet | Node::Net(_) | Node::NetStats(_) | Node::Devices | Node::System | Node::Cpu | Node::Vulns | Node::CpuN(_) | Node::Kernel | Node::Security | Node::Fs | Node::FsCgroup | Node::KernelCgroup | Node::Module | Node::ModAa | Node::ModAaParams | Node::Firmware | Node::Efi | Node::EfiVars | Node::Acpi | Node::AcpiTables | Node::AcpiSub(_) | Node::AcpiHotplug | Node::AcpiHp(_)
                 | Node::Dev | Node::DevChar | Node::Bus | Node::BusPlatform | Node::Platform | Node::PlatDev(_) | Node::PlatClass(_) | Node::Chr(_) | Node::ClassOf(_)
                 | Node::BusPci | Node::BusPciDevs | Node::BusPciSub(_) | Node::PciHost | Node::PciRoot | Node::PciDev(_) | Node::PciLinkDir(_) | Node::PciBusDir(_) | Node::PciBus(_) | Node::ClassPciBus
                 | Node::EvBus | Node::EvBusDevs | Node::EvBusDrivers | Node::EvDev(_) | Node::EvPmuDir(_)
@@ -431,7 +444,10 @@ impl SysInode {
     fn parent(&self) -> Node {
         let l = || chrdevs();
         match self.node {
-            Node::Root | Node::Block | Node::Class | Node::Devices | Node::Kernel | Node::Module | Node::Firmware | Node::Dev | Node::Bus => Node::Root,
+            Node::Root | Node::Block | Node::Class | Node::Devices | Node::Kernel | Node::Module | Node::Firmware | Node::Dev | Node::Bus | Node::Fs => Node::Root,
+            Node::FsCgroup => Node::Fs,
+            Node::KernelCgroup => Node::Kernel,
+            Node::KernelCgroupFile(_) => Node::KernelCgroup,
             Node::Disk => Node::Block,
             Node::DiskFile(_) | Node::Queue | Node::Part(_) => Node::Disk,
             Node::QueueFile(_) => Node::Queue,
@@ -633,6 +649,8 @@ impl SysInode {
                 }
             }
             Node::Vuln(i) => crate::cpuvuln::show(VULN_FILES[i as usize]),
+            Node::KernelCgroupFile(0) => crate::cgroup::delegate_text().into(),
+            Node::KernelCgroupFile(_) => crate::cgroup::features_text().into(),
             Node::ModAaEnabled => if crate::parts::off(crate::parts::Part::Apparmor) { "N\n".into() } else { "Y\n".into() },
             Node::EfiFile(0) => "64\n".into(),
             // FADT の Preferred_PM_Profile (Linux の acpi_show_profile)
@@ -820,8 +838,12 @@ impl Inode for SysInode {
                 "kernel" => Node::Kernel,
                 "module" => Node::Module,
                 "firmware" => Node::Firmware,
+                "fs" => Node::Fs,
                 _ => return Err(-ENOENT),
             },
+            Node::Fs if name == "cgroup" => Node::FsCgroup,
+            Node::Kernel if name == "cgroup" => Node::KernelCgroup,
+            Node::KernelCgroup => Node::KernelCgroupFile(pos(&CG_FILES)?),
             Node::Dev if name == "char" => Node::DevChar,
             Node::DevChar => {
                 let l = chrdevs();
@@ -1015,6 +1037,14 @@ impl Inode for SysInode {
                 add("kernel".into(), Node::Kernel);
                 add("module".into(), Node::Module);
                 add("firmware".into(), Node::Firmware);
+                add("fs".into(), Node::Fs);
+            }
+            Node::Fs => add("cgroup".into(), Node::FsCgroup),
+            Node::FsCgroup => {}
+            Node::KernelCgroup => {
+                for (k, n) in CG_FILES.iter().enumerate() {
+                    add((*n).into(), Node::KernelCgroupFile(k as u8));
+                }
             }
             Node::Firmware => {
                 if crate::acpi::present() {
@@ -1051,7 +1081,10 @@ impl Inode for SysInode {
                 add("efivars".into(), Node::EfiVars);
             }
             Node::EfiVars => {}
-            Node::Kernel => add("security".into(), Node::Security),
+            Node::Kernel => {
+                add("security".into(), Node::Security);
+                add("cgroup".into(), Node::KernelCgroup);
+            }
             Node::Security => {}
             Node::Module => add("apparmor".into(), Node::ModAa),
             Node::ModAa => add("parameters".into(), Node::ModAaParams),

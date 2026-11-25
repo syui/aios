@@ -2850,20 +2850,20 @@ const CLONE_DETACHED: u64 = 0x40_0000;
 /// Go の os/exec はこれで子を作って waitid(P_PIDFD) で待つ (前は pidfd を書かず、Go は pidfd を使わない道にしていた)
 fn sys_clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Result<u32, i64> {
     if flags & CLONE_PIDFD == 0 {
-        return proc::clone(flags, stack, ptid, tls, ctid);
+        return proc::clone(flags, stack, ptid, tls, ctid, None);
     }
     if flags & (CLONE_PARENT_SETTID | CLONE_DETACHED) != 0 {
         return Err(crate::why::inval());
     }
-    clone_pidfd(flags, stack, ptid, tls, ctid, ptid)
+    clone_pidfd(flags, stack, ptid, tls, ctid, ptid, None)
 }
 
 /// clone して、子の pidfd (O_RDWR | O_CLOEXEC。CLONE_THREAD なら PIDFD_THREAD) の番号を at に書く。書けない場所なら
 /// 子を作らずに EFAULT (Linux は子を走らせる前に put_user する)。fd は子が親の表を写したあとで足すので、子の表には
 /// 入らない (CLONE_FILES なら同じ表なので見える。Linux と同じ)。vfork なら子が exec するか終わってから書く
-fn clone_pidfd(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize, at: usize) -> Result<u32, i64> {
+fn clone_pidfd(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize, at: usize, cgroup: Option<(u64, bool)>) -> Result<u32, i64> {
     proc::current().pt().copy_out(at, &(-1i32).to_le_bytes()).ok_or(-EFAULT)?;
-    let tid = proc::clone(flags & !CLONE_PIDFD, stack, ptid, tls, ctid)?;
+    let tid = proc::clone(flags & !CLONE_PIDFD, stack, ptid, tls, ctid, cgroup)?;
     let fd = pidfd_install(tid, flags & 0x1_0000 != 0, false)?;
     proc::current().pt().copy_out(at, &fd.to_le_bytes()).ok_or(-EFAULT)?;
     Ok(tid)
@@ -2872,11 +2872,13 @@ fn clone_pidfd(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize, at:
 /// clone3(args, size): struct clone_args (u64 の並び: flags pidfd child_tid parent_tid exit_signal stack stack_size tls
 /// set_tid set_tid_size cgroup) を読んで clone と同じことを。glibc は pthread_create で先にこれを試す。
 /// stack はいちばん下の番地で、子の sp は stack + stack_size。CLONE_PIDFD なら pidfd の場所に子の pidfd を書く
-/// (parent_tid と同じ場所で CLONE_PARENT_SETTID もなら EINVAL)。set_tid と cgroup はないので EINVAL
+/// (parent_tid と同じ場所で CLONE_PARENT_SETTID もなら EINVAL)。set_tid はないので EINVAL。CLONE_INTO_CGROUP なら
+/// cgroup (cgroup2 のディレクトリの fd) の cgroup で子を作る (版 2 (88 バイト) より小さいか INT_MAX より大きい fd は
+/// EINVAL。行き先と許しは cgroup.rs が見る: Linux の cgroup_css_set_fork)
 fn sys_clone3(uargs: usize, size: usize) -> Result<u32, i64> {
-    const EINVAL: i64 = 22;
     const E2BIG: i64 = 7;
     const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
+    const CLONE_THREAD: u64 = 0x1_0000;
     // 版 0 は 64 バイト (tls まで)。知らない後ろのものは 0 でなければならない (Linux と同じ)
     if size < 64 {
         return Err(crate::why::inval());
@@ -2887,12 +2889,19 @@ fn sys_clone3(uargs: usize, size: usize) -> Result<u32, i64> {
     let mut b = alloc::vec![0u8; size];
     proc::current().pt().copy_in(&mut b, uargs).ok_or(-EFAULT)?;
     let f = |i: usize| b.get(i * 8..i * 8 + 8).map_or(0, |w| u64::from_le_bytes(w.try_into().unwrap()));
-    if b[64..].iter().any(|&x| x != 0) {
-        // set_tid / set_tid_size / cgroup と、その先
-        return Err(if size > 88 && b[88..].iter().any(|&x| x != 0) { -E2BIG } else { -EINVAL });
+    // 知らない続き (copy_struct_from_user)
+    if size > 88 && b[88..].iter().any(|&x| x != 0) {
+        return Err(-E2BIG);
+    }
+    // set_tid と set_tid_size
+    if f(8) != 0 || f(9) != 0 {
+        return Err(crate::why::inval());
     }
     let (flags, exit_signal, stack, stack_size, tls) = (f(0), f(4), f(5) as usize, f(6) as usize, f(7));
-    if flags & CLONE_INTO_CGROUP != 0 || flags & 0xff != 0 || exit_signal > 64 {
+    if flags & 0xff != 0 || exit_signal > 64 {
+        return Err(crate::why::inval());
+    }
+    if flags & CLONE_INTO_CGROUP != 0 && (f(10) > i32::MAX as u64 || size < 88) {
         return Err(crate::why::inval());
     }
     if flags & CLONE_PIDFD != 0 && (flags & CLONE_DETACHED != 0 || (flags & CLONE_PARENT_SETTID != 0 && f(1) == f(3))) {
@@ -2902,10 +2911,29 @@ fn sys_clone3(uargs: usize, size: usize) -> Result<u32, i64> {
         return Err(crate::why::inval());
     }
     let sp = if stack != 0 { stack + stack_size } else { 0 };
+    let cgroup = if flags & CLONE_INTO_CGROUP != 0 { Some(cgroup_of_fd(f(10) as i64, flags & CLONE_THREAD == 0)?) } else { None };
+    let flags = flags & !CLONE_INTO_CGROUP;
     if flags & CLONE_PIDFD != 0 {
-        return clone_pidfd(flags | exit_signal, sp, f(3) as usize, tls, f(2) as usize, f(1) as usize);
+        return clone_pidfd(flags | exit_signal, sp, f(3) as usize, tls, f(2) as usize, f(1) as usize, cgroup);
     }
-    proc::clone(flags | exit_signal, sp, f(3) as usize, tls, f(2) as usize)
+    proc::clone(flags | exit_signal, sp, f(3) as usize, tls, f(2) as usize, cgroup)
+}
+
+/// clone3 の CLONE_INTO_CGROUP: fd (cgroup2 のディレクトリ) の cgroup の番号とそこが凍っているか、いまの cgroup から
+/// そこへ移れるか (cgroup.rs の into_cgroup: main.rs が register_cgroup_fd で置く。なければ EBADF)。threadgroup は
+/// プロセスを作る (CLONE_THREAD でない) とき
+static CGROUP_FD: crate::cell::Early<Option<fn(i64, bool) -> Result<(u64, bool), i64>>> = crate::cell::Early::new(None);
+
+pub fn register_cgroup_fd(f: fn(i64, bool) -> Result<(u64, bool), i64>) {
+    CGROUP_FD.set(Some(f));
+}
+
+fn cgroup_of_fd(fd: i64, threadgroup: bool) -> Result<(u64, bool), i64> {
+    const EBADF: i64 = 9;
+    match CGROUP_FD.val() {
+        Some(f) => f(fd, threadgroup),
+        None => Err(-EBADF),
+    }
 }
 
 /// NULL 終端のポインタ配列が指す文字列たち

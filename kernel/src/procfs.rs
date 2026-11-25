@@ -34,6 +34,11 @@ const PROC_SUPER_MAGIC: u64 = 0x9fa0;
 #[derive(Clone, Copy, PartialEq)]
 enum Node {
     Root,
+    /// /proc/cgroups (cgroup.rs: controller がないので見出しだけ) と /proc/filesystems (mount(2) で使える種類)
+    Cgroups,
+    Filesystems,
+    /// /proc/PID/cgroup (cgroup.rs の proc_text)
+    Cgroup(u32),
     SelfLink,
     Mounts,
     Uptime,
@@ -187,7 +192,7 @@ pub fn new_root() -> InodeRef {
 /// /proc/PID/attr の中 (LSM の属性: AppArmor が使うもの)
 const ATTRS: [&str; 3] = ["current", "exec", "prev"];
 /// task/TID の中のスレッドごとのもの (Node::TaskFile の番号)
-const TASK_FILES: [&str; 10] = ["stat", "status", "comm", "syscall", "sched", "personality", "io", "schedstat", "wchan", "children"];
+const TASK_FILES: [&str; 11] = ["stat", "status", "comm", "syscall", "sched", "personality", "io", "schedstat", "wchan", "children", "cgroup"];
 /// task/TID の中のプロセスのもの (Linux の tid_base_stuff のうち、スレッドごとでないもの)
 const TASK_SHARED: [&str; 30] = [
     "fd", "fdinfo", "ns", "net", "environ", "auxv", "limits", "cmdline", "statm", "maps", "mem", "cwd", "root", "exe", "mounts", "mountinfo", "clear_refs", "smaps",
@@ -278,6 +283,9 @@ impl ProcInode {
         match self.node {
             Node::Root => 1,
             Node::SelfLink => 2,
+            Node::Cgroups => 61,
+            Node::Filesystems => 62,
+            Node::Cgroup(p) => (p as u64) << 16 | 0x75,
             Node::Mounts => 3,
             Node::Uptime => 4,
             Node::Meminfo => 5,
@@ -388,7 +396,7 @@ impl ProcInode {
 
     fn pid(&self) -> Option<u32> {
         match self.node {
-            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Environ(p) | Node::Statm(p) | Node::Comm(p) | Node::Cwd(p) | Node::RootLink(p) | Node::Exe(p) | Node::Maps(p) | Node::Smaps(p) | Node::Stack(p) | Node::FdDir(p) | Node::Fd(p, _) | Node::FdInfoDir(p) | Node::FdInfo(p, _) | Node::NsDir(p) | Node::NsLink(p, _) | Node::PidMounts(p) | Node::MountInfo(p) | Node::IdMap(p, _) | Node::TaskDir(p) | Node::Task(p, _) | Node::TaskFile(p, _, _) | Node::AttrDir(p, _) | Node::Attr(p, ..) | Node::LoginUid(p) | Node::SessionId(p) | Node::Limits(p) | Node::Personality(p) | Node::TimerSlack(p) | Node::OomScore(p) | Node::OomAdj(p) | Node::OomScoreAdj(p) | Node::Auxv(p) | Node::Syscall(p) | Node::Sched(p) | Node::SmapsRollup(p) | Node::Mountstats(p) | Node::TimensOffsets(p) | Node::ClearRefs(p) | Node::Mem(p) | Node::Pagemap(p) | Node::MapFilesDir(p) | Node::MapFile(p, ..) | Node::Io(p) | Node::Schedstat(p) | Node::Wchan(p) | Node::CoredumpFilter(p) | Node::Timers(p) => Some(p),
+            Node::Pid(p) | Node::Stat(p) | Node::Status(p) | Node::Cmdline(p) | Node::Environ(p) | Node::Statm(p) | Node::Comm(p) | Node::Cwd(p) | Node::RootLink(p) | Node::Exe(p) | Node::Maps(p) | Node::Smaps(p) | Node::Stack(p) | Node::FdDir(p) | Node::Fd(p, _) | Node::FdInfoDir(p) | Node::FdInfo(p, _) | Node::NsDir(p) | Node::NsLink(p, _) | Node::PidMounts(p) | Node::MountInfo(p) | Node::IdMap(p, _) | Node::TaskDir(p) | Node::Task(p, _) | Node::TaskFile(p, _, _) | Node::AttrDir(p, _) | Node::Attr(p, ..) | Node::LoginUid(p) | Node::SessionId(p) | Node::Limits(p) | Node::Personality(p) | Node::TimerSlack(p) | Node::OomScore(p) | Node::OomAdj(p) | Node::OomScoreAdj(p) | Node::Auxv(p) | Node::Syscall(p) | Node::Sched(p) | Node::SmapsRollup(p) | Node::Mountstats(p) | Node::TimensOffsets(p) | Node::ClearRefs(p) | Node::Mem(p) | Node::Pagemap(p) | Node::MapFilesDir(p) | Node::MapFile(p, ..) | Node::Io(p) | Node::Schedstat(p) | Node::Wchan(p) | Node::CoredumpFilter(p) | Node::Timers(p) | Node::Cgroup(p) => Some(p),
             _ => None,
         }
     }
@@ -397,6 +405,11 @@ impl ProcInode {
     fn content(&self) -> Result<String, i64> {
         Ok(match self.node {
             Node::Mounts => crate::vfs::mounts_text(),
+            Node::Cgroups => crate::cgroup::proc_cgroups().into(),
+            // 装置のないもの (mount(2) で使える種類: tmpfs と、置いた順の proc、sysfs ...)
+            Node::Filesystems => core::iter::once("tmpfs").chain(crate::vfs::nodev_filesystems()).map(|n| format!("nodev\t{}\n", n)).collect(),
+            // そのプロセス (代表スレッド。ゾンビでも) のいる cgroup
+            Node::Cgroup(pid) => crate::cgroup::proc_text(leader_any(pid)?),
             Node::KernelCmdline => format!("{}\n", crate::dtb::bootargs().unwrap_or("")),
             Node::CpuInfo => {
                 let midr: u64;
@@ -717,6 +730,7 @@ impl ProcInode {
                             String::new()
                         }
                     }
+                    10 => crate::cgroup::proc_text(t),
                     _ => {
                         aa_ptrace(pid, false)?;
                         format!("{:08x}\n", t.personality)
@@ -801,6 +815,10 @@ fn wchan_text(pid: u32, t: &Proc) -> String {
     use crate::syscall::nr::*;
     if ptrace_may(pid, true).is_err() || t.state != State::Sleeping {
         return "0".into();
+    }
+    // cgroup.freeze で凍って眠っている (システムコールの外)
+    if t.frozen {
+        return "do_freezer_trap".into();
     }
     let name = match t.sysno as u64 {
         NANOSLEEP | CLOCK_NANOSLEEP => "hrtimer_nanosleep",
@@ -1151,10 +1169,11 @@ fn fd_target(pid: u32, n: usize) -> Result<String, i64> {
 
 /// /proc/PID/fd/N (と /dev/stdin のような、そこへのリンク) が指す、開いているもの (OpenFile)。
 /// /proc/PID/ns のリンク (aios が分けられるもの。ほかははじめからあるものだけ)
-const NS_KINDS: [&str; 7] = ["ipc", "mnt", "net", "pid", "pid_for_children", "user", "uts"];
+const NS_KINDS: [&str; 8] = ["cgroup", "ipc", "mnt", "net", "pid", "pid_for_children", "user", "uts"];
 
 fn ns_id(c: &crate::cred::Cred, kind: &str) -> u64 {
     match kind {
+        "cgroup" => c.ns.cgroup.as_ref().map_or(crate::ns::INIT_CGROUP, |g| g.id),
         "mnt" => c.ns.mnt_id(),
         "user" => c.ns.user_id(),
         "net" => c.ns.net_id(),
@@ -1707,6 +1726,8 @@ impl Inode for ProcInode {
         let num = name.parse::<u32>().ok();
         let node = match (self.node, name) {
             (Node::Root, "self") => Node::SelfLink,
+            (Node::Root, "cgroups") => Node::Cgroups,
+            (Node::Root, "filesystems") => Node::Filesystems,
             (Node::Root, "mounts") => Node::Mounts,
             (Node::Root, "uptime") => Node::Uptime,
             (Node::Root, "stat") => Node::StatAll,
@@ -1772,6 +1793,7 @@ impl Inode for ProcInode {
             // PID の namespace の中なら、中の番号 (ns.rs)
             (Node::Root, _) => Node::Pid(leader_any(crate::ns::to_global(num.ok_or(-ENOENT)?).ok_or(-ENOENT)?)?.tgid),
             (Node::Pid(p), "stat") => Node::Stat(p),
+            (Node::Pid(p), "cgroup") => Node::Cgroup(p),
             (Node::Pid(p), "status") => Node::Status(p),
             (Node::Pid(p), "cmdline") => Node::Cmdline(p),
             (Node::Pid(p), "environ") => Node::Environ(p),
@@ -1866,6 +1888,8 @@ impl Inode for ProcInode {
         match self.node {
             Node::Root => {
                 add("self".into(), Node::SelfLink);
+                add("cgroups".into(), Node::Cgroups);
+                add("filesystems".into(), Node::Filesystems);
                 add("mounts".into(), Node::Mounts);
                 add("uptime".into(), Node::Uptime);
                 add("stat".into(), Node::StatAll);
@@ -1996,6 +2020,7 @@ impl Inode for ProcInode {
                 add("wchan".into(), Node::Wchan(p));
                 add("coredump_filter".into(), Node::CoredumpFilter(p));
                 add("timers".into(), Node::Timers(p));
+                add("cgroup".into(), Node::Cgroup(p));
             }
             // ptrace で読める人だけ (proc_map_files_readdir: EACCES)
             Node::MapFilesDir(p) => {

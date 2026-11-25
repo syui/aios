@@ -7,6 +7,8 @@
 //   PID  プロセスの番号: 中では 1 から数え、中のプロセスだけが見える (getpid、kill、wait、/proc ...)。
 //        unshare(CLONE_NEWPID) はそのあとに作る子から (Linux と同じ)。中の 1 番が終わると中のみなが終わる。
 //        入れ子 (中でさらに作る) はできない (EINVAL)。外 (はじめの namespace) からは、みな本当の番号で見える
+//   CGROUP  cgroup の根: 作ったときにいた cgroup (Proc の cgroup の番号) を根に見せる (/proc/PID/cgroup のパスと、中で
+//        かぶせた cgroup2 の根: cgroup.rs)。中身 (cgroup の木) は分けない
 // clone(CLONE_NEW*) か unshare(CLONE_NEW*) で新しいものを作る。fork と exec で引き継ぐ (cred の中に持つ)
 // 作るには root か no_new_privs が要る (aios には user namespace がないので、Linux のように root 以外を
 // 止めるのではなく、できることが減るだけの namespace は、setuid のプログラムをだませない no_new_privs で許す)。
@@ -24,6 +26,7 @@ pub const CLONE_NEWPID: u64 = 0x2000_0000;
 pub const CLONE_NEWNS: u64 = 0x0002_0000;
 pub const CLONE_NEWUSER: u64 = 0x1000_0000;
 pub const CLONE_NEWIPC: u64 = 0x0800_0000;
+pub const CLONE_NEWCGROUP: u64 = 0x0200_0000;
 
 const EPERM: i64 = 1;
 
@@ -34,6 +37,7 @@ pub const INIT_PID: u64 = 4026531836;
 pub const INIT_MNT: u64 = 4026531841;
 pub const INIT_USER: u64 = 4026531837;
 pub const INIT_IPC: u64 = 4026531839;
+pub const INIT_CGROUP: u64 = 4026531835;
 
 static NEXT_ID: Bkl<u64> = Bkl::new(4026532000);
 
@@ -125,6 +129,16 @@ pub fn set_lo(up: bool) -> Result<(), i64> {
 }
 
 /// PID: 中の番号を配る
+/// CGROUP: 根の cgroup の番号 (cgroup のディレクトリの ino。はじめのものは 1: cgroup の木の根)
+pub struct Cgroup {
+    pub id: u64,
+    pub owner: u64,
+    pub root: u64,
+}
+
+/// はじめの cgroup の namespace の根 (cgroup の木の根の番号)
+pub const CGROUP_ROOT: u64 = 1;
+
 pub struct Pid {
     pub id: u64,
     pub owner: u64,
@@ -160,10 +174,11 @@ pub struct Ns {
     /// ユーザー (下の「ユーザーの namespace」)
     pub user: Option<Rc<User>>,
     pub ipc: Option<Rc<Ipc>>,
+    pub cgroup: Option<Rc<Cgroup>>,
 }
 
 impl Ns {
-    pub const INIT: Ns = Ns { uts: None, net: None, pid: None, mnt: None, user: None, ipc: None };
+    pub const INIT: Ns = Ns { uts: None, net: None, pid: None, mnt: None, user: None, ipc: None, cgroup: None };
 
     pub fn user_id(&self) -> u64 {
         self.user.as_ref().map_or(INIT_USER, |u| u.id)
@@ -189,6 +204,11 @@ impl Ns {
     pub fn ipc_id(&self) -> u64 {
         self.ipc.as_ref().map_or(INIT_IPC, |n| n.id)
     }
+
+    /// cgroup の namespace の根の cgroup (はじめのものは木の根)
+    pub fn cgroup_root(&self) -> u64 {
+        self.cgroup.as_ref().map_or(CGROUP_ROOT, |c| c.root)
+    }
 }
 
 /// いまのプロセスの IPC の namespace (番号と、なくなったかを見るための弱い参照。はじめからあるものは None)
@@ -203,7 +223,7 @@ pub fn net() -> Option<u64> {
 }
 
 /// flags の CLONE_NEW* のうち、扱えるもの
-pub const SUPPORTED: u64 = CLONE_NEWUTS | CLONE_NEWNET | CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUSER | CLONE_NEWIPC;
+pub const SUPPORTED: u64 = CLONE_NEWUTS | CLONE_NEWNET | CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUSER | CLONE_NEWIPC | CLONE_NEWCGROUP;
 
 /// cred の namespace を flags のぶん新しくする (clone の子と unshare)
 pub fn renew(c: &mut crate::cred::Cred, flags: u64) -> Result<(), i64> {
@@ -247,7 +267,7 @@ pub fn renew(c: &mut crate::cred::Cred, flags: u64) -> Result<(), i64> {
         crate::security::namespace_init(c, flags & !CLONE_NEWUSER)?;
     }
     // 持ち主は、いっしょに作ったユーザーの namespace (あれば)。作る順 (番号の順: listns の並び) は Linux の
-    // create_new_namespaces と同じ mnt、uts、ipc、pid、net
+    // create_new_namespaces と同じ mnt、uts、ipc、pid、cgroup、net
     let owner = c.ns.user_id();
     if flags & CLONE_NEWNS != 0 {
         c.ns.mnt = Some(crate::vfs::new_mnt_ns(next_id(), c.ns.user_id()));
@@ -266,6 +286,10 @@ pub fn renew(c: &mut crate::cred::Cred, flags: u64) -> Result<(), i64> {
             return Err(crate::why::inval());
         }
         c.ns.pid = Some(Rc::new(Pid { id: next_id(), owner, next: core::cell::Cell::new(0) }));
+    }
+    // 根は、いま (作るとき) いる cgroup (clone なら親のもの: Linux の copy_cgroup_ns は current の css_set)
+    if flags & CLONE_NEWCGROUP != 0 {
+        c.ns.cgroup = Some(Rc::new(Cgroup { id: next_id(), owner, root: crate::proc::current().cgroup }));
     }
     if flags & CLONE_NEWNET != 0 {
         c.ns.net = Some(Rc::new(Net { id: next_id(), owner }));
@@ -724,6 +748,7 @@ pub enum Which {
     Mnt(Option<Rc<crate::vfs::MountNs>>),
     Pid(Option<Rc<Pid>>),
     User(Option<Rc<User>>),
+    Cgroup(Option<Rc<Cgroup>>),
 }
 
 impl Which {
@@ -736,6 +761,7 @@ impl Which {
             Which::Mnt(_) => CLONE_NEWNS,
             Which::Pid(_) => CLONE_NEWPID,
             Which::User(_) => CLONE_NEWUSER,
+            Which::Cgroup(_) => CLONE_NEWCGROUP,
         }
     }
 
@@ -747,6 +773,7 @@ impl Which {
             Which::Mnt(_) => "mnt",
             Which::Pid(_) => "pid",
             Which::User(_) => "user",
+            Which::Cgroup(_) => "cgroup",
         }
     }
 
@@ -759,6 +786,7 @@ impl Which {
             Which::Mnt(m) => m.as_ref().map_or(INIT_MNT, |m| m.id),
             Which::Pid(p) => p.as_ref().map_or(INIT_PID, |p| p.id),
             Which::User(u) => u.as_ref().map_or(INIT_USER, |u| u.id),
+            Which::Cgroup(c) => c.as_ref().map_or(INIT_CGROUP, |c| c.id),
         }
     }
 
@@ -770,6 +798,7 @@ impl Which {
             Which::Net(n) => n.as_ref().map_or(INIT_USER, |n| n.owner),
             Which::Mnt(m) => m.as_ref().map_or(INIT_USER, |m| m.owner),
             Which::Pid(p) => p.as_ref().map_or(INIT_USER, |p| p.owner),
+            Which::Cgroup(c) => c.as_ref().map_or(INIT_USER, |c| c.owner),
             Which::User(_) => self.id(),
         }
     }
@@ -899,6 +928,7 @@ pub fn ns_file(kind: &str, p: &crate::proc::Proc) -> (alloc::string::String, cra
         "mnt" => Which::Mnt(n.mnt.clone()),
         "pid" => Which::Pid(p.pid_ns.clone()),
         "pid_for_children" => Which::Pid(n.pid.clone()),
+        "cgroup" => Which::Cgroup(n.cgroup.clone()),
         _ => Which::User(n.user.clone()),
     };
     (alloc::format!("{}:[{}]", w.name(), w.id()), Rc::new(NsInode { which: w }))
@@ -954,6 +984,8 @@ fn install(c: &mut crate::cred::Cred, w: &Which) -> Result<bool, i64> {
             }
             c.ns.pid = p.clone();
         }
+        // 同じところへは何もしない (Linux の cgroupns_install)
+        Which::Cgroup(g) => c.ns.cgroup = g.clone(),
         Which::User(_) => {}
     }
     Ok(false)
@@ -961,7 +993,7 @@ fn install(c: &mut crate::cred::Cred, w: &Which) -> Result<bool, i64> {
 
 /// setns(fd, flags) (Linux の kernel/nsproxy.c): fd は nsfs の口 (flags は 0 かその種類: ちがえば EINVAL) か pidfd (flags は
 /// 入る種類の組: 0 や知らないものは EINVAL。相手を ptrace で読めなければ EPERM、終わっていれば ESRCH。ユーザー、mnt、uts、
-/// ipc、pid、net の順に入れる)。ほかの fd は EINVAL。みな入れられたときだけ変える (Linux の nsset)。mnt に入ると cwd と
+/// ipc、pid、cgroup、net の順に入れる)。ほかの fd は EINVAL。みな入れられたときだけ変える (Linux の nsset)。mnt に入ると cwd と
 /// root はその /
 pub fn setns(fd: i64, flags: u64) -> Result<i64, i64> {
     const EBADF: i64 = 9;
@@ -1004,6 +1036,7 @@ pub fn setns(fd: i64, flags: u64) -> Result<i64, i64> {
                 Which::Uts(n.uts.clone()),
                 Which::Ipc(n.ipc.clone()),
                 Which::Pid(t.pid_ns.clone()),
+                Which::Cgroup(n.cgroup.clone()),
                 Which::Net(n.net.clone()),
             ];
             for w in all.iter().filter(|w| flags & w.flag() != 0) {
@@ -1026,7 +1059,7 @@ pub fn setns(fd: i64, flags: u64) -> Result<i64, i64> {
 // ---- listns と nsfs の ioctl (Linux 6.19、7.4 の形: kernel/nstree.c と fs/nsfs.c) ----
 
 /// Linux の ns_id (listns、nsfs の NS_GET_ID、statmount の mnt_ns_id): はじめのものは Linux と同じ 1〜8 (ipc 1、uts 2、
-/// user 3、pid 4、net 7、mnt 8。cgroup 5 と time 6 は aios にない)、新しいものは作った順 (aios の番号の順。種類によらず
+/// user 3、pid 4、cgroup 5、net 7、mnt 8。time 6 は aios にない)、新しいものは作った順 (aios の番号の順。種類によらず
 /// 1 つの数) に 10 から (Linux の ns_tree_gen_id)
 pub fn ns_id(inum: u64) -> u64 {
     match inum {
@@ -1034,6 +1067,7 @@ pub fn ns_id(inum: u64) -> u64 {
         INIT_UTS => 2,
         INIT_USER => 3,
         INIT_PID => 4,
+        INIT_CGROUP => 5,
         INIT_NET => 7,
         INIT_MNT => 8,
         n => n.saturating_sub(4026532000) + 9,
@@ -1046,7 +1080,7 @@ pub fn ns_id(inum: u64) -> u64 {
 /// 持ち主をたどる。aios のユーザーの namespace は入れ子にならないので、持ち主はいつもはじめのもの)
 fn active() -> alloc::collections::BTreeMap<u64, (u64, u64)> {
     let mut m = alloc::collections::BTreeMap::new();
-    for (id, kind) in [(INIT_IPC, CLONE_NEWIPC), (INIT_UTS, CLONE_NEWUTS), (INIT_PID, CLONE_NEWPID), (INIT_NET, CLONE_NEWNET), (INIT_MNT, CLONE_NEWNS)] {
+    for (id, kind) in [(INIT_IPC, CLONE_NEWIPC), (INIT_UTS, CLONE_NEWUTS), (INIT_PID, CLONE_NEWPID), (INIT_CGROUP, CLONE_NEWCGROUP), (INIT_NET, CLONE_NEWNET), (INIT_MNT, CLONE_NEWNS)] {
         m.insert(id, (kind, INIT_USER));
     }
     m.insert(INIT_USER, (CLONE_NEWUSER, 0));
@@ -1070,6 +1104,7 @@ fn active() -> alloc::collections::BTreeMap<u64, (u64, u64)> {
             Which::Pid(n.pid.clone()),
             Which::Pid(p.pid_ns.clone()),
             Which::User(n.user.clone()),
+            Which::Cgroup(n.cgroup.clone()),
         ] {
             add(&w, &mut m);
         }
@@ -1105,6 +1140,7 @@ fn current_of(kind: u64) -> u64 {
         CLONE_NEWNET => Which::Net(n.net.clone()).id(),
         CLONE_NEWNS => Which::Mnt(n.mnt.clone()).id(),
         CLONE_NEWPID => Which::Pid(p.pid_ns.clone()).id(),
+        CLONE_NEWCGROUP => Which::Cgroup(n.cgroup.clone()).id(),
         _ => n.user_id(),
     }
 }
@@ -1127,7 +1163,6 @@ pub fn listns(reqp: usize, idsp: usize, nr: usize, flags: u64) -> Result<i64, i6
     const ENOENT: i64 = 2;
     const EOVERFLOW: i64 = 75;
     const EOPNOTSUPP: i64 = 95;
-    const CLONE_NEWCGROUP: u64 = 0x0200_0000;
     const CLONE_NEWTIME: u64 = 0x80;
     const NS_ALL: u64 = CLONE_NEWPID | CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET | CLONE_NEWCGROUP | CLONE_NEWTIME;
     const CURRENT_USER: u64 = u64::MAX;
@@ -1181,8 +1216,8 @@ pub fn listns(reqp: usize, idsp: usize, nr: usize, flags: u64) -> Result<i64, i6
         owned[start..].iter().copied().filter(|e| requested(e.1) && (see_all || e.3)).collect()
     } else {
         let tree: Vec<&(u64, u64, u64, bool)> = if ns_type.count_ones() == 1 {
-            // その種類の木 (aios にない cgroup と time は Linux の「木がない」と同じく EINVAL)
-            if ns_type & (CLONE_NEWCGROUP | CLONE_NEWTIME) != 0 {
+            // その種類の木 (aios にない time は Linux の「木がない」と同じく EINVAL)
+            if ns_type & CLONE_NEWTIME != 0 {
                 return Err(crate::why::inval());
             }
             all.iter().filter(|e| e.1 == ns_type).collect()

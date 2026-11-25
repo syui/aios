@@ -696,18 +696,29 @@ pub fn new_mnt_ns(id: u64, owner: u64) -> Rc<MountNs> {
     n
 }
 
-/// 装置のないファイルシステムの種類 (Linux の file_system_type と register_filesystem: proc、sysfs、securityfs、efivarfs)。
-/// 名前と、マウントするときに根を作るもの。main.rs が起動のときに置く (mount(2) と起動のときの /proc や /sys がここを引く)
-static FILESYSTEMS: crate::spinlock::SpinLock<alloc::vec::Vec<(&'static str, fn() -> Result<InodeRef, i64>)>> = crate::spinlock::SpinLock::new(alloc::vec::Vec::new());
+/// 装置のないファイルシステムの種類 (Linux の file_system_type と register_filesystem: proc、sysfs、securityfs、efivarfs、
+/// cgroup、cgroup2)。名前と、マウントするときに根を作るもの (data は mount(2) のオプションの文字: cgroup2 の nsdelegate
+/// など。見ないものは捨てる)。main.rs が起動のときに置く (mount(2) と起動のときの /proc や /sys がここを引く)
+static FILESYSTEMS: crate::spinlock::SpinLock<alloc::vec::Vec<(&'static str, fn(&str) -> Result<InodeRef, i64>)>> = crate::spinlock::SpinLock::new(alloc::vec::Vec::new());
 
-pub fn register_filesystem(name: &'static str, mount: fn() -> Result<InodeRef, i64>) {
+pub fn register_filesystem(name: &'static str, mount: fn(&str) -> Result<InodeRef, i64>) {
     FILESYSTEMS.lock().push((name, mount));
 }
 
 /// 種類が name のファイルシステムの根を新しく作る (知らない種類は ENODEV)
 pub fn mount_nodev(name: &str) -> Result<InodeRef, i64> {
+    mount_nodev_data(name, "")
+}
+
+/// mount_nodev に data (オプション) をわたして
+pub fn mount_nodev_data(name: &str, data: &str) -> Result<InodeRef, i64> {
     let f = FILESYSTEMS.lock().iter().find(|(n, _)| *n == name).map(|&(_, f)| f).ok_or(-ENODEV)?;
-    f()
+    f(data)
+}
+
+/// 装置のないファイルシステムの名前 (置いた順: /proc/filesystems)
+pub fn nodev_filesystems() -> alloc::vec::Vec<&'static str> {
+    FILESYSTEMS.lock().iter().map(|&(n, _)| n).collect()
 }
 
 /// dir (すでにあるディレクトリ) の上に fs の根をかぶせる (いまの表に)
@@ -748,6 +759,16 @@ fn ro_mark(ns: &Rc<MountNs>) {
 pub fn mount_ro(path: &str, fsroot: InodeRef, source: &str, fstype: &str, ro: bool, attrs: u32) -> Result<(), i64> {
     if !resolve("", path, true)?.meta().is_dir() {
         return Err(-ENOTDIR);
+    }
+    // 同じファイルシステム (分けあうもの: cgroup2) を、それがかぶさっているところ (いちばん上のマウントの根) にもう一度は
+    // EBUSY (16。Linux の do_add_mount の "Refuse the same filesystem on the same mount point")
+    {
+        let (target, _) = lookup("", path, true)?;
+        let ns = current_mnt();
+        let l = ns.list.borrow();
+        if l.iter().rev().find(|m| m.target == target).is_some_and(|m| m.root.id().0 == fsroot.id().0) {
+            return Err(-16);
+        }
     }
     mount_at(path, fsroot, "/", source, fstype, ro, attrs)
 }

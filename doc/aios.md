@@ -637,7 +637,9 @@ test/madvfree.c (redis の起動のたしかめと同じ: 書いた無名のペ�
   16 進・8 進・10 進、下の 9 ビット、fork と exec で受けつぐ)。aios は core を作らないので、覚えて見せるだけ。
   直したもの: exec で受けつぐはずの PR_SET_THP_DISABLE の印が、exec で外れていた (load_image が、前のアドレス空間を外した
   あとに見ていた)。test/procio.c は Linux 7.4 と同じ答え
-- まだ: cgroup (aios に cgroup がない)、timers (CHECKPOINT_RESTORE)、/proc/kallsyms (手本は KALLSYMS で持つ) など
+- timers は 2026-11-23 に (CHECKPOINT_RESTORE: test/kcmp.c)、cgroup は 2026-11-25 に (下の「cgroup v2 の核」。手本の
+  test/linux.config に CGROUPS を足して /proc/self は 46 こ、task/TID は 40 こ: test/procpid.c は新しい手本でも同じ)。
+  まだ: /proc/kallsyms (手本は KALLSYMS で持つ) など
 
 madvise と prctl も Linux の答えに (2026-11-15。前は知らない値も 0 で受け、多くを何もせず 0 にしていた):
 
@@ -819,13 +821,14 @@ ENOSYS のものを Linux 7.4 とくらべる)。順に Linux の答えにそろ
   と同じ道で写しなおす (prot と mlock は領域のもの、MAP_NONBLOCK でなければ先に読む)。/proc/PID/maps の位置も
 - listns (Linux 6.19、7.4 の形。ns.rs、test/listns.c、root で Linux と 21 行同じ) と nsfs の ioctl: namespace の番号 (Linux
   の ns_id。ns::ns_id) は、はじめのものが Linux と同じ 1〜8 (ipc 1、uts 2、user 3、pid 4、net 7、mnt 8)、新しいものは作った
-  順に 10 から (unshare の作る順も Linux の create_new_namespaces と同じ mnt、uts、ipc、pid、net に)。listns は使われて
+  順に 10 から (unshare の作る順も Linux の create_new_namespaces と同じ mnt、uts、ipc、pid、cgroup、net に)。listns は使われて
   いる namespace (はじめのもの、プロセスが入っているもの、nsfs の口が開いているもの、それらの持ち主のユーザーの
   namespace) を番号の順に、ns_type でしぼり (1 つの種類ならその種類の中で)、ns_id の次から (なければ ENOENT)。
   見えるのは自分のいまのものか、はじめの pid の namespace の CAP_SYS_ADMIN ならみな。user_ns_id (LISTNS_CURRENT_USER
   も) ならその持ち主のものだけ。たしかめる順も Linux と同じ (EINVAL、EOVERFLOW、EFAULT、E2BIG、知らない種類は
   EOPNOTSUPP)。nsfs の口の ioctl は NS_GET_NSTYPE、NS_GET_ID、NS_GET_MNTNS_ID、NS_GET_OWNER_UID。statmount の
-  mnt_ns_id も同じ番号。ないもの: cgroup と time の namespace (その種類だけでしぼると EINVAL)、NS_GET_USERNS と
+  mnt_ns_id も同じ番号。cgroup の namespace は 2026-11-25 から (はじめのものは ns_id 5)。ないもの: time の namespace
+  (その種類だけでしぼると EINVAL)、NS_GET_USERNS と
   NS_GET_PARENT (口を返すもの)、プロセスもいない口もないのに Linux が「使っている」と見るもの (ソケットが持つ net など)
 - fchroot (Linux 7.4。sysfile.rs、test/fchroot.c、root で Linux と 8 行同じ): 開いているディレクトリ (O_PATH でもよい) を根に。
   Linux と同じ順 (flags は EINVAL、fd がなければ EBADF、ディレクトリでなければ ENOTDIR、通れなければ EACCES、
@@ -3213,6 +3216,48 @@ settimeofday / mknod、中の UTS、写したあとの DAC、capset と CAPBSET_
 capability の rootid がその namespace の root のもの、入れ子のユーザーの namespace (aios はつくれない)、chown の CAP_CHOWN
 (写した別の uid へ)。
 
+### cgroup v2 の核 (2026-11-25)
+
+todo.json の proc-pid ののこり (/proc/PID/cgroup) から。aios に cgroup のしくみがなかったので、Linux の
+kernel/cgroup/cgroup.c のうち controller のないもの (手本の test/linux.config に CGROUPS だけを足したもの: ふつうの
+配布の Linux もこれを入れる) を作った。cgroup.rs (extra) が木とファイルシステムを持ち、core はプロセスのいる番号だけ
+(Proc の cgroup: cgroup のディレクトリの ino と同じで、Linux の cgroup_id。pidfd の CGROUPID もこれ)。
+
+- 木とプロセス: 根は 1。fork とスレッドは親のところ、clone3 の CLONE_INTO_CGROUP (版 2 の 88 バイト。cgroup2 の
+  ディレクトリの fd でなければ EBADF) ならそこ。cgroup.procs に pid を書いて移す (0 は自分、スレッドの番号はそのプロセス、
+  ないものは ESRCH、数でなければ EINVAL、ゾンビは移さずに 0)。移すには、もとと行き先の共通の祖先の cgroup.procs に
+  書けること (EACCES: Linux の cgroup_procs_write_permission。chown して任せたところの中では、ふつうの人も動かせる)。
+  cgroup.threads は domain の cgroup どうしでは EOPNOTSUPP
+- cgroup2 (mount -t cgroup2): 分けあう 1 つのファイルシステム (同じところにもう一度は EBUSY: vfs の mount_ro に Linux の
+  do_add_mount の決まりを足した)。根は 0555 で ino 1、子は mkdir の mode と作った人の fsuid。ファイルは Linux の
+  cgroup_base_files と同じ名前と許し (根は 9 こ、子は 14 こ)。ファイルは作れない (EACCES)、名前を変える・消すのは EPERM、
+  chmod と chown はできる。mkdir は cgroup.max.depth と cgroup.max.descendants (max か 0 以上: 負は ERANGE) をこえれば
+  EAGAIN、rmdir は中にプロセスか子の cgroup があれば EBUSY。オプションは nsdelegate (と controller のための名前: 受けるだけ)、
+  知らないものは EINVAL と kmsg に "cgroup2: Unknown parameter"。statfs は CGROUP2_SUPER_MAGIC
+- 中身: cgroup.controllers と cgroup.subtree_control は空 (+NAME は EINVAL)、cgroup.stat (nr_descendants と、プロセスが
+  まだ指している消したものの nr_dying_descendants)、cgroup.events (populated: 中と子孫にゾンビでないスレッドがいるか、
+  frozen)、cgroup.type (domain)、cpu.stat (usage_usec、user_usec、system_usec、nice_usec: いるプロセスの走った時間と、そこで
+  片づけたものの時間。数えるのは proc.rs の CG_DEAD。根はみなの CPU の時間)、cgroup.stat.local の frozen_usec、
+  cgroup.kill (1 で中と子孫のプロセスみなに SIGKILL。ほかの数は ERANGE、読むと EINVAL)
+- cgroup.freeze: 1 で中と子孫のスレッドを凍らせる (proc.rs の set_freezing: 眠っているシステムコールからも出させ、
+  シグナルの道 (signal.rs の deliver_now) の freeze_while_frozen で、とけるまで眠る: Linux の do_freezer_trap)。凍ったものの
+  State は S、wchan は do_freezer_trap。ふつうのシグナルは、とけるまで受けとらない。SIGKILL と、ハンドラのない既定で終わる
+  シグナル (SIGTERM など) は凍っていても終わらせる (Linux の complete_signal の sig_fatal)。凍った cgroup で生まれた子と、
+  そこへ移ったものも凍り、出ればとける。cgroup.events の frozen は、凍らせていて中のスレッドがみな眠ったとき (中が空でも 1)
+- 見えかた: /proc/PID/cgroup と task/TID/cgroup ("0::パス"。cgroup2 をはじめてかぶせるまでは空: Linux の
+  cgrp_dfl_visible。消した cgroup にいるゾンビは " (deleted)")、/proc/cgroups (controller がないので見出しだけ)、
+  /proc/filesystems (前はなかった。mount(2) で使える装置のないもの)、/sys/fs/cgroup (かぶせるところ)、
+  /sys/kernel/cgroup/delegate と features
+- cgroup の namespace (ns.rs: unshare と clone の CLONE_NEWCGROUP、setns、/proc/PID/ns/cgroup、listns、NS_GET_NSTYPE):
+  根は作ったときにいた cgroup。/proc/PID/cgroup のパスは読む人の namespace の根から (外のものは /../NAME)、中でかぶせた
+  cgroup2 の根も namespace の根。nsdelegate なら、namespace の根の任せてよいもの (procs、threads、subtree_control) の
+  ほかは中から書けない (EPERM)、外の cgroup へは移せない (ENOENT)
+- test/cgroup.c (root で: test/ldiff.sh --root cgroup) は Linux 7.4-rc4 と 287 行同じ (proc、mount、mkdir、procs、kill、
+  freeze、clone3、ns、pidfd、perm。同じ VM でくりかえしても同じ)。手本を CGROUPS にしても、procpid、listns、setns、
+  pidfdinfo、ipcns、statmount、procfiles、capsns、mountinfo、dumpable は同じ
+- まだ: threaded (cgroup.type に threaded を書くと EOPNOTSUPP)、cgroup.events の知らせ (poll と inotify)、controller
+  (cpu、memory、io、pids)、v1 の名前つきの木 (mount -t cgroup は EINVAL)
+
 ### 長い並び (op 150) で見つけた 4 つ (2026-11-23)
 
 sysdiff を 7.4-rc4 で、ext4 の種 10301〜10600 と tmpfs の種 10001〜10300 (どちらも op 150) にのばして見つけたもの:
@@ -3283,8 +3328,9 @@ kernel/signal.c、kernel/pid.c と同じに (kernel/src/pidfd.rs を足した。
   大きければ知らない続きを 0 に): いつも番号 (pid、tgid、ppid) と資格情報、頼まれれば COREDUMP (PR_SET_DUMPABLE からの印:
   1 なら USER、0 なら SKIP) と SUPPORTED_MASK (0xff)。入らない欄の印は落とす。片づけられたあとは EXIT だけ (頼まなければ
   ESRCH): exit_code は wait の status で、片づけたとき (proc の free_slot) に覚える。Linux と同じく、それまでに pidfd を
-  開いていたものだけ (pidfd がみな閉じたら忘れる)。ゾンビのあいだはまだ EXIT はない。cgroup がないので CGROUPID は
-  入らない (手本の Linux も同じ)。namespace の fd を返す PIDFD_GET_*_NAMESPACE はまだ (ENOTTY)
+  開いていたものだけ (pidfd がみな閉じたら忘れる)。ゾンビのあいだはまだ EXIT はない。CGROUPID はいつも (いる cgroup の
+  ディレクトリの ino。片づけたあとの EXIT には、そのときの cgroup: 2026-11-25、test/pidfdinfo.c は CGROUPS の手本でも
+  同じ)。namespace の fd を返す PIDFD_GET_*_NAMESPACE はまだ (ENOTTY)
 - pidfd の st_ino はプロセス (スレッド) ごと (aios の pid は使いまわさないので番号そのもの。同じものを指す pidfd は同じ ino)
 - `pidfd_getfd` (438): 相手の fd を写して close-on-exec で受けとる。ptrace で ATTACH できる相手だけ (実の uid と gid が
   相手の 3 つの id と同じで dumpable、でなければ CAP_SYS_PTRACE。landlock と AppArmor の ptrace の決まりも)。ゾンビは ESRCH
@@ -3578,7 +3624,7 @@ has: ...`)。test/features.c (システムコールが ENOSYS か、namespace �
 もの: 76 こを yes / no で) を両方で動かしてくらべる。手本の Linux は tinyconfig に test/linux.config を足したものなので、
 テストが使う機能がないと、ENOSYS や EINVAL がテストの答えにかくれて同じに見える (CONFIG_USER_NS がなかったとき、
 test/landlockabi.c の namespace の行が、どちらも「止められていない」に見えた)。そのときは test/linux.config に足す。
-`test/ldiff.sh features` は、両方の機能の一覧そのものをくらべる (aios にないもの: IPv6、cgroup と time の namespace、
+`test/ldiff.sh features` は、両方の機能の一覧そのものをくらべる (aios にないもの: IPv6、time の namespace、
 /proc/self/mountinfo、NETLINK_AUDIT など)。
 
 ### Linux と答えあわせ (sysdiff)

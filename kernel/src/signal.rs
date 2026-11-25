@@ -236,9 +236,20 @@ pub fn blocked_or_ignored(p: &Proc, sig: i32) -> bool {
     p.sig_mask & bit(sig) != 0 || action(p, sig).handler == SIG_IGN
 }
 
-/// いま受け取れるシグナルがあるか (sleep を中断する)
+/// 来ていて (ブロックしていない)、ハンドラがなく既定で終わるシグナルがあるか (Linux の complete_signal の sig_fatal:
+/// それは SIGKILL と同じく、cgroup.freeze で凍っていても終わらせる。ptrace されていれば tracer に見せるので SIGKILL だけ)
+pub fn fatal_pending(p: &Proc) -> bool {
+    let pend = (p.sig_pending | p.sig_shared) & !p.sig_mask;
+    if p.ptracer != 0 {
+        return pend & bit(SIGKILL) != 0;
+    }
+    (1..NSIG as i32).any(|s| pend & bit(s) != 0 && action(p, s).handler == SIG_DFL && matches!(default_action(s), Default::Terminate))
+}
+
+/// いま受け取れるシグナルがあるか (sleep を中断する)。cgroup.freeze で凍らせるように言われたものも (Linux の
+/// cgroup_freeze_task の signal_wake_up: システムコールから出て、シグナルの道で凍る)
 pub fn deliverable(p: &Proc) -> bool {
-    (p.sig_pending | p.sig_shared) & !p.sig_mask != 0 || p.pt_interrupt
+    (p.sig_pending | p.sig_shared) & !p.sig_mask != 0 || p.pt_interrupt || (p.freezing && !p.frozen)
 }
 
 /// フォールトなど、来たら先に受けとるもの (Linux の SYNCHRONOUS_MASK)
@@ -816,7 +827,7 @@ fn setup_frame(p: &mut Proc, tf: &mut TrapFrame, sig: i32, info: &SigInfo, a: &S
 #[inline]
 pub fn deliver(tf: &mut TrapFrame, interrupted: Option<Restart>) {
     let p = proc::current();
-    if (p.sig_pending | p.sig_shared) & !p.sig_mask == 0 && interrupted.is_none() && !p.no_restart && p.saved_mask.is_none() && !proc::any_stopped() && !p.pt_interrupt {
+    if (p.sig_pending | p.sig_shared) & !p.sig_mask == 0 && interrupted.is_none() && !p.no_restart && p.saved_mask.is_none() && !proc::any_stopped() && !p.pt_interrupt && !p.freezing {
         return;
     }
     deliver_now(tf, interrupted);
@@ -826,6 +837,8 @@ pub fn deliver(tf: &mut TrapFrame, interrupted: Option<Restart>) {
 fn deliver_now(tf: &mut TrapFrame, interrupted: Option<Restart>) {
     // 他のスレッドがグループを止めたなら、ここで止まる
     proc::stop_while_stopped();
+    // cgroup.freeze で凍らされたなら、とけるまでここで眠る
+    proc::freeze_while_frozen();
     let p = proc::current();
     // 他のスレッドの execve を引きついだばかり: 割り込まれたのは前のプログラムのシステムコールなので、やり直さない
     let interrupted = if core::mem::take(&mut p.no_restart) { None } else { interrupted };

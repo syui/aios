@@ -3457,8 +3457,12 @@ pub fn mount(srcp: usize, targetp: usize, typep: usize, flags: u64, datap: usize
                 let data = if datap != 0 { user_str(datap)? } else { String::new() };
                 crate::tmpfs::parse_data(&data)?.new_root()?
             }
-            // 装置のないもの (proc、sysfs、securityfs、efivarfs: vfs::register_filesystem で置いたもの。知らなければ ENODEV)
-            t => vfs::mount_nodev(t)?,
+            // 装置のないもの (proc、sysfs、securityfs、efivarfs、cgroup2: vfs::register_filesystem で置いたもの。知らなければ
+            // ENODEV)。data は、見るもの (cgroup2 の nsdelegate) にわたす
+            t => {
+                let data = if datap != 0 { user_str(datap)? } else { String::new() };
+                vfs::mount_nodev_data(t, &data)?
+            }
         };
         let source = if srcp != 0 { user_str(srcp)? } else { fstype.clone() };
         (root, source, fstype)
@@ -3720,7 +3724,7 @@ fn lsm_mount(srcp: usize, typep: usize, datap: usize, flags: u64, full: &str, di
         // 知らない fs の種類は ENODEV (get_fs_type)。aios の fs にデバイスの要るもの (FS_REQUIRES_DEV) やバイナリの
         // データのものはない
         let fstype = opt(typep)?;
-        if fstype.as_deref().is_some_and(|t| !matches!(t, "tmpfs" | "proc" | "sysfs" | "securityfs" | "efivarfs")) {
+        if fstype.as_deref().is_some_and(|t| !vfs::has_filesystem(t)) {
             return Err(-19);
         }
         let dev = opt(srcp)?;

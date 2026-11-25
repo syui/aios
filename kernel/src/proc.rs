@@ -549,6 +549,14 @@ pub struct Proc {
     pub child_subreaper: bool,
     /// PR_MCE_KILL (0 既定、1 遅く、2 はやく: Linux の PF_MCE_PROCESS と PF_MCE_EARLY)。aios は覚えて見せるだけ
     pub mce_kill: u8,
+    /// いる cgroup (cgroup v2 の木の、ディレクトリの ino: 1 は根。Linux の task の dfl の css_set の cgroup。スレッドごと
+    /// (aios の cgroup は domain だけなので、プロセスのスレッドはみな同じ)。fork とスレッドで受けつぐ (clone3 の
+    /// CLONE_INTO_CGROUP ならそこ)。cgroup.rs が cgroup.procs に書かれたときに変える。番号だけで、木は cgroup.rs が持つ
+    pub cgroup: u64,
+    /// cgroup.freeze で凍らせるように言われた (cgroup.rs が set_freezing で立てる: Linux の JOBCTL_TRAP_FREEZE) と、
+    /// 凍って眠っている (freeze_while_frozen の中: Linux の cgroup_task_frozen)。シグナルの道で、とけるか SIGKILL まで眠る
+    pub freezing: bool,
+    pub frozen: bool,
     /// nice (-20..19) とスケジューラの決まり (Linux の task の static_prio と policy: スレッドごと。fork とスレッドで
     /// 受けつぐ)。policy は 0 SCHED_OTHER、1 FIFO、2 RR、3 BATCH、5 IDLE、6 DEADLINE。aios は FIFO / RR / DEADLINE も
     /// CFS のように回す (覚えて答えるだけ)。rt_priority は FIFO / RR の優先度。reset_on_fork は SCHED_RESET_ON_FORK、
@@ -781,6 +789,9 @@ impl Proc {
         oom_score_adj: 0,
         oom_score_adj_min: 0,
         personality: 0,
+        cgroup: crate::ns::CGROUP_ROOT,
+        freezing: false,
+        frozen: false,
         nice: 0,
         affinity: u64::MAX,
         policy: 0,
@@ -1210,8 +1221,12 @@ fn free_slot(p: &mut Proc) {
     set_stopped(p, false);
     // seccomp の listener に、フィルタを使う人が減ったことを (使う人がいなくなれば POLLHUP)
     crate::security::seccomp_filter_release(&p.cred);
-    // pidfd があれば、終わったときの status を (PIDFD_GET_INFO の PIDFD_INFO_EXIT)
-    crate::pidfd::reaped(p.pid, p.xstatus);
+    // pidfd があれば、終わったときの status といた cgroup を (PIDFD_GET_INFO の PIDFD_INFO_EXIT と CGROUPID)
+    crate::pidfd::reaped(p.pid, p.xstatus, p.cgroup);
+    // 片づけたプロセスの走った時間は、いた cgroup のもの (cpu.stat。スレッドの分は代表の dead に入っている)
+    if !p.thread && !p.kthread {
+        cgroup_charge(p);
+    }
     let i = slot_of(p);
     kid_unlink(i);
     // 子はふつう終わるときに init にわたしている (そのあとに、残っていたスレッドが fork したものも)
@@ -1487,6 +1502,36 @@ pub fn cpu_times(c: usize) -> (u64, u64) {
 
 /// CPU ごとの、いま走らせている Proc の添字 + 1 (0 は何も)。起こしたものにゆずらせる相手を、Proc をみな見ずに選ぶ
 static ON_CPU: [core::sync::atomic::AtomicUsize; crate::smp::MAXCPU] = [const { core::sync::atomic::AtomicUsize::new(0) }; crate::smp::MAXCPU];
+
+/// cgroup ごとの、片づけたプロセスの走った時間 (ns: ユーザー、カーネル、nice が正のときのユーザー。Linux の cgroup の
+/// rstat の bstat のうち、もういないタスクの分)。cgroup の cpu.stat は、いまいるプロセスの時間とこれの和 (数えるのは
+/// ここ、見せるのは cgroup.rs)。消した cgroup のものは cgroup.rs が cgroup_forget で外す
+static CG_DEAD: Bkl<alloc::collections::BTreeMap<u64, [u64; 3]>> = Bkl::new(alloc::collections::BTreeMap::new());
+
+fn cgroup_charge(p: &Proc) {
+    let (u, s) = user_sys_ns(p, false);
+    let e = CG_DEAD.get().entry(p.cgroup).or_insert([0; 3]);
+    e[0] += u;
+    e[1] += s;
+    if p.nice > 0 {
+        e[2] += u;
+    }
+}
+
+/// cgroup id にいた、片づけたプロセスの (ユーザー, カーネル, nice) ns
+pub fn cgroup_dead(id: u64) -> [u64; 3] {
+    CG_DEAD.get().get(&id).copied().unwrap_or([0; 3])
+}
+
+/// 消した cgroup の覚えを外す (その時間は親へ: Linux の cgroup_rstat が親に足したまま)
+pub fn cgroup_forget(id: u64, parent: u64) {
+    if let Some(d) = CG_DEAD.get().remove(&id) {
+        let e = CG_DEAD.get().entry(parent).or_insert([0; 3]);
+        for k in 0..3 {
+            e[k] += d[k];
+        }
+    }
+}
 
 /// 使っている Proc (Unused でないもの)
 pub fn live() -> impl Iterator<Item = &'static mut Proc> {
@@ -2703,7 +2748,8 @@ pub fn unshare(flags: u64) -> Result<i64, i64> {
     Ok(0)
 }
 
-pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Result<u32, i64> {
+/// cgroup は clone3 の CLONE_INTO_CGROUP の行き先 (cgroup.rs がたしかめた番号と、そこが凍っているか。None なら親と同じ)
+pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize, cgroup: Option<(u64, bool)>) -> Result<u32, i64> {
     const EAGAIN: i64 = 11;
     const ENOMEM: i64 = 12;
     let thread = flags & CLONE_THREAD != 0;
@@ -2762,6 +2808,9 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize) -> Re
     child.sync_cred_work();
     child.comm = parent.comm;
     child.spec_ssb = parent.spec_ssb;
+    // 凍っている cgroup で生まれた子は、はじめから凍る (Linux の cgroup_post_fork の CGRP_FREEZE)
+    (child.cgroup, child.freezing) = cgroup.unwrap_or((parent.cgroup, parent.freezing));
+    child.frozen = false;
     // rlimit と oom_score_adj はプロセスが受けつぐ (Linux の copy_signal)。スレッドは代表のものを使う
     if !thread {
         let l = if parent.thread { find_leader_any(parent.tgid) } else { None };
@@ -3309,6 +3358,46 @@ pub fn set_stopped(l: &mut Proc, on: bool) {
 #[inline]
 pub fn any_stopped() -> bool {
     STOPPED_GROUPS.load(core::sync::atomic::Ordering::Relaxed) != 0
+}
+
+static FREEZE_CHAN: u8 = 0;
+
+/// 凍っているものが眠るチャンネル (とかすときにみな起こし、起きたものが見なおす)
+fn freeze_chan() -> usize {
+    &raw const FREEZE_CHAN as usize
+}
+
+/// cgroup.freeze で凍らされていれば、とけるか、終わらせるシグナル (SIGKILL と、ハンドラのない既定で終わるもの) まで
+/// 眠る (Linux の do_freezer_trap: ほかのシグナルは来ても受けとらずに眠りなおす)。シグナルを受けとる前に (signal.rs の
+/// deliver_now)
+pub fn freeze_while_frozen() {
+    loop {
+        let p = current();
+        if !p.freezing || p.killed || crate::signal::fatal_pending(p) {
+            p.frozen = false;
+            return;
+        }
+        p.frozen = true;
+        p.chan = freeze_chan();
+        p.state = State::Sleeping;
+        wq_enter();
+        sched();
+        wq_exit();
+        current().chan = 0;
+    }
+}
+
+/// t を凍らせる (眠っているシステムコールからも出てきてもらう: interrupt) か、とかす (cgroup.rs の cgroup.freeze と移すとき)
+pub fn set_freezing(t: &mut Proc, on: bool) {
+    if t.freezing == on {
+        return;
+    }
+    t.freezing = on;
+    if on {
+        interrupt(t);
+    } else {
+        wakeup(freeze_chan());
+    }
 }
 
 pub fn stop_while_stopped() {
