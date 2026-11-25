@@ -4510,11 +4510,16 @@ segs_out が 0 のまま (2026-11-23、種 10151)。test/chosen.c も確かめ�
 
 | 名前 | Linux のまちがい | ロボットは Linux で |
 |---|---|---|
-| zero-range-eof | ext4 の fallocate ZERO_RANGE で、範囲がファイルの終わりをこえ、終わりのブロックがもうディスクにあると、そのブロックの中 (ファイルの終わりまで) が 0 にならない。7.2.11 の ext4_alloc_file_blocks が、大きさをのばすときに ext4_block_zero_eof で終わりのブロックの残りを 0 にするが、それが ZERO_RANGE で落としたばかりのページを読みもどす。7.3 にもある。6.18 にはない (delalloc でまだディスクにないブロックなら 0 になる。ロボットの並びではめったに起きず、ブロックにそろった ZERO_RANGE を fsync と fadvise DONTNEED のあとにすると出る) | ZERO_RANGE がうまくいったら、範囲のうちファイルの終わりまでを PUNCH_HOLE で 0 にする |
-| efault-extend | ファイルの終わりより先への write / pwrite / pwritev2 がさわれない入れ物で EFAULT になっても、ファイルがその位置まで伸びる (ext4 も tmpfs も: generic_perform_write が write_begin のあとに写し、0 バイトでも write_end が i_size を pos にする) | 6.18、7.2.11、7.3 | なにも書けなかったのだから伸びない (aios はそう) |
+| zero-range-eof | (7.4-rc5 の f0872c44e "ext4: skip eof zeroing when the zero range covers the eof block" で直る: rc4 にあてて test/fsbugs.c で確かめた。rc5 の手本で sysdiff -r をして外す) ext4 の fallocate ZERO_RANGE で、範囲がファイルの終わりをこえ、終わりのブロックがもうディスクにあると、そのブロックの中 (ファイルの終わりまで) が 0 にならない。7.2.11 の ext4_alloc_file_blocks が、大きさをのばすときに ext4_block_zero_eof で終わりのブロックの残りを 0 にするが、それが ZERO_RANGE で落としたばかりのページを読みもどす。7.3 にもある。6.18 にはない (delalloc でまだディスクにないブロックなら 0 になる。ロボットの並びではめったに起きず、ブロックにそろった ZERO_RANGE を fsync と fadvise DONTNEED のあとにすると出る) | ZERO_RANGE がうまくいったら、範囲のうちファイルの終わりまでを PUNCH_HOLE で 0 にする |
+| efault-extend | (ext4 は 7.4-rc5 の e5db68ec4 "ext4: do not advance i_size on a buffered write that copied nothing" で直る: rc4 にあてて test/fsbugs.c で確かめた。tmpfs の shmem_write_end はまだなので、rc5 の手本で tmpfs だけにする) ファイルの終わりより先への write / pwrite / pwritev2 がさわれない入れ物で EFAULT になっても、ファイルがその位置まで伸びる (ext4 も tmpfs も: generic_perform_write が write_begin のあとに写し、0 バイトでも write_end が i_size を pos にする) | 6.18、7.2.11、7.3 | なにも書けなかったのだから伸びない (aios はそう) |
 | unix-oob-inq | AF_UNIX の stream で、MSG_OOB の 1 バイトを SO_OOBINLINE なしに読みとばす (ふつうの read や recv が、印のところの OOB の skb を読まずに捨てる) と、FIONREAD (SIOCINQ) の数がそのぶん多いままになる (manage_oob が skb を外して捨てるが、unix_inq_len が使う inq_len を減らさない) | 7.3 と 7.4 | 読めないバイトを数えるのはまちがい (aios は減らす)。読む op の前に印 (SIOCATMARK) にいて、あとで印でなくなったら読みとばした数をソケットごとに覚え、FIONREAD の数から引く (印は両方で) |
 | udp-cork-dst | つないだ UDP で、ほかのあて先へ MSG_MORE でためはじめる (sendto や sendmsg であて先をつけて) と、それを出したあとも、あて先なしの送り (write、send) がつないだ相手でなく、そのためたときのあて先へ行く (udp_sendmsg のつないだものの近道は、経路の覚え (sk_dst_check) があると inet->cork.fl をそのまま使い、cork.fl はためはじめたときのあて先のまま。つなぎなおすまで続く) | 7.4-rc4 | あて先なしの送りは、つないだ相手へ行くのが正しい (connect(2))。UDP のソケットごとに、ためているかと、ためはじめたときのあて先を覚え (両方で)、ためていないときにあて先なしで送る op の前に、あて先がつないだ相手とちがえば、Linux ではつなぎなおして cork.fl を相手にもどす (つなぎなおしは cork.fl を書きかえるだけ) |
 | tmpfs-extend | tmpfs で、写し (mmap) でファイルの終わりの先 (同じページの中) に書いたものが、ファイルを伸ばすと (ftruncate、fallocate、終わりより先への write) そのまま中身になる (shmem_setattr と shmem_write_end はページの終わりの先を 0 にしない。ext4 は pagecache_isize_extended で 0 にする) | 7.2.11 と 7.3 | POSIX は伸ばしたところは 0 と読めると決めている (ftruncate(2)、write(2))。伸ばした op のあとで、前の終わりからそのページの終わり (op が書いたところの手前) までに 0 を書く (aios は ext4 でも tmpfs でも 0) |
+
+`test/fsbugs.c` (`test/ldiff.sh fsbugs @home /tmp`、vm-ctests にも) は、このうちファイルのもの (zero-range-eof、
+efault-extend、tmpfs-extend) を小さく起こす。新しい版の Linux で直ったかを、sysdiff の長い並びを待たずに見るため
+(2026-11-25: 7.4-rc4 はみな出る。7.4-rc5 の ext4 の直し (ext4_for_linus-7.4-rc5) のうち f0872c44e と e5db68ec4 を
+rc4 にあてたものでは ext4 の 5 つが ok、tmpfs の efault-extend と tmpfs-extend はのこる。aios はみな ok)。
 
 #### Linux よりよくできそうなところ (候補)
 
