@@ -314,6 +314,12 @@ OpenSSL はいらない。Zig の clang で作るので USE_MLDSA が入る)。2
 - まだ見る側がない: Gitea (golang.org/x/crypto/ssh v0.59.0 は ML-DSA だけの ssh-mldsa-44 は知っているが、ed25519 と
   あわせた ssh-mldsa44-ed25519 は知らない) は、この鍵を登録できず、署名も確かめられない。GitHub は確かめていない。
   ai のコミットの署名は gpg のまま (aigpt-mcp.sh が gpg の署名で ai/gpt と ai/log を確かめる)
+- ai の身元 (aigpt identity) に mldsa44-ed25519 の鍵を足すのは `aigpt identity ssh ~/.ssh/id_mldsa44_ed25519`
+  (ai/gpt 5ea1ec3。gpg のいちばん上の鍵と ssh の鍵の秘密があるところ: 使う人のマシンで)。記録
+  `ai.syui.gpt.account/ssh` に、公開鍵と指紋、その文 (did、handle、ssh の指紋) を gpg のいちばん上の鍵で署名した
+  proof (gpg → ssh) と、ssh の鍵で署名した sshProof (`ssh-keygen -Y sign -n aigpt-identity`: ssh → did)。
+  `aigpt identity status` が両方を確かめ (openssh がその種類を知らなければ ssh の署名は飛ばす)、`aigpt sync -c
+  ai.syui.gpt.account` で PDS に
 
 ## カーネルの値 (/proc/sys と sysctl)
 
