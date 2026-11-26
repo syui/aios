@@ -2546,6 +2546,25 @@ pub fn register_exit_hook(f: fn(u32)) {
     EXIT_HOOK.set(Some(f));
 }
 
+/// fork とスレッドを作る前に、子の入る cgroup の pids.max を見るもの (cgroup.rs の can_fork: main.rs が置く。こえれば
+/// EAGAIN。Linux の cgroup_can_fork)
+type ForkHook = fn(u64) -> Result<(), i64>;
+static FORK_HOOK: crate::cell::Early<Option<ForkHook>> = crate::cell::Early::new(None);
+
+pub fn register_fork_hook(f: ForkHook) {
+    FORK_HOOK.set(Some(f));
+}
+
+/// cgroup の pids で数えるタスク (Linux の pids_release までのもの): 片づけていないゾンビの代表はまだ数え、終わった
+/// スレッドと、親を待たずに片づくゾンビ (autoreap) は数えない。カーネルのスレッドは根にいるので数えない
+pub fn pids_counted(p: &Proc) -> bool {
+    match p.state {
+        State::Unused => false,
+        State::Zombie => !p.thread && !p.autoreap && !p.kthread,
+        _ => !p.kthread,
+    }
+}
+
 /// PTRACE_O_SUSPEND_SECCOMP (Linux の PT_SUSPEND_SECCOMP): tracer がこの印で SEIZE か SETOPTIONS したあいだ、seccomp を見ない
 pub const PT_SUSPEND_SECCOMP: u32 = 0x20_0000;
 
@@ -2763,6 +2782,10 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: u64, ctid: usize, cgrou
     }
     let mut cred = parent.cred.clone();
     crate::ns::renew(&mut cred, flags)?;
+    // cgroup の pids.max (子の入る cgroup から上。こえれば EAGAIN: 重いもの (ページ表の写し) を作る前に)
+    if let Some(f) = *FORK_HOOK.get() {
+        f(cgroup.map_or(parent.cgroup, |c| c.0))?;
+    }
     // CLONE_VM: スレッドでなくても同じアドレス空間 (vfork と glibc の posix_spawn は、子が exec するまで親のメモリで
     // 動き、exec できなかったわけをそこに書いて知らせる)。子が exec すれば新しいものに切りかわる
     let mm = if flags & CLONE_VM != 0 {

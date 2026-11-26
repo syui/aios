@@ -278,11 +278,14 @@ pub extern "C" fn kmain() -> ! {
     vfs::register_filesystem("sysfs", |_| Ok(sysfs::new_root()));
     vfs::register_filesystem("securityfs", |_| Ok(securityfs::new_root()));
     vfs::register_filesystem("efivarfs", |_| efivarfs::new_root());
-    // cgroup (v1: controller も名前つきの木もないので、マウントは EINVAL) と cgroup2 (分けあう 1 つの木。cgroup.rs)。
+    // cgroup (v1: 名前つきの木がなく、controller (pids) も v1 には渡さないので、マウントは EINVAL) と cgroup2 (分けあう
+    // 1 つの木。cgroup.rs)。
     // clone3 の CLONE_INTO_CGROUP の行き先もそこで決める
     vfs::register_filesystem("cgroup", cgroup::mount_v1);
     vfs::register_filesystem("cgroup2", cgroup::mount);
     syscall::register_cgroup_fd(cgroup::into_cgroup);
+    // fork とスレッドを作る前に pids.max を (cgroup v2 の pids controller)
+    proc::register_fork_hook(cgroup::can_fork);
     // /dev/stdin や /proc/self/fd/N で、名前のないものを開くとき [quirk tty-root-fdlink] (proc の magic link)
     sysfile::register_fd_link(procfs::fd_link_file);
     // ルート: ディスクがあれば (block::mount_root: Linux の mount_root)、なければ initramfs

@@ -3277,7 +3277,7 @@ kernel/cgroup/cgroup.c のうち controller のないもの (手本の test/linu
   シグナル (SIGTERM など) は凍っていても終わらせる (Linux の complete_signal の sig_fatal)。凍った cgroup で生まれた子と、
   そこへ移ったものも凍り、出ればとける。cgroup.events の frozen は、凍らせていて中のスレッドがみな眠ったとき (中が空でも 1)
 - 見えかた: /proc/PID/cgroup と task/TID/cgroup ("0::パス"。cgroup2 をはじめてかぶせるまでは空: Linux の
-  cgrp_dfl_visible。消した cgroup にいるゾンビは " (deleted)")、/proc/cgroups (controller がないので見出しだけ)、
+  cgrp_dfl_visible。消した cgroup にいるゾンビは " (deleted)")、/proc/cgroups (2026-11-26 から pids の行も)、
   /proc/filesystems (前はなかった。mount(2) で使える装置のないもの)、/sys/fs/cgroup (かぶせるところ)、
   /sys/kernel/cgroup/delegate と features
 - cgroup の namespace (ns.rs: unshare と clone の CLONE_NEWCGROUP、setns、/proc/PID/ns/cgroup、listns、NS_GET_NSTYPE):
@@ -3288,7 +3288,40 @@ kernel/cgroup/cgroup.c のうち controller のないもの (手本の test/linu
   freeze、clone3、ns、pidfd、perm。同じ VM でくりかえしても同じ)。手本を CGROUPS にしても、procpid、listns、setns、
   pidfdinfo、ipcns、statmount、procfiles、capsns、mountinfo、dumpable は同じ
 - まだ: threaded (cgroup.type に threaded を書くと EOPNOTSUPP)、cgroup.events の知らせ (poll と inotify)、controller
-  (cpu、memory、io、pids)、v1 の名前つきの木 (mount -t cgroup は EINVAL)
+  (cpu、memory、io。pids は下に)、v1 の名前つきの木 (mount -t cgroup は EINVAL)
+
+### cgroup v2 の pids controller (2026-11-26)
+
+todo.json の cgroup ののこりの controller から、いちばん小さい pids (Linux の kernel/cgroup/pids.c) を。手本の
+test/linux.config に CGROUP_PIDS を足した (ふつうの配布の Linux も入れる)。コンテナの道具 (runc / crun、systemd の
+TasksMax、aibox) が fork bomb を止めるのに使う。
+
+- 使えるようにする: 根の cgroup.controllers は "pids"。親の cgroup.subtree_control に "+pids" (空白で並べ、あとのものが勝つ。
+  名前のまちがいと +/- のないものは EINVAL、親が渡していないものを + は ENOENT、子が +pids しているのに - は EBUSY) で、
+  子に pids.max (0644)、pids.current、pids.peak、pids.events、pids.events.local (0444。持ち主は作った人) ができる。根には
+  ない。-pids で消え、開いていた fd は ENODEV。+pids しなおすと数えなおし (max は max、events は 0、peak はいまの数)。
+  cgroup.stat に nr_subsys_pids (自分と子孫の生きている入れもの) と nr_dying_subsys_pids、/proc/cgroups に
+  "pids 0 (cgroup の数) 1"
+- 数える: pids.current はその cgroup と子孫のタスク (スレッドも 1 つ。片づけていないゾンビの代表もまだ数え、終わった
+  スレッドと autoreap のゾンビは数えない: Linux の pids_release までのもの。proc.rs の pids_counted)。とっておかず、
+  読むたびに数える (NPROC は 512)。消した cgroup に残ったゾンビも、親から上で数える
+- 止める: fork とスレッドを作るとき (proc.rs の clone が、ページ表を写す前に cgroup.rs の can_fork を呼ぶ。main.rs が
+  register_fork_hook で置く)、子の入る cgroup (CLONE_INTO_CGROUP なら行き先) の入れものから根の手前まで、下から 1 つ足して
+  pids.max をこえるところがあれば EAGAIN (Linux の pids_try_charge。こえなかった下のところの peak は上げたまま: しくじった
+  fork でも peak は上がる)。pids.events は上限に当たったところとその上、pids.events.local はそこだけ。fork した入れもので
+  はじめてしくじったときに kmsg へ "cgroup: fork rejected by pids controller in /パス"。pids.max は "max" か 0 から
+  4194304 (Linux の kstrtoll: 0x と 8 進も。PIDS_MAX から上と負は EINVAL、あふれは ERANGE)。いまの数より下にもできる
+- 移す: 上限は見ない。peak は Linux の pids_can_attach のとおり (1 つずつ行き先から上に足して、もとから上を引く: 共通の
+  祖先は 1 つ多い時がある。pids を分けあうところどうしでは動かない)
+- pids は threaded の controller なので、中にプロセスがいても +pids できる (子に中のものがいなければ。いれば EBUSY: Linux の
+  cgroup_vet_subtree_control_enable)。そうするとその cgroup は thread root (cgroup.type が domain threaded) になり、子は
+  domain invalid (移せない: EOPNOTSUPP)。+pids していて子に中のものがいる cgroup へは移せない (EBUSY: no internal
+  process。Linux の cgroup_migrate_vet_dst。CLONE_INTO_CGROUP も同じ)
+- pids_localevents でかぶせると (はじめの namespace で。かぶせるたびにそのとおり: mountinfo にも出る)、pids.events と
+  pids.events.local はどちらも、その入れもので fork にしくじった数 (v1 と同じ見え方)。そのあいだの失敗は max に数えない
+- test/pids.c (root で: test/ldiff.sh --root pids) は Linux 7.4-rc4 と 224 行同じ (root、files、fork、migrate、control、
+  local。同じ VM でくりかえしても同じ)。手本に CGROUP_PIDS を足しても test/cgroup.c は 287 行同じ (/proc/cgroups の
+  pids の行と cgroup.stat の nr_subsys_pids が増えた)、listns、pidfdinfo、procpid も同じ
 
 ### 長い並び (op 150) で見つけた 4 つ (2026-11-23)
 

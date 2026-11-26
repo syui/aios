@@ -1,14 +1,22 @@
-// cgroup v2 の核 (Linux の kernel/cgroup/cgroup.c のうち controller のないもの: 手本の test/linux.config の CGROUPS)
+// cgroup v2 の核 (Linux の kernel/cgroup/cgroup.c) と pids controller (kernel/cgroup/pids.c): 手本の test/linux.config の
+// CGROUPS と CGROUP_PIDS
 //
 //   木         ディレクトリの木 1 つ (根の番号は 1)。プロセスのいるところは Proc の cgroup (番号: ディレクトリの ino と
 //              同じ。Linux の cgroup_id)。fork とスレッドは親のところ、clone3 の CLONE_INTO_CGROUP ならその fd のところ
 //   cgroup2    mount -t cgroup2 (分けあう 1 つのファイルシステム: 同じところにもう一度は EBUSY)。根は cgroup の namespace
 //              の根。はじめてかぶせるまで /proc/PID/cgroup は空 (Linux の cgrp_dfl_visible)
 //   ファイル   cgroup.procs と cgroup.threads (書いて移す)、cgroup.controllers と cgroup.subtree_control (controller は
-//              ないので空)、cgroup.max.depth と cgroup.max.descendants (mkdir の上限: EAGAIN)、cgroup.stat、cgroup.type
-//              (domain だけ)、cgroup.events (populated と frozen)、cgroup.freeze (1 で中と子孫を凍らせる: シグナルの道で
-//              とけるか SIGKILL まで眠る。proc.rs の freeze_while_frozen)、cgroup.kill (中のみなに SIGKILL)、
-//              cgroup.stat.local、cpu.stat (走った時間) と cpu.stat.local。根には type、events、freeze、kill、stat.local がない
+//              pids だけ)、cgroup.max.depth と cgroup.max.descendants (mkdir の上限: EAGAIN)、cgroup.stat、cgroup.type
+//              (domain、domain threaded、domain invalid)、cgroup.events (populated と frozen)、cgroup.freeze (1 で中と
+//              子孫を凍らせる: シグナルの道でとけるか SIGKILL まで眠る。proc.rs の freeze_while_frozen)、cgroup.kill
+//              (中のみなに SIGKILL)、cgroup.stat.local、cpu.stat (走った時間) と cpu.stat.local。根には type、events、
+//              freeze、kill、stat.local、pids.* がない
+//   pids       親の cgroup.subtree_control に +pids で、子に pids.max / current / peak / events / events.local。数は
+//              タスク (スレッドも 1 つ。片づけていないゾンビの代表もまだ数える) で、その cgroup と子孫のもの。fork と
+//              スレッドを作るときに、いる (CLONE_INTO_CGROUP なら行き先の) cgroup から根の手前まで、どこかで pids.max を
+//              こえれば EAGAIN (proc.rs の clone が can_fork を呼ぶ)。移すときは上限を見ない。pids は threaded の
+//              controller なので、中にプロセスがいても +pids できる (子に中のものがいなければ)。そのときその cgroup は
+//              domain threaded になり、子は domain invalid (移せない: EOPNOTSUPP)
 //   mkdir      子の cgroup (名前に改行は EINVAL)。持ち主は作った人 (fsuid)、許しは mode のまま。ファイルは 0644 か 0444
 //              (kill は 0200)。chmod と chown はできる (任せる: delegate)。ファイルは作れない (EACCES)、名前は変えられ
 //              ない (EPERM)。rmdir は中にプロセスか子の cgroup があれば EBUSY
@@ -18,7 +26,8 @@
 //   namespace  /proc/PID/cgroup のパスは、読む人の cgroup の namespace の根から (外のものは /../NAME)
 //   /proc/PID/cgroup、/proc/cgroups (controller がないので見出しだけ)、/sys/kernel/cgroup の delegate と features は
 //   procfs と sysfs が、ここのものを見せる
-// まだ: threaded (cgroup.type に threaded を書くと EOPNOTSUPP)、cgroup.events の知らせ (poll と inotify)、v1 の名前つきの木
+// まだ: threaded (cgroup.type に threaded を書くと EOPNOTSUPP)、cgroup.events の知らせ (poll と inotify)、v1 の名前つきの木、
+// pids のほかの controller
 use crate::cell::Bkl;
 use crate::proc::{self, State};
 use crate::vfs::*;
@@ -41,8 +50,11 @@ const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
 /// 根の cgroup の番号 (ディレクトリの ino)
 pub const ROOT: u64 = crate::ns::CGROUP_ROOT;
 
-/// ファイル (名前、許し、根にもあるか)。Linux の cgroup_base_files の順
-const FILES: [(&str, u32, bool); 14] = [
+/// pids.max の "max" (Linux の PIDS_MAX: PID_MAX_LIMIT + 1。これから上は書けない)
+const PIDS_MAX: i64 = 4 * 1024 * 1024 + 1;
+
+/// ファイル (名前、許し、根にもあるか)。Linux の cgroup_base_files の順と、pids の pids_files (pids を持つ cgroup だけ)
+const FILES: [(&str, u32, bool); 19] = [
     ("cgroup.type", 0o644, false),
     ("cgroup.procs", 0o644, true),
     ("cgroup.threads", 0o644, true),
@@ -57,6 +69,11 @@ const FILES: [(&str, u32, bool); 14] = [
     ("cgroup.kill", 0o200, false),
     ("cpu.stat", 0o444, true),
     ("cpu.stat.local", 0o444, true),
+    ("pids.max", 0o644, false),
+    ("pids.current", 0o444, false),
+    ("pids.peak", 0o444, false),
+    ("pids.events", 0o444, false),
+    ("pids.events.local", 0o444, false),
 ];
 const F_TYPE: u8 = 0;
 const F_PROCS: u8 = 1;
@@ -72,8 +89,13 @@ const F_FREEZE: u8 = 10;
 const F_KILL: u8 = 11;
 const F_CPU_STAT: u8 = 12;
 const F_CPU_STAT_LOCAL: u8 = 13;
+const F_PIDS_MAX: u8 = 14;
+const F_PIDS_CURRENT: u8 = 15;
+const F_PIDS_PEAK: u8 = 16;
+const F_PIDS_EVENTS: u8 = 17;
+const F_PIDS_EVENTS_LOCAL: u8 = 18;
 /// cgroup ごとの番号の幅 (ディレクトリと、そのあとにファイルの ino)
-const STRIDE: u64 = 16;
+const STRIDE: u64 = 32;
 
 /// 名前つきの許しと持ち主と時刻 (Linux の kernfs の iattr)
 #[derive(Clone, Copy)]
@@ -102,9 +124,31 @@ struct Cg {
     frozen_ns: u64,
     /// rmdir したもの (まだプロセス (ゾンビ) が指しているあいだだけ残す: /proc/PID/cgroup の " (deleted)")
     dead: bool,
+    /// cgroup.subtree_control の pids (子が pids を持つ)
+    subtree_pids: bool,
+    /// pids の入れもの (Linux の pids_cgroup の css: 親が +pids しているあいだ。根は持たない (数えない))
+    pids: Option<Pids>,
     dir: Attr,
     files: [Attr; FILES.len()],
 }
+
+/// pids の入れもの (Linux の pids_cgroup)。数 (pids.current) はとっておかず、そのつど数える (count)
+#[derive(Clone, Copy)]
+struct Pids {
+    /// pids.max (PIDS_MAX は max)
+    max: i64,
+    /// pids.peak (Linux の watermark)
+    peak: i64,
+    /// events[PIDCG_MAX]: ここか子孫で上限に当たった数 (pids.events)
+    ev_max: u64,
+    /// events_local[PIDCG_MAX]: ここの上限に当たった数 (pids.events.local)
+    local_max: u64,
+    /// events_local[PIDCG_FORKFAIL]: ここで fork にしくじった数 (pids_localevents のときの pids.events と
+    /// pids.events.local。はじめの 1 回は kmsg に)
+    forkfail: u64,
+}
+
+const NEW_PIDS: Pids = Pids { max: PIDS_MAX, peak: 0, ev_max: 0, local_max: 0, forkfail: 0 };
 
 static TREE: Bkl<BTreeMap<u64, Cg>> = Bkl::new(BTreeMap::new());
 static NEXT: Bkl<u64> = Bkl::new(ROOT + STRIDE);
@@ -112,6 +156,9 @@ static NEXT: Bkl<u64> = Bkl::new(ROOT + STRIDE);
 static VISIBLE: AtomicBool = AtomicBool::new(false);
 /// nsdelegate (マウントのオプション: namespace の根を任せる境目にする。Linux の CGRP_ROOT_NS_DELEGATE)
 static NS_DELEGATE: AtomicBool = AtomicBool::new(false);
+/// pids_localevents (マウントのオプション: pids.events を v1 のように、ここで fork にしくじった数に。Linux の
+/// CGRP_ROOT_PIDS_LOCAL_EVENTS)
+static PIDS_LOCAL: AtomicBool = AtomicBool::new(false);
 static FS: AtomicUsize = AtomicUsize::new(0);
 
 fn fs_id() -> usize {
@@ -142,6 +189,8 @@ fn new_cg(parent: u64, name: String, uid: u32, gid: u32, mode: u32) -> Cg {
         freeze_at: 0,
         frozen_ns: 0,
         dead: false,
+        subtree_pids: false,
+        pids: None,
         dir: attr(S_IFDIR | mode, uid, gid),
         files: FILES.map(|(_, m, _)| attr(S_IFREG | m, uid, gid)),
     }
@@ -264,6 +313,276 @@ fn populated(id: u64) -> bool {
     proc::live().any(|p| p.state != State::Unused && p.state != State::Zombie && !p.kthread && ids.contains(&p.cgroup))
 }
 
+// ---- threaded のかたち (Linux の cgroup_is_thread_root など。aios に threaded の cgroup はないので、threaded の
+//      controller (pids) を +pids したところだけが thread root になる) ----
+
+/// id そのものに (ゾンビでない) タスクがいる (Linux の cgroup_has_tasks)
+fn has_tasks(id: u64) -> bool {
+    proc::live().any(|p| p.state != State::Unused && p.state != State::Zombie && !p.kthread && p.cgroup == id)
+}
+
+/// 中のものがいる子の数 (Linux の nr_populated_domain_children)
+fn populated_kids(id: u64) -> usize {
+    get(id).map_or(0, |g| g.kids.iter().filter(|&&k| populated(k)).count())
+}
+
+/// タスクがいて threaded の controller を子に渡している (Linux の cgroup_is_thread_root: domain threaded)
+fn thread_root(id: u64) -> bool {
+    get(id).is_some_and(|g| g.subtree_pids) && has_tasks(id)
+}
+
+/// 祖先 (根はのぞく: mixable) に thread root がない (Linux の cgroup_is_valid_domain。あれば domain invalid)
+fn valid_domain(id: u64) -> bool {
+    let mut c = get(id).map_or(0, |g| g.parent);
+    while c != 0 && c != ROOT {
+        if thread_root(c) {
+            return false;
+        }
+        c = get(c).map_or(0, |g| g.parent);
+    }
+    true
+}
+
+/// thread root になれる (Linux の cgroup_can_be_thread_root: 根か、中のものがいる子がない)
+fn can_be_thread_root(id: u64) -> bool {
+    id == ROOT || populated_kids(id) == 0
+}
+
+/// 移す・CLONE_INTO_CGROUP の行き先 (Linux の cgroup_migrate_vet_dst): domain invalid は EOPNOTSUPP、子に中のものが
+/// いて controller を子に渡しているところは EBUSY (no internal process)
+fn vet_dst(dst: u64) -> Result<(), i64> {
+    if !valid_domain(dst) {
+        return Err(-EOPNOTSUPP);
+    }
+    if can_be_thread_root(dst) {
+        return Ok(());
+    }
+    if get(dst).is_some_and(|g| g.subtree_pids) {
+        return Err(-EBUSY);
+    }
+    Ok(())
+}
+
+// ---- pids (Linux の kernel/cgroup/pids.c) ----
+
+/// id にいるタスクを数える pids の入れもの (Linux の task_css(pids): id から上で pids を持つはじめのもの。なければ根)
+fn eff(id: u64) -> u64 {
+    let mut c = id;
+    while c != ROOT {
+        match get(c) {
+            Some(g) if g.pids.is_some() => return c,
+            Some(g) => c = g.parent,
+            None => return ROOT,
+        }
+    }
+    ROOT
+}
+
+/// e から根の手前までの pids の入れもの (Linux の parent_pids をたどるもの: 下から)
+fn pids_chain(e: u64) -> Vec<u64> {
+    let mut v = Vec::new();
+    let mut c = e;
+    while c != ROOT {
+        let Some(g) = get(c) else { break };
+        if g.pids.is_none() {
+            break;
+        }
+        v.push(c);
+        c = g.parent;
+    }
+    v
+}
+
+/// q と子孫 (消したものもふくむ: ゾンビが残っていれば数える) のタスクの数 (pids.current)
+fn count(q: u64) -> i64 {
+    proc::live().filter(|p| proc::pids_counted(p) && descends(p.cgroup, q)).count() as i64
+}
+
+fn pids_of(id: u64) -> Option<&'static mut Pids> {
+    get(id).and_then(|g| g.pids.as_mut())
+}
+
+/// 上限に当たった (Linux の pids_event): forking は fork した (子の入る) ところの入れもの、over は上限をこえたところ
+fn pids_event(forking: u64, over: u64) {
+    if let Some(f) = pids_of(forking) {
+        f.forkfail += 1;
+        if f.forkfail == 1 {
+            crate::println!("cgroup: fork rejected by pids controller in {}", path_from(forking, ROOT));
+        }
+    }
+    if PIDS_LOCAL.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Some(o) = pids_of(over) {
+        o.local_max += 1;
+    }
+    for c in pids_chain(over) {
+        if let Some(p) = pids_of(c) {
+            p.ev_max += 1;
+        }
+    }
+}
+
+/// fork とスレッドを作る前 (Linux の pids_can_fork と pids_try_charge): 子の入る cgroup から上へ、1 つ足して
+/// pids.max をこえるところがあれば EAGAIN。こえなかったところの peak は上げたまま (しくじっても戻さない)
+pub fn can_fork(target: u64) -> Result<(), i64> {
+    let e = eff(target);
+    for q in pids_chain(e) {
+        let new = count(q) + 1;
+        let Some(p) = pids_of(q) else { break };
+        if new > p.max {
+            pids_event(e, q);
+            return Err(-EAGAIN);
+        }
+        p.peak = p.peak.max(new);
+    }
+    Ok(())
+}
+
+/// n 個のタスクを src の入れものから dst の入れものへ移す前の peak (Linux の pids_can_attach: 1 つずつ行き先から上に
+/// 足し、もとから上を引く。共通の祖先は 1 つ多い時がある)
+fn migrate_peaks(src: u64, dst: u64, n: i64) {
+    if src == dst || n == 0 {
+        return;
+    }
+    let old = pids_chain(src);
+    for q in pids_chain(dst) {
+        let c = count(q);
+        if let Some(p) = pids_of(q) {
+            p.peak = p.peak.max(if old.contains(&q) { c + 1 } else { c + n });
+        }
+    }
+}
+
+/// id に pids の入れものを作る (親が +pids した・+pids したところに mkdir した。Linux の css_create と、中のタスクを
+/// 移す cgroup_update_dfl_csses)。ファイルの持ち主は作った人
+fn pids_create(id: u64) {
+    let Some(g) = get(id) else { return };
+    if g.pids.is_some() {
+        return;
+    }
+    let parent = g.parent;
+    let n = count(id);
+    // 中のタスクは親の入れものから移る: 親から上は共通の祖先 (1 つ足してから引く)
+    if n > 0 {
+        for q in pids_chain(eff(parent)) {
+            let c = count(q);
+            if let Some(p) = pids_of(q) {
+                p.peak = p.peak.max(c + 1);
+            }
+        }
+    }
+    let c = crate::cred::current();
+    let g = get(id).unwrap();
+    for f in F_PIDS_MAX..=F_PIDS_EVENTS_LOCAL {
+        g.files[f as usize] = attr(S_IFREG | FILES[f as usize].1, c.fsuid, c.fsgid);
+    }
+    g.pids = Some(Pids { peak: n, ..NEW_PIDS });
+}
+
+/// id の pids の入れものを捨てる (親が -pids した。中のタスクは親の入れものへ)
+fn pids_destroy(id: u64) {
+    let Some(g) = get(id) else { return };
+    if g.pids.is_none() {
+        return;
+    }
+    let parent = g.parent;
+    migrate_peaks(id, eff(parent), count(id));
+    get(id).unwrap().pids = None;
+}
+
+/// cgroup.subtree_control に書く (Linux の cgroup_subtree_control_write): "+pids" と "-pids" を空白で並べる (あとの
+/// ものが勝つ)。ほかの名前や +/- のないものは EINVAL、使えない (親が渡していない) ものを + は ENOENT、子が +pids
+/// しているのに - は EBUSY。+ は cgroup_vet_subtree_control_enable: domain invalid は EOPNOTSUPP、根でなく、子に中の
+/// ものがいて、自分にもタスクがいれば EBUSY
+fn subtree_write(id: u64, text: &str) -> Result<(), i64> {
+    let mut want: Option<bool> = None;
+    for tok in text.trim().split(' ').filter(|t| !t.is_empty()) {
+        let (sign, name) = tok.split_at(tok.chars().next().map_or(0, |c| c.len_utf8()));
+        if name != "pids" {
+            return Err(crate::why::inval());
+        }
+        want = Some(match sign {
+            "+" => true,
+            "-" => false,
+            _ => return Err(crate::why::inval()),
+        });
+    }
+    let g = live_cg(id)?;
+    let Some(on) = want else { return Ok(()) };
+    if on == g.subtree_pids {
+        return Ok(());
+    }
+    if on {
+        let parent = g.parent;
+        if id != ROOT && !get(parent).is_some_and(|p| p.subtree_pids) {
+            return Err(-ENOENT);
+        }
+        if !valid_domain(id) {
+            return Err(-EOPNOTSUPP);
+        }
+        if id != ROOT && !can_be_thread_root(id) && has_tasks(id) {
+            return Err(-EBUSY);
+        }
+    } else if g.kids.iter().any(|&k| get(k).is_some_and(|c| !c.dead && c.subtree_pids)) {
+        return Err(-EBUSY);
+    }
+    let kids: Vec<u64> = g.kids.iter().copied().filter(|&k| get(k).is_some_and(|c| !c.dead)).collect();
+    g.subtree_pids = on;
+    for k in kids {
+        if on {
+            pids_create(k);
+        } else {
+            pids_destroy(k);
+        }
+    }
+    Ok(())
+}
+
+/// Linux の kstrtoll (base 0。終わりの改行 1 つはよい): まちがいは EINVAL、あふれは ERANGE
+fn kstrtoll(s: &str) -> Result<i64, i64> {
+    let s = s.strip_suffix('\n').unwrap_or(s);
+    let (neg, s) = match s.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let (radix, d) = if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        (16, h)
+    } else if s.len() > 1 && s.starts_with('0') {
+        (8, &s[1..])
+    } else {
+        (10, s)
+    };
+    if d.is_empty() || !d.chars().all(|c| c.is_digit(radix)) {
+        return Err(crate::why::inval());
+    }
+    let v = u64::from_str_radix(d, radix).map_err(|_| -ERANGE)?;
+    if neg {
+        if v > i64::MAX as u64 + 1 {
+            return Err(-ERANGE);
+        }
+        Ok((v as i64).wrapping_neg())
+    } else {
+        i64::try_from(v).map_err(|_| -ERANGE)
+    }
+}
+
+/// pids.max に書く (Linux の pids_max_write): "max" か 0 から PIDS_MAX の手前まで (ほかは EINVAL)
+fn pids_max_write(id: u64, text: &str) -> Result<(), i64> {
+    let t = text.trim();
+    let v = if t == "max" {
+        PIDS_MAX
+    } else {
+        let v = kstrtoll(t)?;
+        if !(0..PIDS_MAX).contains(&v) {
+            return Err(crate::why::inval());
+        }
+        v
+    };
+    pids_of(id).ok_or(-ENODEV)?.max = v;
+    Ok(())
+}
+
 // ---- /proc と /sys に見せるもの ----
 
 /// /proc/PID/cgroup (Linux の proc_cgroup_show): "0::パス"。パスは読む人の cgroup の namespace の根から。消した cgroup に
@@ -277,9 +596,10 @@ pub fn proc_text(p: &proc::Proc) -> String {
     format!("0::{}{}\n", path_from(p.cgroup, from), if dead { " (deleted)" } else { "" })
 }
 
-/// /proc/cgroups (controller がないので見出しだけ)
-pub fn proc_cgroups() -> &'static str {
-    "#subsys_name\thierarchy\tnum_cgroups\tenabled\n"
+/// /proc/cgroups (Linux の proc_cgroupstats_show): controller (pids) ごとに、木の番号 (v2 の木は 0)、cgroup の数 (根と、
+/// 消してもまだ残っているものをふくむ)、使えるか
+pub fn proc_cgroups() -> String {
+    format!("#subsys_name\thierarchy\tnum_cgroups\tenabled\npids\t0\t{}\t1\n", tree().len())
 }
 
 /// /sys/kernel/cgroup/delegate (任せてよいファイル: Linux の CFTYPE_NS_DELEGATABLE のもの)
@@ -295,25 +615,37 @@ pub fn features_text() -> &'static str {
 // ---- マウント ----
 
 /// mount -t cgroup2 (Linux の cgroup2 の get_tree と parse_param): 根はいまの cgroup の namespace の根。オプションは
-/// nsdelegate (と、controller のための名前: 受けるだけ)。知らないものは EINVAL ("cgroup2: Unknown parameter")
+/// nsdelegate と pids_localevents (と、ほかの controller のための名前: 受けるだけ)。知らないものは EINVAL
+/// ("cgroup2: Unknown parameter")
 pub fn mount(data: &str) -> Result<InodeRef, i64> {
     let mut deleg = None;
+    let mut local = false;
     for o in data.split(',').filter(|o| !o.is_empty()) {
         match o {
             "nsdelegate" => deleg = Some(true),
-            "favordynmods" | "memory_localevents" | "memory_recursiveprot" | "memory_hugetlb_accounting" | "pids_localevents" => {}
+            "pids_localevents" => local = true,
+            "favordynmods" | "memory_localevents" | "memory_recursiveprot" | "memory_hugetlb_accounting" => {}
             _ => {
                 crate::println!("cgroup2: Unknown parameter '{}'", o.split('=').next().unwrap_or(o));
                 return Err(crate::why::inval());
             }
         }
     }
-    // nsdelegate は、はじめの namespace でかぶせたときだけ変えられる (Linux の cgroup_reconfigure と同じく、中からは見ない)
-    if let Some(d) = deleg
-        && proc::current().cred.ns.cgroup.is_none()
-    {
-        NS_DELEGATE.store(d, Ordering::Relaxed);
-        set_fs_opts(fs_id(), if d { String::from(",nsdelegate") } else { String::new() });
+    // はじめの namespace でかぶせたときだけ変えられる (Linux の apply_cgroup_root_flags と同じく、中からは見ない)。
+    // nsdelegate は書いたときだけ立て、pids_localevents はかぶせるたびにそのとおりに (Linux はどちらもかぶせるたび)
+    if proc::current().cred.ns.cgroup.is_none() {
+        if let Some(d) = deleg {
+            NS_DELEGATE.store(d, Ordering::Relaxed);
+        }
+        PIDS_LOCAL.store(local, Ordering::Relaxed);
+        let mut o = String::new();
+        if NS_DELEGATE.load(Ordering::Relaxed) {
+            o.push_str(",nsdelegate");
+        }
+        if local {
+            o.push_str(",pids_localevents");
+        }
+        set_fs_opts(fs_id(), o);
     }
     VISIBLE.store(true, Ordering::Relaxed);
     let root = proc::current().cred.ns.cgroup_root();
@@ -328,7 +660,8 @@ pub fn mount_v1(_data: &str) -> Result<InodeRef, i64> {
 // ---- 移す ----
 
 /// いまの人が src から dst へ移してよいか (Linux の cgroup_attach_permissions): 共通の祖先の cgroup.procs に書けるか
-/// (EACCES)、nsdelegate なら両方が自分の namespace の中か (ENOENT)、スレッドだけなら同じ domain か (EOPNOTSUPP)
+/// (EACCES)、nsdelegate なら両方が自分の namespace の中か (ENOENT)、行き先がタスクを持てるか (vet_dst: EOPNOTSUPP か
+/// EBUSY)、スレッドだけなら同じ domain か (EOPNOTSUPP)
 fn may_attach(src: u64, dst: u64, threadgroup: bool) -> Result<(), i64> {
     let com = common(src, dst);
     let a = get(com).ok_or(-ENOENT)?.files[F_PROCS as usize];
@@ -339,6 +672,7 @@ fn may_attach(src: u64, dst: u64, threadgroup: bool) -> Result<(), i64> {
             return Err(-ENOENT);
         }
     }
+    vet_dst(dst)?;
     if !threadgroup && src != dst {
         return Err(-EOPNOTSUPP);
     }
@@ -399,9 +733,12 @@ fn procs_write(dst: u64, text: &str, threadgroup: bool) -> Result<(), i64> {
     // 終わりかけ (ゾンビ) のものは移さない (Linux の cgroup_migrate_add_task は PF_EXITING を外す)。行き先が凍って
     // いれば凍らせ、そうでなければとかす (Linux の cgroup_freezer_migrate_task)
     let on = freezing(dst);
+    let pick = |p: &proc::Proc| (if threadgroup { p.tgid == tgid } else { p.pid == tid }) && p.state != State::Unused && p.state != State::Zombie;
+    // pids の数は移るものについていく (上限は見ない。peak は Linux の pids_can_attach のとおり)
+    let n = proc::live().filter(|p| pick(p)).count() as i64;
+    migrate_peaks(eff(src), eff(dst), n);
     for p in proc::live() {
-        let pick = if threadgroup { p.tgid == tgid } else { p.pid == tid };
-        if pick && p.state != State::Unused && p.state != State::Zombie {
+        if pick(p) {
             p.cgroup = dst;
             proc::set_freezing(p, on);
         }
@@ -470,10 +807,44 @@ fn max_text(v: i32) -> String {
     if v == i32::MAX { String::from("max\n") } else { format!("{}\n", v) }
 }
 
+fn events_text(v: u64) -> String {
+    format!("max {}\n", v)
+}
+
 fn content(id: u64, f: u8) -> Result<String, i64> {
     let g = get(id).ok_or(-ENODEV)?;
+    // pids.*: -pids したあとに開いたままの fd は ENODEV (Linux の kernfs の消えたファイル)
+    let pids = || g.pids.ok_or(-ENODEV);
+    let local = PIDS_LOCAL.load(Ordering::Relaxed);
     Ok(match f {
-        F_TYPE => String::from("domain\n"),
+        // Linux の cgroup_type_show (threaded の cgroup はまだないので、そのほかの 3 つ)
+        F_TYPE => String::from(if !valid_domain(id) {
+            "domain invalid\n"
+        } else if thread_root(id) {
+            "domain threaded\n"
+        } else {
+            "domain\n"
+        }),
+        F_CONTROLLERS => String::from(if id == ROOT || get(g.parent).is_some_and(|p| p.subtree_pids) { "pids\n" } else { "" }),
+        F_SUBTREE => String::from(if g.subtree_pids { "pids\n" } else { "" }),
+        F_PIDS_MAX => {
+            let m = pids()?.max;
+            if m >= PIDS_MAX { String::from("max\n") } else { format!("{}\n", m) }
+        }
+        F_PIDS_CURRENT => {
+            pids()?;
+            format!("{}\n", count(id))
+        }
+        F_PIDS_PEAK => format!("{}\n", pids()?.peak),
+        // pids_localevents なら、どちらもここで fork にしくじった数 (Linux の __pids_events_show)
+        F_PIDS_EVENTS => {
+            let p = pids()?;
+            events_text(if local { p.forkfail } else { p.ev_max })
+        }
+        F_PIDS_EVENTS_LOCAL => {
+            let p = pids()?;
+            events_text(if local { p.forkfail } else { p.local_max })
+        }
         F_PROCS | F_THREADS => {
             let mut v: Vec<u32> = proc::live()
                 .filter(|p| p.state != State::Unused && !p.kthread && p.cgroup == id)
@@ -483,13 +854,18 @@ fn content(id: u64, f: u8) -> Result<String, i64> {
             v.sort_unstable();
             v.iter().map(|p| format!("{}\n", p)).collect()
         }
-        F_CONTROLLERS | F_SUBTREE | F_CPU_STAT_LOCAL => String::new(),
+        F_CPU_STAT_LOCAL => String::new(),
         F_EVENTS => format!("populated {}\nfrozen {}\n", populated(id) as u8, frozen(id) as u8),
         F_MAX_DESC => max_text(g.max_desc),
         F_MAX_DEPTH => max_text(g.max_depth),
+        // controller ごとの入れものの数 (Linux の nr_subsys_*: 自分のものと、子孫の生きているもの。持たなければ 0)
         F_STAT => {
-            let dying = subtree(id).iter().skip(1).filter(|&&c| get(c).is_some_and(|k| k.dead)).count();
-            format!("nr_descendants {}\nnr_dying_descendants {}\n", g.nr_desc, dying)
+            let sub = subtree(id);
+            let dying = sub.iter().skip(1).filter(|&&c| get(c).is_some_and(|k| k.dead)).count();
+            let has = |c: u64| c == ROOT || get(c).is_some_and(|k| k.pids.is_some());
+            let n = if has(id) { 1 + sub.iter().skip(1).filter(|&&c| get(c).is_some_and(|k| !k.dead && k.pids.is_some())).count() } else { 0 };
+            let dying_pids = sub.iter().skip(1).filter(|&&c| get(c).is_some_and(|k| k.dead && k.pids.is_some())).count();
+            format!("nr_descendants {}\nnr_subsys_pids {}\nnr_dying_descendants {}\nnr_dying_subsys_pids {}\n", g.nr_desc, n, dying, dying_pids)
         }
         // 凍らせていたあいだ (cgroup.freeze に 1 を書いてから 0 を書くまで)
         F_STAT_LOCAL => {
@@ -507,6 +883,10 @@ fn content(id: u64, f: u8) -> Result<String, i64> {
 }
 
 fn write(id: u64, f: u8, b: &[u8]) -> Result<(), i64> {
+    // 0 バイトはなにもしない (Linux も 0 を返す: pids.max に "" でも EINVAL にならない)
+    if b.is_empty() {
+        return Ok(());
+    }
     let text = core::str::from_utf8(b).map_err(|_| crate::why::inval())?;
     // nsdelegate のとき、自分の namespace の根のファイルは、任せてよいもの (procs、threads、subtree_control) のほかは EPERM
     if NS_DELEGATE.load(Ordering::Relaxed) && !matches!(f, F_PROCS | F_THREADS | F_SUBTREE) {
@@ -519,13 +899,8 @@ fn write(id: u64, f: u8, b: &[u8]) -> Result<(), i64> {
     match f {
         F_PROCS => procs_write(id, text, true),
         F_THREADS => procs_write(id, text, false),
-        // +NAME / -NAME の並び: controller はないので、なにかあれば EINVAL
-        F_SUBTREE => {
-            if text.split_whitespace().next().is_some() {
-                return Err(crate::why::inval());
-            }
-            Ok(())
-        }
+        F_SUBTREE => subtree_write(id, text),
+        F_PIDS_MAX => pids_max_write(id, text),
         F_MAX_DEPTH | F_MAX_DESC => {
             let t = text.trim();
             let v = if t == "max" { i32::MAX } else { kstrtoint(t).ok_or_else(crate::why::inval)? };
@@ -614,7 +989,11 @@ impl CgInode {
     }
 }
 
+/// id にそのファイルがあるか (pids.* は pids の入れものを持つあいだだけ)
 fn file_on(id: u64, f: usize) -> bool {
+    if f >= F_PIDS_MAX as usize {
+        return id != ROOT && get(id).is_some_and(|g| g.pids.is_some());
+    }
     id != ROOT || FILES[f].2
 }
 
@@ -728,6 +1107,10 @@ impl Inode for CgInode {
         while let Some(g) = get(a) {
             g.nr_desc += 1;
             a = g.parent;
+        }
+        // 親が +pids していれば、はじめから pids を持つ
+        if get(parent).is_some_and(|g| g.subtree_pids) {
+            pids_create(id);
         }
         Ok(Rc::new(CgInode { node: Node::Dir(id) }))
     }
