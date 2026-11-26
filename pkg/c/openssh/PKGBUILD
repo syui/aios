@@ -1,19 +1,28 @@
 # openssh: ssh / scp / sftp / ssh-keygen / ssh-agent と sshd。OpenSSL なし (--without-openssl):
-#   鍵は ed25519、暗号は chacha20-poly1305 と aes-ctr、鍵の交換は mlkem768x25519 / sntrup761x25519 /
-#   curve25519 (どれも openssh の中のもの)。RSA と ECDSA の鍵は使えない。
+#   鍵は mldsa44-ed25519 (ML-DSA-44 と Ed25519 をあわせた、量子計算機に強い署名: IANA の ssh-mldsa44-ed25519。
+#   openssh の中の libcrux で、OpenSSL はいらない) と ed25519、暗号は chacha20-poly1305 と aes-ctr、鍵の交換は
+#   mlkem768x25519 / sntrup761x25519 / curve25519 (どれも openssh の中のもの)。RSA と ECDSA の鍵は使えない。
+#   上流の既定は mldsa44-ed25519 をいちばんあとにするが、aios の /etc/ssh/ssh_config は先に (ホストの鍵の
+#   HostKeyAlgorithms と、ユーザーの鍵の IdentityFile の順。相手が持っていなければ ed25519 になる)。sshd のホストの
+#   鍵は sshdgenkeys.service の ssh-keygen -A が、足りないものを起動のたびに作る (前の版で ed25519 だけのものにも)。
+#   sshd は mldsa44-ed25519 の鍵だけで入れる (/etc/ssh/sshd_config.d/mldsa44-ed25519.conf: ホストの鍵とユーザーの鍵、
+#   パスワードでは入れない)。sshd_config のいちばん上の Include で読む (先に決めた値が勝つので、Port などは
+#   sshd_config に書いたまま。前の版から上げて sshd_config を書きかえていれば、新しいものは .pacnew になるので、
+#   Include /etc/ssh/sshd_config.d/*.conf の 1 行を自分の sshd_config のいちばん上に足す)
 #   git の署名も ssh-keygen でできる (git config gpg.format ssh)。Zig でクロスビルドして /opt/c に入る
 #   10.6p2: CVE-2026-123158 (*sshole: musl の crypt() の短い答えとパスワードの欄が合ってしまい、パスワードなしで入れた)
 pkgname=openssh
 pkgver=10.6p2
-pkgrel=1
+pkgrel=2
 pkgdesc='SSH protocol implementation without OpenSSL (static, ed25519, for aios)'
 arch=('aarch64')
 url='https://www.openssh.com/portable.html'
 license=('SSH-OpenSSH')
-backup=(etc/ssh/ssh_config etc/ssh/sshd_config)
+backup=(etc/ssh/ssh_config etc/ssh/sshd_config etc/ssh/sshd_config.d/mldsa44-ed25519.conf)
 source=("https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-$pkgver.tar.gz"
-        sshd.service sshdgenkeys.service)
+        sshd.service sshdgenkeys.service mldsa44-ed25519.conf)
 sha256sums=('9ae44872090cf2f06b3cf9ff147e7f16f309671340763ed2f99248398ae29d5b'
+            'SKIP'
             'SKIP'
             'SKIP')
 
@@ -43,6 +52,22 @@ package() {
   cd "openssh-$pkgver"
   # install-nokeys: ホストの鍵はここで作らない (クロスのバイナリは動かせない。sshd を使うときに ssh-keygen -A)
   make DESTDIR="$pkgdir" install-nokeys
+  # sshd: sshd_config.d を先に読む (sshd_config は最初に決めた値が勝つ)。mldsa44-ed25519 の鍵だけで入れる決まり
+  { printf '%s\n' '# aios: sshd_config.d/*.conf を先に読む (先に決めた値が勝つ)。mldsa44-ed25519 の鍵だけで入れる決まりは' \
+      '# sshd_config.d/mldsa44-ed25519.conf (ed25519 の鍵やパスワードでも入れるなら、そのファイルを消す)。Port などはここに' \
+      'Include /etc/ssh/sshd_config.d/*.conf' ''; cat "$pkgdir/etc/ssh/sshd_config"; } > sshd_config.aios
+  install -Dm644 sshd_config.aios "$pkgdir/etc/ssh/sshd_config"
+  install -Dm644 "$startdir/mldsa44-ed25519.conf" "$pkgdir/etc/ssh/sshd_config.d/mldsa44-ed25519.conf"
+  # mldsa44-ed25519 を先に (ssh_config は最初に決めた値が勝つので、ユーザーの ~/.ssh/config やコマンドの -o が先)
+  cat >> "$pkgdir/etc/ssh/ssh_config" << 'EOT'
+
+# aios: 量子計算機に強い鍵 (mldsa44-ed25519: ML-DSA-44 と Ed25519) を先に。相手が持っていなければ ed25519
+Host *
+	HostKeyAlgorithms ^ssh-mldsa44-ed25519-cert,ssh-mldsa44-ed25519
+	IdentityFile ~/.ssh/id_mldsa44_ed25519
+	IdentityFile ~/.ssh/id_ed25519
+	IdentityFile ~/.ssh/id_ed25519_sk
+EOT
   rm -rf "$pkgdir/opt/c/share/man"
   install -d -m755 "$pkgdir/var/empty"
   install -Dm644 "$startdir/sshd.service" "$pkgdir/usr/lib/systemd/system/sshd.service"

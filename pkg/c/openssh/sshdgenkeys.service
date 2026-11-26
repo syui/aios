@@ -1,7 +1,8 @@
-# sshd のホストの鍵を作る (なければ)。sshd.service から呼ばれる
+# sshd のホストの鍵を作る (足りないものだけ: ssh-keygen -A は、あるものは作りなおさない)。sshd.service から呼ばれる。
+# 前は ed25519 の鍵があれば飛ばしていたので、前の版から上げたものに mldsa44-ed25519 のホストの鍵ができなかった
+# (aios の init の ConditionPathExists は「どれか」の | がないので、条件はつけない)
 [Unit]
 Description=SSH key generation
-ConditionPathExists=!/etc/ssh/ssh_host_ed25519_key
 
 [Service]
 Type=oneshot

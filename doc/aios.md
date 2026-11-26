@@ -289,6 +289,32 @@ aios confirm                            # いまのファイアウォールで�
 }
 ```
 
+## ssh (量子計算機に強い鍵: mldsa44-ed25519)
+
+aios の openssh (10.6p2、OpenSSL なし) は、鍵の交換 (mlkem768x25519) も署名の鍵も量子計算機に強いものにできる。署名の
+鍵は mldsa44-ed25519 (ML-DSA-44 と Ed25519 をあわせたもの: IANA の ssh-mldsa44-ed25519。openssh の中の libcrux なので
+OpenSSL はいらない。Zig の clang で作るので USE_MLDSA が入る)。2026-11-26 から:
+
+- `ssh-keygen -t mldsa44-ed25519` で鍵 (秘密鍵は 3957 バイト、公開鍵は 1854 バイト)。`ssh-keygen -Y sign` / `verify`、
+  git のコミットの署名 (`git config gpg.format ssh` と `user.signingkey ~/.ssh/id_mldsa44_ed25519.pub`) もできる
+- クライアント (`/etc/ssh/ssh_config` の終わり): ホストの鍵は mldsa44-ed25519 を先に (`HostKeyAlgorithms ^...`。上流の
+  既定はいちばんあと)、ユーザーの鍵は `~/.ssh/id_mldsa44_ed25519` を先に。相手が持っていなければ ed25519 になる。
+  known_hosts にある種類は、OpenSSH がそれを先にするので、前の鍵でつないでいた相手もそのまま
+- sshd: `/etc/ssh/sshd_config.d/mldsa44-ed25519.conf` で、mldsa44-ed25519 の鍵だけで入れる (ホストの鍵、ユーザーの鍵、
+  証明書の CA の署名。`AuthenticationMethods publickey` でパスワードでは入れない)。sshd_config のいちばん上の
+  `Include /etc/ssh/sshd_config.d/*.conf` で読む (先に決めた値が勝つので、Port などは sshd_config に書いたまま)。
+  前の版から上げて sshd_config を書きかえていれば、新しいものは sshd_config.pacnew になるので、その 1 行を自分の
+  sshd_config のいちばん上に足す。ed25519 の鍵やパスワードでも入れたければ、そのファイルを消して `sudo systemctl
+  restart sshd`。ホストの鍵は sshdgenkeys.service の `ssh-keygen -A` が、足りないものを起動のたびに作る
+- アカウントのパスワードの欄: PAM のない sshd は `!` (鍵がかかっている) のアカウントを、鍵でも入れない ("User ai not
+  allowed because account is locked")。useradd の既定と、image の root と ai は `*` (パスワードでは入れず、鍵では入れる:
+  nobody は `!` のまま)。前の aios で作ったアカウントは `sudo usermod -p '*' NAME` (usermod -p を足した)
+- VM で確かめたこと: mldsa44-ed25519 の鍵で入れる、ed25519 の鍵 (`ssh-ed25519 not in PubkeyAcceptedAlgorithms`) と
+  パスワードはことわる、ed25519 のホストの鍵を求めると `no matching host key type found`
+- まだ見る側がない: Gitea (golang.org/x/crypto/ssh v0.59.0 は ML-DSA だけの ssh-mldsa-44 は知っているが、ed25519 と
+  あわせた ssh-mldsa44-ed25519 は知らない) は、この鍵を登録できず、署名も確かめられない。GitHub は確かめていない。
+  ai のコミットの署名は gpg のまま (aigpt-mcp.sh が gpg の署名で ai/gpt と ai/log を確かめる)
+
 ## カーネルの値 (/proc/sys と sysctl)
 
 Linux と同じ場所と形。書けるのは root。値の表は kernel/src/sysctl.rs (1 行足せば 1 つ増える)。

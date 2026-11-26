@@ -4,8 +4,11 @@
 //
 //   useradd [-m] [-d HOME] [-s SHELL] [-u UID] [-g GROUP] [-G G1,G2] [-c COMMENT] [-r] [-N] NAME
 //     ユーザーと同じ名前のグループも作る (Arch と同じ)。-m でホームを作り /etc/skel を写す。
-//     パスワードはまだない (passwd NAME で付ける)
-//   usermod [-a] [-G G1,G2] [-g GROUP] [-s SHELL] [-d HOME [-m]] [-c COMMENT] [-L] [-U] NAME
+//     パスワードはまだない ("*": passwd NAME で付ける。パスワードではログインできないが、鍵はかかっていない ("!" で
+//     はない) ので sshd の鍵では入れる: PAM のない sshd は "!" のアカウントを「鍵がかかっている」とことわる)
+//   usermod [-a] [-G G1,G2] [-g GROUP] [-s SHELL] [-d HOME [-m]] [-c COMMENT] [-p PASSWORD] [-L] [-U] NAME
+//     -p はパスワードの欄をそのまま (暗号にしたもの。"*" はパスワードなしで鍵もかけない: 前の aios が作った "!" の
+//     アカウントを sshd の鍵で入れるようにするには usermod -p '*' NAME)
 //   userdel [-r] NAME            (-r でホームも消す)
 //   groupadd [-g GID] [-r] NAME
 //   groupdel NAME
@@ -53,7 +56,7 @@ fn main() {
 
 fn usage(prog: &str, code: i32) -> ! {
     let u = match prog {
-        "usermod" => "usermod [-a] [-G G1,G2] [-g GROUP] [-s SHELL] [-d HOME [-m]] [-c COMMENT] [-L|-U] NAME",
+        "usermod" => "usermod [-a] [-G G1,G2] [-g GROUP] [-s SHELL] [-d HOME [-m]] [-c COMMENT] [-p PASSWORD] [-L|-U] NAME",
         "userdel" => "userdel [-r] NAME",
         "groupadd" => "groupadd [-g GID] [-r] NAME",
         "groupdel" => "groupdel NAME",
@@ -266,10 +269,12 @@ fn useradd(prog: &str, args: &[String]) {
     let mut pw = lines(PASSWD);
     pw.push(vec![name.clone(), "x".into(), uid.to_string(), gid.to_string(), comment, home.clone(), shell]);
     save(prog, PASSWD, &pw, 0o644);
-    // パスワードはまだない ("!": passwd で付けるまでパスワードではログインできない)
+    // パスワードはまだない ("*": passwd で付けるまでパスワードではログインできない。"!" (鍵がかかっている) にすると、
+    // PAM のない sshd が鍵でも入れない: Linux の shadow-utils の useradd も既定は "!" だが、Arch などで sshd の鍵だけで
+    // 入るには usermod -p '*' がいる)
     let mut sh = lines(SHADOW);
     sh.retain(|r| r[0] != name);
-    sh.push(vec![name.clone(), "!".into(), days().to_string(), "0".into(), "99999".into(), "7".into(), String::new(), String::new(), String::new()]);
+    sh.push(vec![name.clone(), "*".into(), days().to_string(), "0".into(), "99999".into(), "7".into(), String::new(), String::new(), String::new()]);
     save(prog, SHADOW, &sh, 0o600);
     if let Some(list) = vals.get(&'G') {
         set_supplementary(prog, &name, list, false);
@@ -287,9 +292,12 @@ fn useradd(prog: &str, args: &[String]) {
 // ---- usermod ----
 
 fn usermod(prog: &str, args: &[String]) {
-    let (flags, vals, rest) = parse(prog, args, "dsgGcl");
+    let (flags, vals, rest) = parse(prog, args, "dsgGclp");
     let name = one_name(prog, &rest);
     let Some(old) = users::by_name(&name) else { die(prog, format!("user '{}' does not exist", name)) };
+    if vals.get(&'p').is_some_and(|v| v.contains(':') || v.contains('\n')) {
+        die(prog, "':' is not allowed");
+    }
     if flags.is_empty() && vals.is_empty() {
         eprintln!("{}: no options", prog);
         usage(prog, 2);
@@ -325,6 +333,15 @@ fn usermod(prog: &str, args: &[String]) {
     if let Some(list) = vals.get(&'G') {
         // -a なら足すだけ、なければ並べたグループだけにする (shadow-utils と同じ)
         set_supplementary(prog, &name, list, !flags.contains(&'a'));
+    }
+    // -p: パスワードの欄をそのまま (shadow-utils と同じく、暗号にしたものを)
+    if let Some(p) = vals.get(&'p') {
+        let mut sh = lines(SHADOW);
+        if let Some(r) = sh.iter_mut().find(|r| r[0] == name) {
+            r.resize(2.max(r.len()), String::new());
+            r[1] = p.clone();
+        }
+        save(prog, SHADOW, &sh, 0o600);
     }
     // -L / -U: パスワードの前の "!" で鍵をかける / 外す
     if flags.contains(&'L') || flags.contains(&'U') {
